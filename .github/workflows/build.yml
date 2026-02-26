@@ -83,7 +83,17 @@ jobs:
           body: |
             ## OSS Executor ${{ github.ref_name }}
 
-            ### Installation
+            ### Download Options
+            - **AppImage** — Single file, run directly (recommended)
+            - **tar.gz** — Manual install
+
+            ### AppImage (Easiest)
+            ```bash
+            chmod +x OSS_Executor-x86_64.AppImage
+            ./OSS_Executor-x86_64.AppImage
+            ```
+
+            ### Manual Install
             ```bash
             tar -xzf oss-executor-linux-x86_64.tar.gz
             cd oss-executor
@@ -164,3 +174,9 @@ jobs:
           name: oss-executor-AppImage
           path: "OSS_Executor*.AppImage"
           if-no-files-found: ignore
+
+      - name: Attach AppImage to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "OSS_Executor*.AppImage"
