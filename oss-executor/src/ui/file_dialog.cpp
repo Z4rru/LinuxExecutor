@@ -1,10 +1,13 @@
 #include "file_dialog.hpp"
+#include "utils/logger.hpp"
 
 namespace oss {
 
 #if GTK_CHECK_VERSION(4, 10, 0)
 
-// ── GTK 4.10+ : GtkFileDialog (async) ──
+// ── GTK 4.10+ : GtkFileDialog (async, portal-based) ──
+// NOTE: This does NOT require GVFS. The portal uses D-Bus directly.
+// Our GIO_MODULE_DIR="" fix does not affect file dialog functionality.
 
 static void on_open_finish(GObject* source, GAsyncResult* result, gpointer user_data) {
     auto* callback = static_cast<FileDialog::Callback*>(user_data);
@@ -18,7 +21,13 @@ static void on_open_finish(GObject* source, GAsyncResult* result, gpointer user_
         }
         g_object_unref(file);
     }
-    if (error) g_error_free(error);
+    if (error) {
+        // Don't log "dismissed" errors — user just hit Cancel
+        if (!g_error_matches(error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED)) {
+            LOG_ERROR("File dialog error: {}", error->message);
+        }
+        g_error_free(error);
+    }
     delete callback;
 }
 
@@ -45,6 +54,12 @@ void FileDialog::open(GtkWindow* parent, Callback cb) {
     gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
     g_object_unref(filters);
 
+    // ── Set initial directory to workspace ──
+    std::string workspace = Config::instance().home_dir() + "/workspace";
+    GFile* initial_dir = g_file_new_for_path(workspace.c_str());
+    gtk_file_dialog_set_initial_folder(dialog, initial_dir);
+    g_object_unref(initial_dir);
+
     auto* cb_ptr = new Callback(std::move(cb));
     gtk_file_dialog_open(dialog, parent, nullptr, on_open_finish, cb_ptr);
 }
@@ -61,7 +76,12 @@ static void on_save_finish(GObject* source, GAsyncResult* result, gpointer user_
         }
         g_object_unref(file);
     }
-    if (error) g_error_free(error);
+    if (error) {
+        if (!g_error_matches(error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED)) {
+            LOG_ERROR("File save dialog error: {}", error->message);
+        }
+        g_error_free(error);
+    }
     delete callback;
 }
 
@@ -70,13 +90,19 @@ void FileDialog::save(GtkWindow* parent, const std::string& suggested_name, Call
     gtk_file_dialog_set_title(dialog, "Save Script");
     gtk_file_dialog_set_initial_name(dialog, suggested_name.c_str());
 
+    // ── Set initial directory to workspace ──
+    std::string workspace = Config::instance().home_dir() + "/workspace";
+    GFile* initial_dir = g_file_new_for_path(workspace.c_str());
+    gtk_file_dialog_set_initial_folder(dialog, initial_dir);
+    g_object_unref(initial_dir);
+
     auto* cb_ptr = new Callback(std::move(cb));
     gtk_file_dialog_save(dialog, parent, nullptr, on_save_finish, cb_ptr);
 }
 
 #else
 
-// ── GTK 4.0–4.9 : GtkFileChooserNative (synchronous response signal) ──
+// ── GTK 4.0–4.9 : GtkFileChooserNative (portal-based) ──
 
 static void on_open_response(GtkNativeDialog* dialog, int response, gpointer user_data) {
     auto* callback = static_cast<FileDialog::Callback*>(user_data);
