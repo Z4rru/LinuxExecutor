@@ -1,3 +1,4 @@
+// src/core/lua_engine.cpp
 #include "lua_engine.hpp"
 #include "utils/http.hpp"
 #include "utils/crypto.hpp"
@@ -54,10 +55,16 @@ void LuaEngine::reset() {
     init();
 }
 
-// ── FIX: cancel sets running_ false; execute resets it ──
-void LuaEngine::stop() {
-    running_ = false;
-}
+// ═══════════════════════════════════════════════════════════
+// ██  stop() is INTENTIONALLY NOT HERE                    ██
+// ██  It is defined inline in lua_engine.hpp:             ██
+// ██    void stop() {                                     ██
+// ██        running_.store(false,                         ██
+// ██                       std::memory_order_release);    ██
+// ██    }                                                 ██
+// ██  Defining it here too causes:                        ██
+// ██    error: redefinition of 'void oss::LuaEngine::stop()'
+// ═══════════════════════════════════════════════════════════
 
 bool LuaEngine::execute(const std::string& script, const std::string& chunk_name) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -69,10 +76,10 @@ bool LuaEngine::execute(const std::string& script, const std::string& chunk_name
         return false;
     }
 
-    // ── FIX: Reset running flag for this execution ──
+    // Reset running flag for this execution
     // Previous cancel_execution() set running_=false;
     // we must re-enable it or this execute() would instantly reject
-    running_ = true;
+    running_.store(true, std::memory_order_release);
     current_engine = this;
 
     // Set up cancellation hook
@@ -134,7 +141,6 @@ bool LuaEngine::execute(const std::string& script, const std::string& chunk_name
         return false;
     }
 
-    // ── FIX: remove error handler using tracked absolute index ──
     lua_remove(L_, handler_index);
 
     lua_sethook(L_, nullptr, 0, 0);
@@ -443,7 +449,6 @@ int LuaEngine::lua_readfile(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    // Security: prevent directory traversal
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(full_path, ec);
     auto base_canonical = std::filesystem::weakly_canonical(base, ec);
@@ -494,7 +499,6 @@ int LuaEngine::lua_appendfile(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    // ── FIX: add path traversal check (was missing for appendfile) ──
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(full_path, ec);
     auto base_canonical = std::filesystem::weakly_canonical(base, ec);
@@ -540,7 +544,6 @@ int LuaEngine::lua_delfolder(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    // ── FIX: add path traversal check (was missing for delfolder) ──
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(full_path, ec);
     auto base_canonical = std::filesystem::weakly_canonical(base, ec);
@@ -557,7 +560,6 @@ int LuaEngine::lua_makefolder(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    // ── FIX: add path traversal check ──
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(full_path, ec);
     auto base_canonical = std::filesystem::weakly_canonical(base, ec);
@@ -587,21 +589,10 @@ int LuaEngine::lua_getclipboard(lua_State* L) {
     return 1;
 }
 
-// ════════════════════════════════════════════════════════════
-// ██████  CRITICAL SECURITY FIX  ██████
-// ORIGINAL CODE HAD COMMAND INJECTION VULNERABILITY:
-//   std::string cmd = "echo -n '" + text + "' | xclip ..."
-//   system(cmd.c_str());
-// If text = "'; rm -rf / #", it executes arbitrary commands.
-//
-// FIX: Use popen("w") and write through stdin pipe.
-// User text NEVER touches the shell command string.
-// ════════════════════════════════════════════════════════════
 int LuaEngine::lua_setclipboard(lua_State* L) {
     size_t len = 0;
     const char* text = luaL_checklstring(L, 1, &len);
 
-    // Write through stdin pipe — no shell expansion of user text
     FILE* pipe = popen("xclip -selection clipboard 2>/dev/null || "
                        "xsel --clipboard --input 2>/dev/null || "
                        "wl-copy 2>/dev/null", "w");
