@@ -336,7 +336,11 @@ void Editor::set_font(const std::string& family, int size) {
                       std::to_string(size) + "px; }";
     
     GtkCssProvider* provider = gtk_css_provider_new();
+#if GTK_CHECK_VERSION(4, 12, 0)
     gtk_css_provider_load_from_string(provider, css.c_str());
+#else
+    gtk_css_provider_load_from_data(provider, css.c_str(), -1);
+#endif
     gtk_style_context_add_provider_for_display(
         gdk_display_get_default(),
         GTK_STYLE_PROVIDER(provider),
