@@ -1,0 +1,174 @@
+name: Build & Release OSS Executor
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential cmake ninja-build git pkg-config \
+          libgtk-4-dev libcurl4-openssl-dev libssl-dev \
+          libgirepository1.0-dev luajit libluajit-5.1-dev \
+          fonts-jetbrains-mono
+
+    - name: Configure
+      run: |
+        mkdir -p build
+        cd build
+        cmake .. \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/usr
+
+    - name: Build
+      run: |
+        cd build
+        ninja -j$(nproc)
+
+    - name: Package
+      run: |
+        mkdir -p package/oss-executor
+        cp build/OSSExecutor package/oss-executor/
+        cp -r scripts package/oss-executor/
+        cp -r themes package/oss-executor/
+        cp -r resources package/oss-executor/
+        cp config.json package/oss-executor/
+        cp run.sh package/oss-executor/
+        cp build.sh package/oss-executor/
+        cp README.md package/oss-executor/
+        chmod +x package/oss-executor/OSSExecutor
+        chmod +x package/oss-executor/run.sh
+        
+        # Create install script
+        cat > package/oss-executor/install.sh << 'INSTALL_EOF'
+        #!/bin/bash
+        set -e
+        echo "Installing OSS Executor..."
+        mkdir -p ~/.oss-executor/{scripts/autoexec,themes,logs,workspace,cache}
+        cp -r scripts/* ~/.oss-executor/scripts/ 2>/dev/null || true
+        cp -r themes/* ~/.oss-executor/themes/ 2>/dev/null || true
+        cp -r resources ~/.oss-executor/ 2>/dev/null || true
+        cp config.json ~/.oss-executor/ 2>/dev/null || true
+        sudo cp OSSExecutor /usr/local/bin/oss-executor
+        echo "Installed! Run with: oss-executor"
+        INSTALL_EOF
+        chmod +x package/oss-executor/install.sh
+        
+        cd package
+        tar -czf oss-executor-linux-x86_64.tar.gz oss-executor/
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: oss-executor-linux-x86_64
+        path: package/oss-executor-linux-x86_64.tar.gz
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: package/oss-executor-linux-x86_64.tar.gz
+        body: |
+          ## OSS Executor ${{ github.ref_name }}
+          
+          ### Installation
+          ```bash
+          tar -xzf oss-executor-linux-x86_64.tar.gz
+          cd oss-executor
+          chmod +x install.sh
+          ./install.sh
+          ```
+          
+          ### Or run directly
+          ```bash
+          tar -xzf oss-executor-linux-x86_64.tar.gz
+          cd oss-executor
+          ./OSSExecutor
+          ```
+        draft: false
+        prerelease: false
+
+  build-appimage:
+    runs-on: ubuntu-22.04
+    needs: build-linux
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential cmake ninja-build pkg-config \
+          libgtk-4-dev libcurl4-openssl-dev libssl-dev \
+          luajit libluajit-5.1-dev \
+          fuse libfuse2 wget
+
+    - name: Build
+      run: |
+        mkdir -p build && cd build
+        cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+        ninja -j$(nproc)
+
+    - name: Create AppImage
+      run: |
+        # Download linuxdeploy
+        wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+        chmod +x linuxdeploy-x86_64.AppImage
+        
+        # Create AppDir structure
+        mkdir -p AppDir/usr/bin
+        mkdir -p AppDir/usr/share/applications
+        mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+        mkdir -p AppDir/usr/share/oss-executor
+        
+        cp build/OSSExecutor AppDir/usr/bin/
+        cp -r scripts themes resources config.json AppDir/usr/share/oss-executor/
+        
+        # Desktop file
+        cat > AppDir/usr/share/applications/oss-executor.desktop << EOF
+        [Desktop Entry]
+        Type=Application
+        Name=OSS Executor
+        Comment=Open Source Roblox Executor
+        Exec=OSSExecutor
+        Icon=oss-executor
+        Categories=Development;
+        Terminal=false
+        EOF
+        
+        # Placeholder icon (replace with real icon)
+        convert -size 256x256 xc:'#6e40c9' \
+          -gravity center -pointsize 72 -fill white \
+          -annotate 0 "OSS" \
+          AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png 2>/dev/null || \
+        touch AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png
+        
+        # Build AppImage
+        ./linuxdeploy-x86_64.AppImage \
+          --appdir AppDir \
+          --output appimage \
+          --desktop-file AppDir/usr/share/applications/oss-executor.desktop || true
+
+    - name: Upload AppImage
+      uses: actions/upload-artifact@v4
+      with:
+        name: oss-executor-AppImage
+        path: OSS_Executor*.AppImage
+        if-no-files-found: ignore
