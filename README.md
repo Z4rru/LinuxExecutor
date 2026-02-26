@@ -66,6 +66,7 @@ Inject	F5
 Toggle Console	F12
 Undo	Ctrl+Z
 Redo	Ctrl+Y
+
 📁 Project Structure
 See ARCHITECTURE.md for detailed explanations.
 
