@@ -16,15 +16,13 @@ find_package(PkgConfig REQUIRED)
 # GTK4
 pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
 
-# GLib version checks — prevent hard-to-debug runtime crashes
+# GLib version checks
 pkg_check_modules(GLIB REQUIRED glib-2.0)
-if(GLIB_VERSION VERSION_LESS "2.74")
-    message(WARNING
-        "GLib ${GLIB_VERSION} detected.  GLib ≥ 2.74 required for "
-        "G_APPLICATION_DEFAULT_FLAGS.  Build will use compatibility fallback."
-    )
-    add_compile_definitions(OSS_GLIB_COMPAT)
-endif()
+# ═══════════════════════════════════════════════════════════════
+# NOTE: G_APPLICATION_DEFAULT_FLAGS compat (OSS_GLIB_COMPAT)
+# removed — app.cpp now uses G_APPLICATION_NON_UNIQUE (GLib 2.30+)
+# which is universally available on any system with GTK4.
+# ═══════════════════════════════════════════════════════════════
 if(GLIB_VERSION VERSION_LESS "2.76")
     message(STATUS
         "GLib ${GLIB_VERSION}: g_task_set_static_name not available.  "
@@ -35,11 +33,22 @@ endif()
 # LuaJIT
 pkg_check_modules(LUAJIT REQUIRED IMPORTED_TARGET luajit)
 
-# CURL  (find_package provides proper IMPORTED target)
+# CURL
 find_package(CURL REQUIRED)
 
 # OpenSSL
 find_package(OpenSSL REQUIRED)
+
+# ══════════════════════════════════════════════════════════════
+# ██  FIX: find_package(Threads) MUST come before             ██
+# ██  target_link_libraries — Threads::Threads is an          ██
+# ██  IMPORTED target that must exist at configure time.       ██
+# ██                                                           ██
+# ██  BEFORE: find_package(Threads) was 20 lines AFTER the    ██
+# ██  target_link_libraries call → CMake CMP0028 error:        ██
+# ██  "Target Threads::Threads not found"                      ██
+# ══════════════════════════════════════════════════════════════
+find_package(Threads REQUIRED)
 
 # ── Optional system packages with FetchContent fallback ───────
 
@@ -55,7 +64,7 @@ if(NOT spdlog_FOUND)
         GIT_TAG        v1.13.0
         GIT_SHALLOW    TRUE
     )
-    set(SPDLOG_FMT_EXTERNAL OFF CACHE BOOL "" FORCE)   # use bundled fmt
+    set(SPDLOG_FMT_EXTERNAL OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(spdlog)
 endif()
 
@@ -72,7 +81,7 @@ if(NOT nlohmann_json_FOUND)
     FetchContent_MakeAvailable(json)
 endif()
 
-# ── Source Files (explicit — GLOB_RECURSE hides missing files) ─
+# ── Source Files ──────────────────────────────────────────────
 
 set(SOURCES
     src/main.cpp
@@ -112,13 +121,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     OpenSSL::Crypto
     spdlog::spdlog
     nlohmann_json::nlohmann_json
-    ${CMAKE_DL_LIBS}           # portable dl
-    Threads::Threads           # portable pthreads
+    ${CMAKE_DL_LIBS}
+    Threads::Threads
     m
 )
-
-# Threads::Threads requires this
-find_package(Threads REQUIRED)
 
 # stdc++fs — only needed on GCC < 9
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
@@ -126,15 +132,14 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
     target_link_libraries(${PROJECT_NAME} PRIVATE stdc++fs)
 endif()
 
-# ── Compiler Warnings (target-scoped, never override -O flags) ─
+# ── Compiler Warnings ────────────────────────────────────────
 
 target_compile_options(${PROJECT_NAME} PRIVATE
     -Wall -Wextra -Wpedantic
     -Wno-unused-parameter
-    -fPIC
 )
 
-# ── Post-Build: copy resources next to binary ──────────────────
+# ── Post-Build: copy resources ────────────────────────────────
 
 if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
@@ -148,9 +153,6 @@ endif()
 # ── Install ───────────────────────────────────────────────────
 
 install(TARGETS ${PROJECT_NAME} DESTINATION bin)
-install(DIRECTORY resources/ DESTINATION share/oss-executor/resources
-        OPTIONAL)
-install(DIRECTORY themes/    DESTINATION share/oss-executor/themes
-        OPTIONAL)
-install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts
-        OPTIONAL)
+install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
+install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
+install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
