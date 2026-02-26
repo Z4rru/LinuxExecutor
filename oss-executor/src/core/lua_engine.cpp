@@ -1,4 +1,3 @@
-// src/core/lua_engine.cpp
 #include "lua_engine.hpp"
 #include "utils/http.hpp"
 #include "utils/crypto.hpp"
@@ -18,13 +17,19 @@ static thread_local LuaEngine* current_engine = nullptr;
 LuaEngine::LuaEngine() = default;
 
 LuaEngine::~LuaEngine() {
-    shutdown();
+    // Destructor: no other thread should be using this object
+    shutdown_internal();
 }
 
 bool LuaEngine::init() {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (L_) shutdown();
+    // ═══════════════════════════════════════════════════════
+    // ██  FIX: Call shutdown_internal() — NOT shutdown()    ██
+    // ██  shutdown() would try to lock mutex_ again →       ██
+    // ██  std::mutex is non-recursive → DEADLOCK            ██
+    // ═══════════════════════════════════════════════════════
+    if (L_) shutdown_internal();
 
     L_ = luaL_newstate();
     if (!L_) {
@@ -34,6 +39,15 @@ bool LuaEngine::init() {
 
     luaL_openlibs(L_);
     setup_environment();
+
+    // ═══════════════════════════════════════════════════════
+    // ██  FIX: register_custom_libs() and sandbox() call   ██
+    // ██  execute_internal() — NOT execute().               ██
+    // ██  We already hold mutex_ here.                     ██
+    // ██                                                    ██
+    // ██  BEFORE: init() → register_custom_libs() →        ██
+    // ██          execute() → lock(mutex_) → ☠ DEADLOCK    ██
+    // ═══════════════════════════════════════════════════════
     register_custom_libs();
     sandbox();
 
@@ -43,6 +57,11 @@ bool LuaEngine::init() {
 }
 
 void LuaEngine::shutdown() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    shutdown_internal();
+}
+
+void LuaEngine::shutdown_internal() {
     running_ = false;
     if (L_) {
         lua_close(L_);
@@ -51,23 +70,25 @@ void LuaEngine::shutdown() {
 }
 
 void LuaEngine::reset() {
+    // Each call independently acquires/releases mutex — no deadlock
     shutdown();
     init();
 }
 
-// ═══════════════════════════════════════════════════════════
-// ██  stop() is INTENTIONALLY NOT HERE                    ██
-// ██  It is defined inline in lua_engine.hpp:             ██
-// ██    void stop() {                                     ██
-// ██        running_.store(false,                         ██
-// ██                       std::memory_order_release);    ██
-// ██    }                                                 ██
-// ██  Defining it here too causes:                        ██
-// ██    error: redefinition of 'void oss::LuaEngine::stop()'
-// ═══════════════════════════════════════════════════════════
-
 bool LuaEngine::execute(const std::string& script, const std::string& chunk_name) {
     std::lock_guard<std::mutex> lock(mutex_);
+    return execute_internal(script, chunk_name);
+}
+
+bool LuaEngine::execute_internal(const std::string& script,
+                                  const std::string& chunk_name) {
+    // ═══════════════════════════════════════════════════════
+    // ██  NOTE: Caller MUST hold mutex_.                    ██
+    // ██  Called by:                                        ██
+    // ██    execute()        — after locking                ██
+    // ██    register_custom_libs() — via init() which locks ██
+    // ██    sandbox()             — via init() which locks  ██
+    // ═══════════════════════════════════════════════════════
 
     if (!L_) {
         if (error_cb_) {
@@ -76,11 +97,17 @@ bool LuaEngine::execute(const std::string& script, const std::string& chunk_name
         return false;
     }
 
-    // Reset running flag for this execution
-    // Previous cancel_execution() set running_=false;
-    // we must re-enable it or this execute() would instantly reject
     running_.store(true, std::memory_order_release);
     current_engine = this;
+
+    // ═══════════════════════════════════════════════════════
+    // ██  STACK LEAK FIX: Record stack level before we      ██
+    // ██  push anything.  Restore it on all exit paths.     ██
+    // ██                                                     ██
+    // ██  BEFORE: LUA_MULTRET results accumulated on the   ██
+    // ██  stack across repeated execute() calls.            ██
+    // ═══════════════════════════════════════════════════════
+    int base_top = lua_gettop(L_);
 
     // Set up cancellation hook
     lua_sethook(L_, [](lua_State* L, lua_Debug*) {
@@ -89,11 +116,12 @@ bool LuaEngine::execute(const std::string& script, const std::string& chunk_name
         }
     }, LUA_MASKCOUNT, 1000000);
 
-    int status = luaL_loadbuffer(L_, script.c_str(), script.size(), chunk_name.c_str());
+    int status = luaL_loadbuffer(L_, script.c_str(), script.size(),
+                                 chunk_name.c_str());
 
     if (status != 0) {
         std::string err = lua_tostring(L_, -1);
-        lua_pop(L_, 1);
+        lua_settop(L_, base_top);  // clean stack
 
         LuaError error;
         error.message = err;
@@ -104,7 +132,8 @@ bool LuaEngine::execute(const std::string& script, const std::string& chunk_name
             auto colon2 = err.find(':', colon1 + 1);
             if (colon2 != std::string::npos) {
                 try {
-                    error.line = std::stoi(err.substr(colon1 + 1, colon2 - colon1 - 1));
+                    error.line = std::stoi(
+                        err.substr(colon1 + 1, colon2 - colon1 - 1));
                 } catch (...) {}
             }
         }
@@ -116,18 +145,18 @@ bool LuaEngine::execute(const std::string& script, const std::string& chunk_name
         return false;
     }
 
-    // Push error handler
+    // Stack: [base..., chunk]
     lua_pushcfunction(L_, lua_pcall_handler);
-    lua_insert(L_, -2);   // stack: [handler, chunk]
+    lua_insert(L_, -2);
+    // Stack: [base..., handler, chunk]
 
-    int handler_index = lua_gettop(L_) - 1;  // absolute index of handler
+    int handler_index = lua_gettop(L_) - 1;
 
     status = lua_pcall(L_, 0, LUA_MULTRET, handler_index);
 
     if (status != 0) {
         std::string err = lua_tostring(L_, -1);
-        lua_pop(L_, 1);                // pop error message
-        lua_remove(L_, handler_index); // pop handler
+        lua_settop(L_, base_top);  // clean everything
 
         LuaError error;
         error.message = err;
@@ -141,7 +170,12 @@ bool LuaEngine::execute(const std::string& script, const std::string& chunk_name
         return false;
     }
 
-    lua_remove(L_, handler_index);
+    // ═══════════════════════════════════════════════════════
+    // ██  STACK LEAK FIX: Discard handler + all results     ██
+    // ██  BEFORE: lua_remove(handler_index) left results    ██
+    // ██  on the stack — grew with every execute() call.    ██
+    // ═══════════════════════════════════════════════════════
+    lua_settop(L_, base_top);
 
     lua_sethook(L_, nullptr, 0, 0);
     current_engine = nullptr;
@@ -210,6 +244,34 @@ std::optional<std::string> LuaEngine::get_global_string(const std::string& name)
     return std::nullopt;
 }
 
+// ═══════════════════════════════════════════════════════════
+// ██  PATH TRAVERSAL FIX                                   ██
+// ██                                                        ██
+// ██  BEFORE:                                               ██
+// ██    canonical.string().find(base_canonical.string())    ██
+// ██    → "/workspace2/evil".find("/workspace") == 0  ✓     ██
+// ██    → BYPASSED — attacker reads /workspace2/            ██
+// ██                                                        ██
+// ██  AFTER:                                                ██
+// ██    Append "/" to base before comparison.                ██
+// ██    → "/workspace2/evil".find("/workspace/") == npos ✗  ██
+// ██    → BLOCKED                                           ██
+// ═══════════════════════════════════════════════════════════
+bool LuaEngine::is_sandboxed(const std::string& full_path,
+                              const std::string& base_dir) {
+    std::error_code ec;
+    auto canonical = std::filesystem::weakly_canonical(full_path, ec);
+    if (ec) return false;  // can't resolve → deny
+    auto base_canonical = std::filesystem::weakly_canonical(base_dir, ec);
+    if (ec) return false;
+
+    std::string base_str = base_canonical.string();
+    if (!base_str.empty() && base_str.back() != '/')
+        base_str += '/';
+
+    return canonical.string().find(base_str) == 0;
+}
+
 void LuaEngine::setup_environment() {
     lua_pushcfunction(L_, lua_print);
     lua_setglobal(L_, "print");
@@ -273,8 +335,12 @@ void LuaEngine::register_custom_libs() {
     set_global_number("_EXECUTOR_LEVEL", 8);
     set_global_bool("_OSS", true);
 
-    // Compatibility aliases
-    execute(R"(
+    // ═══════════════════════════════════════════════════════
+    // ██  DEADLOCK FIX: Call execute_internal(), NOT        ██
+    // ██  execute().  We are called from init() which       ██
+    // ██  already holds mutex_.                             ██
+    // ═══════════════════════════════════════════════════════
+    execute_internal(R"(
         task = task or {}
         task.wait = wait
         task.spawn = spawn
@@ -296,7 +362,10 @@ void LuaEngine::register_custom_libs() {
 }
 
 void LuaEngine::sandbox() {
-    execute(R"(
+    // ═══════════════════════════════════════════════════════
+    // ██  DEADLOCK FIX: execute_internal(), NOT execute()   ██
+    // ═══════════════════════════════════════════════════════
+    execute_internal(R"(
         local safe_os = {
             time = os.time,
             clock = os.clock,
@@ -310,7 +379,7 @@ void LuaEngine::sandbox() {
     )", "=sandbox");
 }
 
-// ── Static Lua callbacks ──
+// ── Static Lua callbacks ──────────────────────────────────
 
 int LuaEngine::lua_print(lua_State* L) {
     int nargs = lua_gettop(L);
@@ -440,7 +509,7 @@ int LuaEngine::lua_spawn(lua_State* L) {
         }
     }
 
-    return 1;
+    return 1;  // return thread handle to Lua
 }
 
 int LuaEngine::lua_readfile(lua_State* L) {
@@ -449,10 +518,7 @@ int LuaEngine::lua_readfile(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(full_path, ec);
-    auto base_canonical = std::filesystem::weakly_canonical(base, ec);
-    if (canonical.string().find(base_canonical.string()) != 0) {
+    if (!is_sandboxed(full_path, base)) {
         return luaL_error(L, "Access denied: path traversal detected");
     }
 
@@ -474,14 +540,13 @@ int LuaEngine::lua_writefile(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(full_path, ec);
-    auto base_canonical = std::filesystem::weakly_canonical(base, ec);
-    if (canonical.string().find(base_canonical.string()) != 0) {
+    if (!is_sandboxed(full_path, base)) {
         return luaL_error(L, "Access denied: path traversal detected");
     }
 
-    std::filesystem::create_directories(std::filesystem::path(full_path).parent_path(), ec);
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path(full_path).parent_path(), ec);
 
     std::ofstream file(full_path);
     if (!file.is_open()) {
@@ -499,10 +564,7 @@ int LuaEngine::lua_appendfile(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(full_path, ec);
-    auto base_canonical = std::filesystem::weakly_canonical(base, ec);
-    if (canonical.string().find(base_canonical.string()) != 0) {
+    if (!is_sandboxed(full_path, base)) {
         return luaL_error(L, "Access denied: path traversal detected");
     }
 
@@ -517,22 +579,52 @@ int LuaEngine::lua_appendfile(lua_State* L) {
 
 int LuaEngine::lua_isfile(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
-    std::string full_path = Config::instance().home_dir() + "/workspace/" + path;
+
+    std::string base = Config::instance().home_dir() + "/workspace/";
+    std::string full_path = base + path;
+
+    // ═══════════════════════════════════════════════════════
+    // ██  FIX: Added sandbox check — was completely missing ██
+    // ██  BEFORE: isfile("../../etc/passwd") → true         ██
+    // ═══════════════════════════════════════════════════════
+    if (!is_sandboxed(full_path, base)) {
+        lua_pushboolean(L, false);
+        return 1;
+    }
+
     lua_pushboolean(L, std::filesystem::exists(full_path));
     return 1;
 }
 
 int LuaEngine::lua_listfiles(lua_State* L) {
     const char* path = luaL_optstring(L, 1, "");
-    std::string full_path = Config::instance().home_dir() + "/workspace/" + path;
+
+    std::string base = Config::instance().home_dir() + "/workspace/";
+    std::string full_path = base + path;
+
+    // ═══════════════════════════════════════════════════════
+    // ██  FIX: Added sandbox check — was completely missing ██
+    // ██  BEFORE: listfiles("../../") → lists parent dirs   ██
+    // ═══════════════════════════════════════════════════════
+    if (!is_sandboxed(full_path, base)) {
+        lua_newtable(L);
+        return 1;  // return empty table, don't leak info
+    }
 
     lua_newtable(L);
     int index = 1;
 
-    if (std::filesystem::exists(full_path) && std::filesystem::is_directory(full_path)) {
-        for (const auto& entry : std::filesystem::directory_iterator(full_path)) {
-            lua_pushstring(L, entry.path().filename().string().c_str());
-            lua_rawseti(L, -2, index++);
+    if (std::filesystem::exists(full_path) &&
+        std::filesystem::is_directory(full_path)) {
+        try {
+            for (const auto& entry :
+                 std::filesystem::directory_iterator(full_path)) {
+                lua_pushstring(L,
+                    entry.path().filename().string().c_str());
+                lua_rawseti(L, -2, index++);
+            }
+        } catch (const std::filesystem::filesystem_error& /*e*/) {
+            // Permission denied or broken symlink — return partial list
         }
     }
 
@@ -541,32 +633,30 @@ int LuaEngine::lua_listfiles(lua_State* L) {
 
 int LuaEngine::lua_delfolder(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
+
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(full_path, ec);
-    auto base_canonical = std::filesystem::weakly_canonical(base, ec);
-    if (canonical.string().find(base_canonical.string()) != 0) {
+    if (!is_sandboxed(full_path, base)) {
         return luaL_error(L, "Access denied: path traversal detected");
     }
 
+    std::error_code ec;
     std::filesystem::remove_all(full_path, ec);
     return 0;
 }
 
 int LuaEngine::lua_makefolder(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
+
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(full_path, ec);
-    auto base_canonical = std::filesystem::weakly_canonical(base, ec);
-    if (canonical.string().find(base_canonical.string()) != 0) {
+    if (!is_sandboxed(full_path, base)) {
         return luaL_error(L, "Access denied: path traversal detected");
     }
 
+    std::error_code ec;
     std::filesystem::create_directories(full_path, ec);
     return 0;
 }
@@ -655,9 +745,12 @@ int LuaEngine::lua_base64_decode(lua_State* L) {
     static const auto table = []() {
         std::array<unsigned char, 256> t{};
         t.fill(0);
-        const char* chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const char* chars =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            "0123456789+/";
         for (size_t i = 0; i < 64; ++i) {
-            t[static_cast<unsigned char>(chars[i])] = static_cast<unsigned char>(i);
+            t[static_cast<unsigned char>(chars[i])] =
+                static_cast<unsigned char>(i);
         }
         return t;
     }();
