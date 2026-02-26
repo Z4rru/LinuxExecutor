@@ -20,6 +20,8 @@ Copy and paste this into your terminal to download, build, and run automatically
 git clone https://github.com/Z4rru/oss-executor.git && cd oss-executor && chmod +x build.sh && ./build.sh && ./run.sh
 Manual Install
 If you prefer to run the steps individually:
+code
+Bash
 # 1. Clone the repository
 git clone https://github.com/Z4rru/oss-executor.git
 cd oss-executor
@@ -30,7 +32,6 @@ chmod +x build.sh run.sh
 
 # 3. Run
 ./run.sh
-```
 Download Pre-Built Binary
 Go to Releases and download the latest .tar.gz for your system.
 ✨ Features
