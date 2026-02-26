@@ -30,16 +30,23 @@ public:
         return inst;
     }
 
+    Injection(const Injection&)            = delete;
+    Injection& operator=(const Injection&) = delete;
+
+    ~Injection() {
+        stop_auto_scan();          // ensure thread is joined
+    }
+
     void set_status_callback(StatusCallback cb) { status_cb_ = std::move(cb); }
 
-    InjectionStatus status() const { return status_; }
+    InjectionStatus status() const { return status_.load(); }
     pid_t target_pid() const { return memory_.get_pid(); }
 
     bool scan_for_roblox();
     bool attach();
     bool detach();
     bool inject();
-    
+
     void start_auto_scan();
     void stop_auto_scan();
 
@@ -47,14 +54,14 @@ public:
 
 private:
     Injection() = default;
-    
+
     void set_status(InjectionStatus s, const std::string& msg = "") {
-        status_ = s;
+        status_.store(s);
         if (status_cb_) status_cb_(s, msg);
     }
 
     Memory memory_;
-    InjectionStatus status_ = InjectionStatus::Idle;
+    std::atomic<InjectionStatus> status_{InjectionStatus::Idle};
     StatusCallback status_cb_;
     std::atomic<bool> scanning_{false};
     std::thread scan_thread_;
