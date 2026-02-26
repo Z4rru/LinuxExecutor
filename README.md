@@ -38,9 +38,6 @@ chmod +x build.sh run.sh
 
 Download Pre-Built Binary
 Go to Releases and download the latest .tar.gz for your system.
-
----
-
 ✨ Features
 Feature	Status
 LuaJIT Script Execution	✅
@@ -59,7 +56,6 @@ Keyboard Shortcuts	✅
 Clipboard Access	✅
 AES-256 Encryption	✅
 Logging System	✅
----
 ⌨️ Keybinds
 Action	Shortcut
 Execute Script	Ctrl+Enter
@@ -72,10 +68,8 @@ Inject	F5
 Toggle Console	F12
 Undo	Ctrl+Z
 Redo	Ctrl+Y
-
 📁 Project Structure
 See ARCHITECTURE.md for detailed explanations.
-
 🔧 Requirements
 OS: Linux Mint 21+ / Ubuntu 22.04+
 UI: GTK4 development libraries
