@@ -15,6 +15,24 @@ echo "║       Linux Mint Native Build                    ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
+check_glib_version() {
+    # Warn if system GLib is too old or if there's a version split
+    local glib_ver
+    glib_ver=$(pkg-config --modversion glib-2.0 2>/dev/null || echo "unknown")
+    echo -e "${CYAN}[i] System GLib version: ${glib_ver}${NC}"
+
+    # Check GVFS module GLib dependency
+    local gvfs_lib="/usr/lib/x86_64-linux-gnu/gio/modules/libgvfsdbus.so"
+    if [ -f "$gvfs_lib" ]; then
+        local gvfs_needs
+        gvfs_needs=$(objdump -T "$gvfs_lib" 2>/dev/null | grep -c "g_task_set_static_name" || true)
+        if [ "$gvfs_needs" -gt 0 ]; then
+            echo -e "${YELLOW}[!] System GVFS requires g_task_set_static_name (GLib 2.76+)"
+            echo -e "    Build will set GIO_MODULE_DIR=\"\" to isolate from system GVFS${NC}"
+        fi
+    fi
+}
+
 install_deps() {
     echo -e "${YELLOW}[*] Installing dependencies...${NC}"
     sudo apt-get update -qq
@@ -22,40 +40,74 @@ install_deps() {
         build-essential cmake ninja-build git pkg-config \
         libgtk-4-dev libcurl4-openssl-dev libssl-dev \
         libgirepository1.0-dev fonts-jetbrains-mono \
-        luajit libluajit-5.1-dev 2>/dev/null
+        luajit libluajit-5.1-dev \
+        libspdlog-dev nlohmann-json3-dev \
+        2>/dev/null || true
+
+    # Fallback: if spdlog/nlohmann not in repos, CMake FetchContent handles it
     echo -e "${GREEN}[✓] Dependencies installed${NC}"
 }
 
 build_project() {
     echo -e "${YELLOW}[*] Configuring build...${NC}"
-    
+
     mkdir -p build
     cd build
-    
+
     cmake .. \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local
-    
+
     echo -e "${YELLOW}[*] Building...${NC}"
-    ninja -j$(nproc)
-    
+    ninja -j"$(nproc)"
+
     echo -e "${GREEN}[✓] Build complete${NC}"
     cd ..
 }
 
 setup_dirs() {
-    mkdir -p ~/.oss-executor/{scripts/autoexec,themes,logs,cache}
-    cp -r scripts/* ~/.oss-executor/scripts/ 2>/dev/null || true
-    cp -r themes/* ~/.oss-executor/themes/ 2>/dev/null || true
-    cp -r resources ~/.oss-executor/ 2>/dev/null || true
-    
-    if [ ! -f ~/.oss-executor/config.json ]; then
-        cp config.json ~/.oss-executor/config.json
+    local home="${HOME}/.oss-executor"
+    mkdir -p "${home}"/{scripts/autoexec,themes,logs,cache,workspace}
+    cp -r scripts/* "${home}/scripts/" 2>/dev/null || true
+    cp -r themes/* "${home}/themes/" 2>/dev/null || true
+    cp -r resources "${home}/" 2>/dev/null || true
+
+    if [ ! -f "${home}/config.json" ]; then
+        cp config.json "${home}/config.json" 2>/dev/null || true
     fi
-    
+
     echo -e "${GREEN}[✓] Directory structure ready${NC}"
 }
+
+create_appimage_wrapper() {
+    # Create AppRun wrapper that sets GIO env vars
+    local appdir="$1"
+    cat > "${appdir}/AppRun" << 'APPRUN_EOF'
+#!/usr/bin/env bash
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
+
+# ── CRITICAL: Isolate from system GIO/GVFS ──
+export GIO_MODULE_DIR=""
+export GIO_USE_VFS="local"
+export GSK_RENDERER="${GSK_RENDERER:-gl}"
+export GTK_A11Y=none
+export NO_AT_BRIDGE=1
+
+# Use bundled libraries if present
+if [ -d "${SELF_DIR}/usr/lib" ]; then
+    export LD_LIBRARY_PATH="${SELF_DIR}/usr/lib:${LD_LIBRARY_PATH:-}"
+fi
+
+export OSS_HOME="${HOME}/.oss-executor"
+exec "${SELF_DIR}/usr/bin/OSSExecutor" "$@"
+APPRUN_EOF
+    chmod +x "${appdir}/AppRun"
+    echo -e "${GREEN}[✓] AppRun wrapper created with GIO isolation${NC}"
+}
+
+# ── Main ──
+check_glib_version
 
 if ! command -v cmake &>/dev/null || ! pkg-config --exists gtk4 2>/dev/null; then
     install_deps
