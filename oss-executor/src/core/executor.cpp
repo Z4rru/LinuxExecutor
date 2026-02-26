@@ -24,7 +24,6 @@ void Executor::init() {
     LOG_INFO("Initializing OSS Executor...");
     if (status_cb_) status_cb_("Initializing...");
 
-    // ── Initialize Lua engine with timing ──
     auto t0 = std::chrono::steady_clock::now();
 
     if (!lua_.init()) {
@@ -38,7 +37,6 @@ void Executor::init() {
                   std::chrono::steady_clock::now() - t0).count();
     LOG_INFO("Lua engine initialized in {}ms", ms);
 
-    // ── Wire Lua output/error to our callbacks ──
     lua_.set_output_callback([this](const std::string& msg) {
         if (output_cb_) output_cb_(msg);
     });
@@ -51,18 +49,23 @@ void Executor::init() {
         if (error_cb_) error_cb_(msg);
     });
 
-    // ── Injection status forwarding ──
     Injection::instance().set_status_callback(
         [this](InjectionStatus /*status*/, const std::string& msg) {
             if (status_cb_) status_cb_(msg);
         }
     );
 
-    // ── Ensure workspace exists ──
-    auto workspace = Config::instance().home_dir() + "/workspace";
-    std::filesystem::create_directories(workspace);
+    // ═══════════════════════════════════════════════════════
+    // Ensure workspace exists — prevents "open dir error"
+    // when scripts try readfile/writefile before first use
+    // ═══════════════════════════════════════════════════════
+    try {
+        auto workspace = Config::instance().home_dir() + "/workspace";
+        std::filesystem::create_directories(workspace);
+    } catch (const std::filesystem::filesystem_error& e) {
+        LOG_WARN("Could not create workspace: {}", e.what());
+    }
 
-    // ── Optional auto-scan ──
     if (Config::instance().get<bool>("executor.auto_inject", false)) {
         Injection::instance().start_auto_scan();
     }
@@ -128,32 +131,42 @@ void Executor::cancel_execution() {
 void Executor::auto_execute() {
     std::string dir = Config::instance().home_dir() + "/scripts/autoexec";
 
-    if (!std::filesystem::exists(dir) ||
-        !std::filesystem::is_directory(dir)) {
-        return;
-    }
-
-    std::vector<std::filesystem::path> scripts;
-    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-        if (!entry.is_regular_file()) continue;
-        auto ext = entry.path().extension().string();
-        if (ext == ".lua" || ext == ".luau") {
-            scripts.push_back(entry.path());
+    // ═══════════════════════════════════════════════════════
+    // ██  FIX: Wrap directory iteration in try/catch.       ██
+    // ██  BEFORE: Unhandled filesystem_error if dir has     ██
+    // ██  bad permissions or is a broken symlink.           ██
+    // ═══════════════════════════════════════════════════════
+    try {
+        if (!std::filesystem::exists(dir) ||
+            !std::filesystem::is_directory(dir)) {
+            return;
         }
-    }
 
-    std::sort(scripts.begin(), scripts.end());
-
-    for (const auto& s : scripts) {
-        LOG_INFO("Auto-executing: {}", s.filename().string());
-        if (output_cb_) {
-            output_cb_("[autoexec] Running " + s.filename().string());
+        std::vector<std::filesystem::path> scripts;
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            if (!entry.is_regular_file()) continue;
+            auto ext = entry.path().extension().string();
+            if (ext == ".lua" || ext == ".luau") {
+                scripts.push_back(entry.path());
+            }
         }
-        execute_file(s.string());
-    }
 
-    if (!scripts.empty()) {
-        LOG_INFO("Auto-executed {} scripts", scripts.size());
+        std::sort(scripts.begin(), scripts.end());
+
+        for (const auto& s : scripts) {
+            LOG_INFO("Auto-executing: {}", s.filename().string());
+            if (output_cb_) {
+                output_cb_("[autoexec] Running " + s.filename().string());
+            }
+            execute_file(s.string());
+        }
+
+        if (!scripts.empty()) {
+            LOG_INFO("Auto-executed {} scripts", scripts.size());
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        LOG_ERROR("Auto-execute failed: {}", e.what());
+        if (error_cb_) error_cb_("Auto-execute error: " + std::string(e.what()));
     }
 }
 
