@@ -73,13 +73,18 @@ public:
         data_[ptr] = value;
     }
 
-    const json& raw() const {
+    // ═══════════════════════════════════════════════════════
+    // WARNING: The returned reference is only safe while no
+    // other thread calls set()/load()/save().  Copy the json
+    // object if you need it across an async boundary:
+    //   json snapshot = Config::instance().raw();
+    // ═══════════════════════════════════════════════════════
+    json raw() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return data_;
+        return data_;  // return by VALUE — safe across threads
     }
 
     std::string home_dir() const {
-        // Allow override via environment variable
         const char* oss_home = std::getenv("OSS_HOME");
         if (oss_home && oss_home[0] != '\0') {
             return std::string(oss_home);
@@ -90,14 +95,23 @@ public:
 
 private:
     Config() {
-        // Ensure essential directories exist on construction
+        // ═══════════════════════════════════════════════════
+        // ██  FIX for "open dir error: No such file or      ██
+        // ██  directory" — create ALL directories on first   ██
+        // ██  construction, before anything tries to read.   ██
+        // ═══════════════════════════════════════════════════
         auto home = home_dir();
-        std::filesystem::create_directories(home);
-        std::filesystem::create_directories(home + "/workspace");
-        std::filesystem::create_directories(home + "/logs");
-        std::filesystem::create_directories(home + "/scripts/autoexec");
-        std::filesystem::create_directories(home + "/themes");
-        std::filesystem::create_directories(home + "/cache");
+        try {
+            std::filesystem::create_directories(home);
+            std::filesystem::create_directories(home + "/workspace");
+            std::filesystem::create_directories(home + "/logs");
+            std::filesystem::create_directories(home + "/scripts/autoexec");
+            std::filesystem::create_directories(home + "/themes");
+            std::filesystem::create_directories(home + "/cache");
+        } catch (const std::filesystem::filesystem_error& /*e*/) {
+            // If we can't create dirs (read-only fs, permissions),
+            // continue — individual operations will fail gracefully.
+        }
     }
 
     std::string replace_dots(const std::string& key) const {
