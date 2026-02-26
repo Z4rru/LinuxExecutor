@@ -34,7 +34,7 @@ static void signal_handler(int sig) {
     // Avoid spdlog in signal handler (not async-signal-safe)
     // Use write() which IS async-signal-safe
     const char* msg = "\n[!] Signal received, shutting down...\n";
-    (void)write(STDERR_FILENO, msg, strlen(msg));
+    if (write(STDERR_FILENO, msg, strlen(msg)) == -1) { /* signal-safe, nothing to do */ }
 
     oss::Executor::instance().shutdown();
     _exit(0);  // _exit, not exit — safe in signal handlers
@@ -65,3 +65,4 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+
