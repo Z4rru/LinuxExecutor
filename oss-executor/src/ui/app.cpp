@@ -9,7 +9,11 @@
 namespace oss {
 
 App::App(int argc, char** argv) : argc_(argc), argv_(argv) {
+#if GLIB_CHECK_VERSION(2, 74, 0)
     gtk_app_ = gtk_application_new("com.oss.executor", G_APPLICATION_DEFAULT_FLAGS);
+#else
+    gtk_app_ = gtk_application_new("com.oss.executor", G_APPLICATION_FLAGS_NONE);
+#endif
     
     g_signal_connect(gtk_app_, "activate", G_CALLBACK(+[](GtkApplication* app, gpointer data) {
         static_cast<App*>(data)->build_ui(app);
@@ -300,7 +304,11 @@ void App::apply_theme() {
     std::string css = theme.generate_css();
     
     GtkCssProvider* provider = gtk_css_provider_new();
+#if GTK_CHECK_VERSION(4, 12, 0)
     gtk_css_provider_load_from_string(provider, css.c_str());
+#else
+    gtk_css_provider_load_from_data(provider, css.c_str(), -1);
+#endif
     
     gtk_style_context_add_provider_for_display(
         gdk_display_get_default(),
