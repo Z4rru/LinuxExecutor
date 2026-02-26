@@ -1,4 +1,4 @@
-# ◈ OSS Executor v2.0
+# ◈ OSS Executor v1.0
 <img width="958" height="575" alt="image" src="https://github.com/user-attachments/assets/5e365f64-68b9-4e80-a550-7a693082ded9" />
 
 **Open Source Softworks — Roblox Executor for Linux Mint**
