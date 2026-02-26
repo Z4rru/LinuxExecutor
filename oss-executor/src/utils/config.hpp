@@ -1,10 +1,11 @@
-﻿#pragma once
+#pragma once
 
 #include <nlohmann/json.hpp>
 #include <string>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <cstdlib>
 
 namespace oss {
 
@@ -17,28 +18,32 @@ public:
         return inst;
     }
 
+    Config(const Config&)            = delete;
+    Config& operator=(const Config&) = delete;
+
     bool load(const std::string& path) {
         std::lock_guard<std::mutex> lock(mutex_);
         path_ = path;
-        
+
         try {
             if (!std::filesystem::exists(path)) {
                 data_ = get_defaults();
                 save_internal();
                 return true;
             }
-            
+
             std::ifstream f(path);
             if (!f.is_open()) return false;
-            
-            data_ = json::parse(f, nullptr, true, true);
-            
+
+            data_ = json::parse(f, nullptr, /*allow_exceptions=*/true,
+                                /*ignore_comments=*/true);
+
             // Merge with defaults for any missing keys
             auto defaults = get_defaults();
             merge_defaults(data_, defaults);
-            
+
             return true;
-        } catch (const std::exception& e) {
+        } catch (const std::exception& /*e*/) {
             data_ = get_defaults();
             return false;
         }
@@ -68,16 +73,33 @@ public:
         data_[ptr] = value;
     }
 
-    const json& raw() const { return data_; }
-    
+    const json& raw() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return data_;
+    }
+
     std::string home_dir() const {
-        const char* home = getenv("HOME");
-        return std::string(home ? home : "/tmp") + "/.oss-executor";
+        // Allow override via environment variable
+        const char* oss_home = std::getenv("OSS_HOME");
+        if (oss_home && oss_home[0] != '\0') {
+            return std::string(oss_home);
+        }
+        const char* user_home = std::getenv("HOME");
+        return std::string(user_home ? user_home : "/tmp") + "/.oss-executor";
     }
 
 private:
-    Config() = default;
-    
+    Config() {
+        // Ensure essential directories exist on construction
+        auto home = home_dir();
+        std::filesystem::create_directories(home);
+        std::filesystem::create_directories(home + "/workspace");
+        std::filesystem::create_directories(home + "/logs");
+        std::filesystem::create_directories(home + "/scripts/autoexec");
+        std::filesystem::create_directories(home + "/themes");
+        std::filesystem::create_directories(home + "/cache");
+    }
+
     std::string replace_dots(const std::string& key) const {
         std::string result = key;
         for (auto& c : result) {
@@ -88,12 +110,14 @@ private:
 
     bool save_internal() {
         try {
-            std::filesystem::create_directories(
-                std::filesystem::path(path_).parent_path()
-            );
+            auto parent = std::filesystem::path(path_).parent_path();
+            if (!parent.empty()) {
+                std::filesystem::create_directories(parent);
+            }
             std::ofstream f(path_);
+            if (!f.is_open()) return false;
             f << data_.dump(4);
-            return true;
+            return f.good();
         } catch (...) {
             return false;
         }
@@ -109,7 +133,7 @@ private:
         }
     }
 
-    json get_defaults() {
+    static json get_defaults() {
         return json::parse(R"({
             "version": "2.0.0",
             "executor": {
