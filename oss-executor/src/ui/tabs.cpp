@@ -119,6 +119,24 @@ void TabManager::set_tab_modified(int id, bool modified) {
     rebuild_ui();
 }
 
+// Helper struct to avoid commas inside macros
+struct TabCallbackData {
+    TabManager* manager;
+    int tab_id;
+};
+
+static void on_close_tab(gpointer data) {
+    auto* cbd = static_cast<TabCallbackData*>(data);
+    cbd->manager->remove_tab(cbd->tab_id);
+    delete cbd;
+}
+
+static void on_select_tab(gpointer data) {
+    auto* cbd = static_cast<TabCallbackData*>(data);
+    cbd->manager->set_active(cbd->tab_id);
+    delete cbd;
+}
+
 void TabManager::rebuild_ui() {
     // Remove all children from tab_box
     GtkWidget* child = gtk_widget_get_first_child(tab_box_);
@@ -143,13 +161,9 @@ void TabManager::rebuild_ui() {
             gtk_widget_add_css_class(close_btn, "tab-close");
             gtk_widget_set_margin_start(close_btn, 4);
             
-            int tab_id = tab.id;
-            auto* close_data = new std::pair<TabManager*, int>(this, tab_id);
-            g_signal_connect_swapped(close_btn, "clicked", G_CALLBACK(+[](gpointer data) {
-                auto* pair = static_cast<std::pair<TabManager*, int>*>(data);
-                pair->first->remove_tab(pair->second);
-                delete pair;
-            }), close_data);
+            auto* close_data = new TabCallbackData{this, tab.id};
+            g_signal_connect_swapped(close_btn, "clicked",
+                G_CALLBACK(on_close_tab), close_data);
             
             gtk_box_append(GTK_BOX(btn_box), close_btn);
         }
@@ -162,13 +176,9 @@ void TabManager::rebuild_ui() {
             gtk_widget_add_css_class(tab_btn, "active");
         }
         
-        int tab_id = tab.id;
-        auto* tab_data = new std::pair<TabManager*, int>(this, tab_id);
-        g_signal_connect_swapped(tab_btn, "clicked", G_CALLBACK(+[](gpointer data) {
-            auto* pair = static_cast<std::pair<TabManager*, int>*>(data);
-            pair->first->set_active(pair->second);
-            delete pair;
-        }), tab_data);
+        auto* tab_data = new TabCallbackData{this, tab.id};
+        g_signal_connect_swapped(tab_btn, "clicked",
+            G_CALLBACK(on_select_tab), tab_data);
         
         tab.button = tab_btn;
         gtk_box_append(GTK_BOX(tab_box_), tab_btn);
