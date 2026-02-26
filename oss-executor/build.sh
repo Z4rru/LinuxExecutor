@@ -11,24 +11,23 @@ NC='\033[0m'
 echo -e "${CYAN}${BOLD}"
 echo "╔══════════════════════════════════════════════════╗"
 echo "║       OSS Executor — Build System v2.0           ║"
-echo "║       Linux Mint Native Build                    ║"
+echo "║       Linux Native Build                         ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
 check_glib_version() {
-    # Warn if system GLib is too old or if there's a version split
     local glib_ver
     glib_ver=$(pkg-config --modversion glib-2.0 2>/dev/null || echo "unknown")
     echo -e "${CYAN}[i] System GLib version: ${glib_ver}${NC}"
 
-    # Check GVFS module GLib dependency
+    # Check if system GVFS needs symbols newer than installed GLib
     local gvfs_lib="/usr/lib/x86_64-linux-gnu/gio/modules/libgvfsdbus.so"
-    if [ -f "$gvfs_lib" ]; then
+    if [ -f "$gvfs_lib" ] && command -v objdump &>/dev/null; then
         local gvfs_needs
         gvfs_needs=$(objdump -T "$gvfs_lib" 2>/dev/null | grep -c "g_task_set_static_name" || true)
         if [ "$gvfs_needs" -gt 0 ]; then
             echo -e "${YELLOW}[!] System GVFS requires g_task_set_static_name (GLib 2.76+)"
-            echo -e "    Build will set GIO_MODULE_DIR=\"\" to isolate from system GVFS${NC}"
+            echo -e "    Build sets GIO_MODULE_DIR=\"\" to isolate from system GVFS${NC}"
         fi
     fi
 }
@@ -44,7 +43,6 @@ install_deps() {
         libspdlog-dev nlohmann-json3-dev \
         2>/dev/null || true
 
-    # Fallback: if spdlog/nlohmann not in repos, CMake FetchContent handles it
     echo -e "${GREEN}[✓] Dependencies installed${NC}"
 }
 
@@ -80,8 +78,13 @@ setup_dirs() {
     echo -e "${GREEN}[✓] Directory structure ready${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+# AppRun wrapper generator — used by CI and `make appimage`
+# Creates the FUSE/GIO isolation layer inside an AppDir.
+#
+# Usage:  create_appimage_wrapper /path/to/AppDir
+# ══════════════════════════════════════════════════════════════
 create_appimage_wrapper() {
-    # Create AppRun wrapper that sets GIO env vars
     local appdir="$1"
     cat > "${appdir}/AppRun" << 'APPRUN_EOF'
 #!/usr/bin/env bash
@@ -94,7 +97,12 @@ export GSK_RENDERER="${GSK_RENDERER:-gl}"
 export GTK_A11Y=none
 export NO_AT_BRIDGE=1
 
-# Use bundled libraries if present
+# D-Bus timeout prevention
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="disabled:"
+fi
+
+# Use bundled libraries
 if [ -d "${SELF_DIR}/usr/lib" ]; then
     export LD_LIBRARY_PATH="${SELF_DIR}/usr/lib:${LD_LIBRARY_PATH:-}"
 fi
@@ -103,7 +111,7 @@ export OSS_HOME="${HOME}/.oss-executor"
 exec "${SELF_DIR}/usr/bin/OSSExecutor" "$@"
 APPRUN_EOF
     chmod +x "${appdir}/AppRun"
-    echo -e "${GREEN}[✓] AppRun wrapper created with GIO isolation${NC}"
+    echo -e "${GREEN}[✓] AppRun wrapper created with GIO/D-Bus isolation${NC}"
 }
 
 # ── Main ──
@@ -119,3 +127,6 @@ setup_dirs
 echo ""
 echo -e "${GREEN}${BOLD}[✓] OSS Executor built successfully!${NC}"
 echo -e "${CYAN}    Run: ./run.sh${NC}"
+echo ""
+echo -e "${CYAN}    If using AppImage and FUSE fails:${NC}"
+echo -e "${CYAN}    ./OSS_Executor-x86_64.AppImage --appimage-extract-and-run${NC}"
