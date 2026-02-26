@@ -30,6 +30,8 @@ chmod +x build.sh run.sh
 # Run
 ./run.sh
 
+```
+
 Download Pre-Built Binary
 Go to Releases
 and download the latest .tar.gz for your system.
