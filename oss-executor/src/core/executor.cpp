@@ -26,7 +26,7 @@ bool Executor::init() {
 
     // Set up injection status callback
     Injection::instance().set_status_callback(
-        [this](InjectionStatus status, const std::string& msg) {
+            [this](InjectionStatus /*status*/, const std::string& msg) {
             if (status_cb_) status_cb_(msg);
         }
     );
@@ -169,5 +169,6 @@ void Executor::worker_loop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
+
 
 } // namespace oss
