@@ -1,4 +1,5 @@
 #include "closures.hpp"
+#include <string>
 
 namespace oss {
 
@@ -71,5 +72,6 @@ int Closures::get_calling_script(lua_State* L) {
     lua_pushnil(L); // No real script instance in standalone mode
     return 1;
 }
+
 
 } // namespace oss
