@@ -9,9 +9,6 @@
 #include <optional>
 #include <atomic>
 
-// PkgConfig::LUAJIT adds -I/usr/include/luajit-2.1 (or -2.0),
-// so <lua.h> resolves correctly.  Do NOT use <luajit-2.1/lua.h>
-// with IMPORTED_TARGET — that would double the subdirectory.
 extern "C" {
 #include <lua.h>
 #include <lualib.h>
@@ -41,7 +38,7 @@ public:
 
     bool init();
     void shutdown();
-    void reset();   // tear down + re-init (used by cancel_execution)
+    void reset();
 
     bool execute(const std::string& script,
                  const std::string& chunk_name = "=input");
@@ -62,20 +59,43 @@ public:
     lua_State* state()      { return L_; }
     bool is_running() const { return running_.load(std::memory_order_acquire); }
 
-    // Signals the Lua debug hook to abort execution
     void stop() { running_.store(false, std::memory_order_release); }
 
 private:
+    // ═══════════════════════════════════════════════════════
+    // ██  DEADLOCK FIX: Internal versions of execute() and  ██
+    // ██  shutdown() that do NOT acquire mutex_.             ██
+    // ██                                                     ██
+    // ██  init() holds mutex_ and calls:                     ██
+    // ██    → shutdown_internal()  (to reset if re-init)     ██
+    // ██    → execute_internal()   (for env_setup/sandbox)   ██
+    // ██                                                     ██
+    // ██  Public execute()/shutdown() acquire mutex_ then    ██
+    // ██  delegate to the _internal versions.                ██
+    // ═══════════════════════════════════════════════════════
+    bool execute_internal(const std::string& script,
+                          const std::string& chunk_name);
+    void shutdown_internal();
+
+    // ═══════════════════════════════════════════════════════
+    // ██  PATH TRAVERSAL FIX: Validates that resolved path  ██
+    // ██  is strictly inside the sandbox directory.          ██
+    // ██                                                     ██
+    // ██  BEFORE: used string::find which matched            ██
+    // ██  /workspace2/ as being inside /workspace/           ██
+    // ═══════════════════════════════════════════════════════
+    static bool is_sandboxed(const std::string& full_path,
+                             const std::string& base_dir);
+
     void setup_environment();
     void register_custom_libs();
     void sandbox();
 
-    // Lua C callbacks (must be static)
+    // Lua C callbacks
     static int lua_print(lua_State* L);
     static int lua_warn_handler(lua_State* L);
     static int lua_pcall_handler(lua_State* L);
 
-    // Custom library functions
     static int lua_http_get(lua_State* L);
     static int lua_http_post(lua_State* L);
     static int lua_wait(lua_State* L);
@@ -99,7 +119,7 @@ private:
     static int lua_sha256(lua_State* L);
 
     lua_State*         L_ = nullptr;
-    std::atomic<bool>  running_{false};    // cross-thread safe
+    std::atomic<bool>  running_{false};
     OutputCallback     output_cb_;
     ErrorCallback      error_cb_;
     mutable std::mutex mutex_;
