@@ -1,5 +1,6 @@
 #include "file_dialog.hpp"
 #include "utils/logger.hpp"
+#include "utils/config.hpp" 
 
 namespace oss {
 
@@ -173,3 +174,4 @@ void FileDialog::save(GtkWindow* parent, const std::string& suggested_name, Call
 #endif
 
 } // namespace oss
+
