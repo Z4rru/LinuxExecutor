@@ -119,7 +119,7 @@ void Environment::register_debug_lib(lua_State* L) {
         luaL_checktype(L, 1, LUA_TFUNCTION);
         int idx = luaL_optinteger(L, 2, 1);
         lua_Debug ar;
-        if (lua_getinfo(L, ">u", &ar)) {
+        if (::lua_getinfo(L, ">u", &ar)) {
             if (idx <= ar.nups) {
                 const char* name = lua_getupvalue(L, 1, idx);
                 if (name) {
@@ -138,7 +138,7 @@ void Environment::register_debug_lib(lua_State* L) {
         luaL_checktype(L, 1, LUA_TFUNCTION);
         lua_Debug ar;
         lua_pushvalue(L, 1);
-        lua_getinfo(L, ">u", &ar);
+        ::lua_getinfo(L, ">u", &ar);
         lua_pushinteger(L, ar.nups);
         return 1;
     });
@@ -216,7 +216,7 @@ int Environment::lua_getinfo(lua_State* L) {
     int level = luaL_optinteger(L, 1, 1);
     
     if (lua_getstack(L, level, &ar)) {
-        lua_getinfo(L, "nSluf", &ar);
+        ::lua_getinfo(L, "nSluf", &ar);
         
         lua_newtable(L);
         
@@ -318,5 +318,6 @@ int Environment::lua_fireproximityprompt(lua_State* L) {
     (void)L;
     return 0;
 }
+
 
 } // namespace oss
