@@ -550,7 +550,7 @@ int LuaEngine::lua_setclipboard(lua_State* L) {
     const char* text = luaL_checkstring(L, 1);
     
     std::string cmd = "echo -n '" + std::string(text) + "' | xclip -selection clipboard 2>/dev/null || echo -n '" + std::string(text) + "' | xsel --clipboard --input 2>/dev/null";
-        (void)system(cmd.c_str());
+        if (system(cmd.c_str())) { /* ignore */ }
     
     return 0;
 }
@@ -643,3 +643,4 @@ int LuaEngine::lua_sha256(lua_State* L) {
 
 
 } // namespace oss
+
