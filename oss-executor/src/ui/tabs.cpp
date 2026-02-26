@@ -144,12 +144,12 @@ void TabManager::rebuild_ui() {
             gtk_widget_set_margin_start(close_btn, 4);
             
             int tab_id = tab.id;
+            auto* close_data = new std::pair<TabManager*, int>(this, tab_id);
             g_signal_connect_swapped(close_btn, "clicked", G_CALLBACK(+[](gpointer data) {
-                // Decode packed data
                 auto* pair = static_cast<std::pair<TabManager*, int>*>(data);
                 pair->first->remove_tab(pair->second);
                 delete pair;
-            }), new std::pair<TabManager*, int>(this, tab_id));
+            }), close_data);
             
             gtk_box_append(GTK_BOX(btn_box), close_btn);
         }
@@ -163,11 +163,12 @@ void TabManager::rebuild_ui() {
         }
         
         int tab_id = tab.id;
+        auto* tab_data = new std::pair<TabManager*, int>(this, tab_id);
         g_signal_connect_swapped(tab_btn, "clicked", G_CALLBACK(+[](gpointer data) {
             auto* pair = static_cast<std::pair<TabManager*, int>*>(data);
             pair->first->set_active(pair->second);
             delete pair;
-        }), new std::pair<TabManager*, int>(this, tab_id));
+        }), tab_data);
         
         tab.button = tab_btn;
         gtk_box_append(GTK_BOX(tab_box_), tab_btn);
