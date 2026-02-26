@@ -13,7 +13,6 @@ permissions:
 jobs:
   build-linux:
     runs-on: ubuntu-24.04
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -59,7 +58,6 @@ jobs:
           chmod +x package/oss-executor/OSSExecutor
           chmod +x package/oss-executor/run.sh
 
-          # install.sh — heredoc at column 0 to avoid leading whitespace
           cat > package/oss-executor/install.sh << 'INSTALL_EOF'
           #!/bin/bash
           set -e
@@ -97,31 +95,16 @@ jobs:
             cd oss-executor && ./install.sh
             ```
 
-            ### Or run directly
-            ```bash
-            tar -xzf oss-executor-linux-x86_64.tar.gz
-            cd oss-executor && ./run.sh
-            ```
-
             ### AppImage
             ```bash
             chmod +x OSS_Executor-x86_64.AppImage
             ./OSS_Executor-x86_64.AppImage
-            ```
-            If FUSE is unavailable:
-            ```bash
-            ./OSS_Executor-x86_64.AppImage --appimage-extract-and-run
             ```
           draft: false
           prerelease: false
 
   build-appimage:
     runs-on: ubuntu-22.04
-    # ═══════════════════════════════════════════════════════
-    # Removed `needs: build-linux` — jobs are independent
-    # builds, letting them run in parallel saves ~3 minutes.
-    # ═══════════════════════════════════════════════════════
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -134,7 +117,7 @@ jobs:
             libgtk-4-dev libcurl4-openssl-dev libssl-dev \
             luajit libluajit-5.1-dev \
             libspdlog-dev nlohmann-json3-dev \
-            wget file
+            wget file imagemagick patchelf
 
       - name: Build
         working-directory: oss-executor
@@ -143,17 +126,68 @@ jobs:
           cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
           ninja -j$(nproc)
 
+      # ═══════════════════════════════════════════════════════
+      # ██  ICON FIX: Generate a guaranteed-valid PNG BEFORE ██
+      # ██  linuxdeploy ever touches it.                     ██
+      # ═══════════════════════════════════════════════════════
+      - name: Prepare icon
+        run: |
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+
+          ICON_DST="AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png"
+          ICON_SRC="oss-executor/resources/icons/logo.png"
+          ICON_OK=false
+
+          # 1. Try real icon
+          if [ -f "$ICON_SRC" ] && [ -s "$ICON_SRC" ]; then
+            if file "$ICON_SRC" | grep -qi "PNG image"; then
+              cp "$ICON_SRC" "$ICON_DST"
+              ICON_OK=true
+              echo "✓ Using project logo.png"
+            fi
+          fi
+
+          # 2. Fallback: ImageMagick
+          if [ "$ICON_OK" = false ]; then
+            echo "⚠ Generating fallback icon with ImageMagick..."
+            convert -size 256x256 xc:'#6e40c9' \
+              -fill white -gravity center \
+              -font Helvetica -pointsize 80 \
+              -annotate 0 "OSS" \
+              "png:${ICON_DST}" 2>/dev/null \
+            || convert -size 256x256 xc:'#6e40c9' "png:${ICON_DST}" 2>/dev/null \
+            || {
+              echo "⚠ ImageMagick failed — using minimal base64 PNG"
+              echo "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADPMOyrAAAAF0lEQVR42u3BAQ0AAADCoPd/aLsIkHEBAVYAAQFuwOsZAAAAAElFTkSuQmCC" | tr -d ' ' | base64 -d > "$ICON_DST"
+            }
+          fi
+
+          # 3. Final Python fallback (if file is garbage)
+          if [ ! -s "$ICON_DST" ] || [ "$(wc -c < "$ICON_DST")" -lt 100 ]; then
+            echo "✗ Icon still invalid — generating with pure base64"
+            python3 -c "
+          import struct, zlib
+          def png(w,h):
+              def chunk(t,d):
+                  c=t+d; return struct.pack('>I',len(d))+c+struct.pack('>I',zlib.crc32(c)&0xffffffff)
+              raw=b''
+              for y in range(h):
+                  raw+=b'\x00'+b'\x6e\x40\xc9\xff'*w
+              return b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(raw))+chunk(b'IEND',b'')
+          with open('$ICON_DST','wb') as f: f.write(png(256,256))
+          "
+          fi
+          
+          echo "Icon size: $(wc -c < "$ICON_DST") bytes"
+          file "$ICON_DST"
+
       - name: Create AppImage
         run: |
-          # ── Download tools ──
           wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
-          wget -q "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
-          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
+          chmod +x linuxdeploy-x86_64.AppImage
 
-          # ── Populate AppDir ──
           mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/share/applications
-          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
           mkdir -p AppDir/usr/share/oss-executor
 
           cp oss-executor/build/OSSExecutor AppDir/usr/bin/
@@ -161,7 +195,7 @@ jobs:
                 oss-executor/resources oss-executor/config.json \
                 AppDir/usr/share/oss-executor/
 
-          # ── Desktop file (must have NO leading whitespace) ──
+          # Desktop file
           cat > AppDir/usr/share/applications/oss-executor.desktop << 'DESKTOP_EOF'
           [Desktop Entry]
           Type=Application
@@ -173,17 +207,7 @@ jobs:
           Terminal=false
           DESKTOP_EOF
 
-          # ── Icon ──
-          if [ -f oss-executor/resources/icons/logo.png ]; then
-            cp oss-executor/resources/icons/logo.png \
-               AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png
-          else
-            # Fallback: 1x1 transparent PNG (valid, won't crash)
-            printf '\x89PNG\r\n\x1a\n' > \
-               AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png
-          fi
-
-          # ── AppRun wrapper with GIO/D-Bus isolation ──
+          # AppRun (Sanitized)
           cat > AppDir/AppRun << 'APPRUN_EOF'
           #!/usr/bin/env bash
           SELF="$(readlink -f "$0")"
@@ -194,7 +218,7 @@ jobs:
           export GTK_A11Y=none
           export NO_AT_BRIDGE=1
           if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-              export DBUS_SESSION_BUS_ADDRESS="disabled:"
+            export DBUS_SESSION_BUS_ADDRESS="disabled:"
           fi
           export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
           export OSS_HOME="${HOME}/.oss-executor"
@@ -202,21 +226,19 @@ jobs:
           APPRUN_EOF
           chmod +x AppDir/AppRun
 
-          # ══════════════════════════════════════════════════
-          # ██  FUSE FIX: CI runners lack /dev/fuse.         ██
-          # ██  APPIMAGE_EXTRACT_AND_RUN=1 makes linuxdeploy ██
-          # ██  extract to /tmp instead of FUSE-mounting.    ██
-          # ══════════════════════════════════════════════════
           export APPIMAGE_EXTRACT_AND_RUN=1
-          export DEPLOY_GTK_VERSION=4
           export OUTPUT="OSS_Executor-x86_64.AppImage"
 
           ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
-            --plugin gtk \
             --output appimage \
             --desktop-file AppDir/usr/share/applications/oss-executor.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png
+
+      - name: Verify AppImage
+        run: |
+          ls -lh OSS_Executor-x86_64.AppImage
+          file OSS_Executor-x86_64.AppImage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
