@@ -27,13 +27,13 @@ jobs:
             build-essential cmake ninja-build git pkg-config \
             libgtk-4-dev libcurl4-openssl-dev libssl-dev \
             libgirepository1.0-dev luajit libluajit-5.1-dev \
+            libspdlog-dev nlohmann-json3-dev \
             fonts-jetbrains-mono
 
       - name: Configure
         working-directory: oss-executor
         run: |
-          mkdir -p build
-          cd build
+          mkdir -p build && cd build
           cmake .. \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -46,17 +46,21 @@ jobs:
       - name: Package
         run: |
           mkdir -p package/oss-executor
+
           cp oss-executor/build/OSSExecutor package/oss-executor/
-          cp -r oss-executor/scripts package/oss-executor/
-          cp -r oss-executor/themes package/oss-executor/
+          cp -r oss-executor/scripts  package/oss-executor/
+          cp -r oss-executor/themes   package/oss-executor/
           cp -r oss-executor/resources package/oss-executor/
           cp oss-executor/config.json package/oss-executor/
-          cp oss-executor/run.sh package/oss-executor/
-          cp oss-executor/build.sh package/oss-executor/
-          cp README.md package/oss-executor/
+          cp oss-executor/run.sh      package/oss-executor/
+          cp oss-executor/build.sh    package/oss-executor/
+          cp README.md               package/oss-executor/ 2>/dev/null || true
+
           chmod +x package/oss-executor/OSSExecutor
           chmod +x package/oss-executor/run.sh
-          cat > package/oss-executor/install.sh << 'EOF'
+
+          # install.sh — heredoc at column 0 to avoid leading whitespace
+          cat > package/oss-executor/install.sh << 'INSTALL_EOF'
           #!/bin/bash
           set -e
           echo "Installing OSS Executor..."
@@ -67,8 +71,9 @@ jobs:
           cp config.json ~/.oss-executor/ 2>/dev/null || true
           sudo cp OSSExecutor /usr/local/bin/oss-executor
           echo "Installed! Run with: oss-executor"
-          EOF
+          INSTALL_EOF
           chmod +x package/oss-executor/install.sh
+
           cd package
           tar -czf oss-executor-linux-x86_64.tar.gz oss-executor/
 
@@ -86,36 +91,36 @@ jobs:
           body: |
             ## OSS Executor ${{ github.ref_name }}
 
-            ### Download Options
-            - **AppImage** — Single file, run directly (recommended)
-            - **tar.gz** — Manual install
-
-            ### AppImage (Easiest)
-            ```bash
-            chmod +x OSS_Executor-x86_64.AppImage
-            ./OSS_Executor-x86_64.AppImage
-            ```
-
-            ### Manual Install
+            ### tar.gz Install
             ```bash
             tar -xzf oss-executor-linux-x86_64.tar.gz
-            cd oss-executor
-            chmod +x install.sh
-            ./install.sh
+            cd oss-executor && ./install.sh
             ```
 
             ### Or run directly
             ```bash
             tar -xzf oss-executor-linux-x86_64.tar.gz
-            cd oss-executor
-            ./OSSExecutor
+            cd oss-executor && ./run.sh
+            ```
+
+            ### AppImage
+            ```bash
+            chmod +x OSS_Executor-x86_64.AppImage
+            ./OSS_Executor-x86_64.AppImage
+            ```
+            If FUSE is unavailable:
+            ```bash
+            ./OSS_Executor-x86_64.AppImage --appimage-extract-and-run
             ```
           draft: false
           prerelease: false
 
   build-appimage:
     runs-on: ubuntu-22.04
-    needs: build-linux
+    # ═══════════════════════════════════════════════════════
+    # Removed `needs: build-linux` — jobs are independent
+    # builds, letting them run in parallel saves ~3 minutes.
+    # ═══════════════════════════════════════════════════════
 
     steps:
       - name: Checkout
@@ -128,7 +133,8 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libgtk-4-dev libcurl4-openssl-dev libssl-dev \
             luajit libluajit-5.1-dev \
-            fuse libfuse2 wget
+            libspdlog-dev nlohmann-json3-dev \
+            wget file
 
       - name: Build
         working-directory: oss-executor
@@ -139,18 +145,24 @@ jobs:
 
       - name: Create AppImage
         run: |
-          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          chmod +x linuxdeploy-x86_64.AppImage
+          # ── Download tools ──
+          wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          wget -q "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
 
+          # ── Populate AppDir ──
           mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
           mkdir -p AppDir/usr/share/oss-executor
 
           cp oss-executor/build/OSSExecutor AppDir/usr/bin/
-          cp -r oss-executor/scripts oss-executor/themes oss-executor/resources oss-executor/config.json AppDir/usr/share/oss-executor/
+          cp -r oss-executor/scripts oss-executor/themes \
+                oss-executor/resources oss-executor/config.json \
+                AppDir/usr/share/oss-executor/
 
-          cat > AppDir/usr/share/applications/oss-executor.desktop << 'DESK'
+          # ── Desktop file (must have NO leading whitespace) ──
+          cat > AppDir/usr/share/applications/oss-executor.desktop << 'DESKTOP_EOF'
           [Desktop Entry]
           Type=Application
           Name=OSS Executor
@@ -159,27 +171,62 @@ jobs:
           Icon=oss-executor
           Categories=Development;
           Terminal=false
-          DESK
+          DESKTOP_EOF
 
-          cp oss-executor/resources/icons/logo.png AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png 2>/dev/null || \
-            convert -size 256x256 xc:'#6e40c9' -gravity center -pointsize 72 -fill white -annotate 0 "OSS" \
-            AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png 2>/dev/null || \
-            touch AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png
+          # ── Icon ──
+          if [ -f oss-executor/resources/icons/logo.png ]; then
+            cp oss-executor/resources/icons/logo.png \
+               AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png
+          else
+            # Fallback: 1x1 transparent PNG (valid, won't crash)
+            printf '\x89PNG\r\n\x1a\n' > \
+               AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png
+          fi
+
+          # ── AppRun wrapper with GIO/D-Bus isolation ──
+          cat > AppDir/AppRun << 'APPRUN_EOF'
+          #!/usr/bin/env bash
+          SELF="$(readlink -f "$0")"
+          HERE="$(dirname "$SELF")"
+          export GIO_MODULE_DIR=""
+          export GIO_USE_VFS="local"
+          export GSK_RENDERER="${GSK_RENDERER:-gl}"
+          export GTK_A11Y=none
+          export NO_AT_BRIDGE=1
+          if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+              export DBUS_SESSION_BUS_ADDRESS="disabled:"
+          fi
+          export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
+          export OSS_HOME="${HOME}/.oss-executor"
+          exec "${HERE}/usr/bin/OSSExecutor" "$@"
+          APPRUN_EOF
+          chmod +x AppDir/AppRun
+
+          # ══════════════════════════════════════════════════
+          # ██  FUSE FIX: CI runners lack /dev/fuse.         ██
+          # ██  APPIMAGE_EXTRACT_AND_RUN=1 makes linuxdeploy ██
+          # ██  extract to /tmp instead of FUSE-mounting.    ██
+          # ══════════════════════════════════════════════════
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export DEPLOY_GTK_VERSION=4
+          export OUTPUT="OSS_Executor-x86_64.AppImage"
 
           ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
+            --plugin gtk \
             --output appimage \
-            --desktop-file AppDir/usr/share/applications/oss-executor.desktop || true
+            --desktop-file AppDir/usr/share/applications/oss-executor.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
           name: oss-executor-AppImage
-          path: "OSS_Executor*.AppImage"
-          if-no-files-found: ignore
+          path: "OSS_Executor-x86_64.AppImage"
+          if-no-files-found: warn
 
       - name: Attach AppImage to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: "OSS_Executor*.AppImage"
+          files: "OSS_Executor-x86_64.AppImage"
