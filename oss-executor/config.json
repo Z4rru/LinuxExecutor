@@ -1,0 +1,45 @@
+{
+    "version": "2.0.0",
+    "executor": {
+        "auto_inject": false,
+        "auto_execute_folder": "scripts/autoexec",
+        "top_most": true,
+        "save_tabs": true,
+        "max_output_lines": 5000,
+        "execution_timeout_ms": 30000
+    },
+    "editor": {
+        "font_family": "JetBrains Mono",
+        "font_size": 14,
+        "tab_size": 4,
+        "word_wrap": true,
+        "line_numbers": true,
+        "highlight_current_line": true,
+        "auto_indent": true,
+        "bracket_matching": true,
+        "minimap": false
+    },
+    "theme": "midnight",
+    "wine": {
+        "prefix": "~/.oss-executor/wineprefix",
+        "runner": "wine",
+        "dxvk": true,
+        "fsync": true,
+        "esync": true
+    },
+    "network": {
+        "script_hub_url": "https://scriptblox.com/api",
+        "update_check": true,
+        "proxy": ""
+    },
+    "keybinds": {
+        "execute": "Ctrl+Return",
+        "clear": "Ctrl+L",
+        "save": "Ctrl+S",
+        "open": "Ctrl+O",
+        "new_tab": "Ctrl+T",
+        "close_tab": "Ctrl+W",
+        "toggle_console": "F12",
+        "inject": "F5"
+    }
+}
