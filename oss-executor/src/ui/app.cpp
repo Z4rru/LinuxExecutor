@@ -219,7 +219,7 @@ void App::build_ui(GtkApplication* app) {
     position_label_ = gtk_label_new("Ln 1, Col 1");
     gtk_box_append(GTK_BOX(status_bar_), position_label_);
 
-    GtkWidget* version_label = gtk_label_new("v2.0.0");
+    GtkWidget* version_label = gtk_label_new("v" APP_VERSION);
     gtk_widget_add_css_class(version_label, "dim-label");
     gtk_box_append(GTK_BOX(status_bar_), version_label);
 
@@ -400,7 +400,7 @@ void App::on_save_file() {
 void App::on_inject() {
     console_->print("🔗 Scanning for Roblox...", Console::Level::System);
     auto* console = console_.get();
-    g_thread_new("inject", [](gpointer data) -> gpointer {
+    GThread* t = g_thread_new("inject", [](gpointer data) -> gpointer {
         auto* c = static_cast<Console*>(data);
         auto& inj = Executor::instance().injection();
         bool success = inj.inject();
@@ -421,6 +421,7 @@ void App::on_inject() {
         }, new std::pair<Console*, bool>(c, success));
         return nullptr;
     }, console);
+    g_thread_unref(t);
 }
 
 void App::on_kill() {
