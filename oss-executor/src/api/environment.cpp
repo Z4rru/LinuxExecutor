@@ -112,17 +112,17 @@ static int lua_drawing_set_bridge(lua_State* L) {
     const char* key = luaL_checkstring(L, 2);
     std::string k(key);
 
-    auto read_vec2 = [L](int idx, float& x, float& y) {
+        auto read_vec2 = [L](int idx, double& x, double& y) {
         if (lua_istable(L, idx)) {
-            lua_getfield(L, idx, "X"); x = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
-            lua_getfield(L, idx, "Y"); y = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+            lua_getfield(L, idx, "X"); x = lua_tonumber(L, -1); lua_pop(L, 1);
+            lua_getfield(L, idx, "Y"); y = lua_tonumber(L, -1); lua_pop(L, 1);
         }
     };
-    auto read_color = [L](int idx, float& r, float& g, float& b) {
+        auto read_color = [L](int idx, double& r, double& g, double& b) {
         if (lua_istable(L, idx)) {
-            lua_getfield(L, idx, "R"); r = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
-            lua_getfield(L, idx, "G"); g = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
-            lua_getfield(L, idx, "B"); b = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+            lua_getfield(L, idx, "R"); r = lua_tonumber(L, -1); lua_pop(L, 1);
+            lua_getfield(L, idx, "G"); g = lua_tonumber(L, -1); lua_pop(L, 1);
+            lua_getfield(L, idx, "B"); b = lua_tonumber(L, -1); lua_pop(L, 1);
         }
     };
 
@@ -1831,3 +1831,4 @@ void Environment::setup_roblox_mock(LuaEngine& engine) {
 }
 
 } // namespace oss
+
