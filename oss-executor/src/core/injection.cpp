@@ -286,7 +286,7 @@ bool Injection::inject() {
 
             auto result = memory_.pattern_scan(pattern, mask,
                                                 region.start, scan_len);
-            if (result.has_value()) {
+                       if (result.has_value()) {
                 vm_marker_addr_ = result.value();
                 LOG_INFO("Found Luau marker '{}' at 0x{:X} in '{}' "
                          "(scanned {} regions, {:.1f}MB total)",
@@ -294,12 +294,13 @@ bool Injection::inject() {
                          region.path.empty() ? "[anonymous]" : region.path,
                          regions_scanned,
                          bytes_scanned / (1024.0 * 1024.0));
-                goto found;
+                break;  // break inner loop
             }
         }
+        if (vm_marker_addr_ != 0) break;  // break outer loop
     }
 
-found:
+    // Remove the "found:" label entirely
     if (vm_marker_addr_ != 0) {
         mode_ = InjectionMode::Full;
         set_status(InjectionStatus::Injected,
@@ -344,3 +345,4 @@ void Injection::stop_auto_scan() {
 }
 
 } // namespace oss
+
