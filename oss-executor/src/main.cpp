@@ -10,6 +10,14 @@ static void fix_gio_before_anything() {
     setenv("GIO_MODULE_DIR", "", 1);
     setenv("GIO_USE_VFS", "local", 1);
     setenv("GSK_RENDERER", "gl", 0);
+
+    // ★ FIX: Suppress IBus input method module
+    // libibus-1.0.so links against newer GLib → "undefined symbol: g_task_set_static_name"
+    // Setting GTK_IM_MODULE to empty or "none" prevents GTK from loading it
+    setenv("GTK_IM_MODULE", "", 1);
+
+    // Suppress "Could not get DRI3 device" warning (cosmetic, not a real problem)
+    setenv("LIBGL_DRI3_DISABLE", "1", 0);
 }
 // ══════════════════════════════════════════════════════════════
 
@@ -58,3 +66,4 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+
