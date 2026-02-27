@@ -98,9 +98,12 @@ private:
         curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, header_callback);
         curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &response.headers);
         curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 30L);
+        curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, 10L);
         curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
         curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "OSSExecutor/2.0");
+        curl_easy_setopt(curl.get(), CURLOPT_MAXFILESIZE, 10L * 1024L * 1024L);
 
         struct SlistDeleter {
             void operator()(curl_slist* p) { if (p) curl_slist_free_all(p); }
