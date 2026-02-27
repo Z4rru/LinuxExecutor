@@ -1,47 +1,40 @@
 // ══════════════════════════════════════════════════════════════
 // GIO/GVFS FIX — Must execute before ANY GLib/GTK header loads
-// Fixes: "undefined symbol: g_task_set_static_name"
-// Fixes: "Failed to load module: libgvfsdbus.so"
 // ══════════════════════════════════════════════════════════════
 #include <cstdlib>
+#include <cstring>
+#include <unistd.h>
 
-// __attribute__((constructor)) runs before main() and before
-// most C++ static initializers — catches GLib init in shared libs
 __attribute__((constructor(101)))
 static void fix_gio_before_anything() {
-    // Prevent GLib from loading system GIO/GVFS modules that may be
-    // compiled against a different GLib version (the actual crash).
-    // Empty string = don't scan any module directory.
     setenv("GIO_MODULE_DIR", "", 1);
-
-    // Force local-only VFS — disables gvfsd D-Bus backend entirely.
-    // We only need local file:// paths, never sftp:// smb:// trash://
     setenv("GIO_USE_VFS", "local", 1);
-
-    // Linux Mint / Cinnamon compositor fix
-    setenv("GSK_RENDERER", "gl", 0);  // 0 = don't override if user set it
+    setenv("GSK_RENDERER", "gl", 0);
 }
 // ══════════════════════════════════════════════════════════════
 
 #include "ui/app.hpp"
-#include "core/executor.hpp"   // ← WAS MISSING — signal_handler uses Executor
+#include "core/executor.hpp"
 #include "utils/logger.hpp"
 
 #include <csignal>
 #include <iostream>
 
-static void signal_handler(int sig) {
-    // Avoid spdlog in signal handler (not async-signal-safe)
-    // Use write() which IS async-signal-safe
-    const char* msg = "\n[!] Signal received, shutting down...\n";
-    if (write(STDERR_FILENO, msg, strlen(msg)) == -1) { /* signal-safe, nothing to do */ }
+// ★ FIX: Don't call shutdown() inside a signal handler.
+//   shutdown() uses mutexes/memory-allocation which can deadlock.
+//   Just set a flag and exit immediately.
+static volatile sig_atomic_t g_shutdown_requested = 0;
 
-    oss::Executor::instance().shutdown();
-    _exit(0);  // _exit, not exit — safe in signal handlers
+static void signal_handler(int sig) {
+    g_shutdown_requested = 1;
+    const char* msg = "\n[!] Signal received, shutting down...\n";
+    // write() is async-signal-safe, unlike printf/cout/spdlog
+    ssize_t unused = write(STDERR_FILENO, msg, strlen(msg));
+    (void)unused;  // suppress unused-result warning
+    _exit(0);      // _exit (not exit) is safe in signal handlers
 }
 
 int main(int argc, char** argv) {
-    // Belt-and-suspenders: ensure GIO fix even if constructor didn't fire
     fix_gio_before_anything();
 
     signal(SIGINT, signal_handler);
@@ -65,4 +58,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-
