@@ -29,32 +29,38 @@ struct LuaError {
 };
 
 struct DrawingObject {
-    enum class Type {
-        Line, Circle, Rectangle, Triangle, Text, Quad, Image
-    };
+    enum class Type { Line, Text, Circle, Square, Triangle, Quad, Image };
 
     int id = 0;
     Type type = Type::Line;
     bool visible = false;
+
+    float color_r = 1.0f, color_g = 1.0f, color_b = 1.0f;
+    float transparency = 0.0f;
     float thickness = 1.0f;
-    float transparency = 1.0f;
-    uint32_t color = 0xFFFFFFFF;
-    bool filled = false;
-    float size = 13.0f;
+    int z_index = 0;
+
+    float from_x = 0, from_y = 0;
+    float to_x = 0, to_y = 0;
+
     std::string text;
-    std::string font;
+    float text_size = 14.0f;
+    float pos_x = 0, pos_y = 0;
+    bool center = false;
+    bool outline = false;
+    float outline_r = 0, outline_g = 0, outline_b = 0;
+    int font = 0;
 
-    struct Vec2 { float x = 0, y = 0; };
-    Vec2 from, to;
-    Vec2 position;
-    Vec2 center;
-    float radius = 0;
-    int num_sides = 64;
+    float radius = 50.0f;
+    int num_sides = 32;
+    bool filled = false;
 
-    Vec2 point_a, point_b, point_c, point_d;
+    float size_x = 100.0f, size_y = 100.0f;
+    float rounding = 0;
 
-    bool zindex_changed = false;
-    int zindex = 0;
+    float pa_x = 0, pa_y = 0;
+    float pb_x = 0, pb_y = 0;
+    float pc_x = 0, pc_y = 0;
 };
 
 struct ScheduledTask {
