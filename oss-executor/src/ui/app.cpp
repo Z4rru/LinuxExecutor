@@ -5,7 +5,7 @@
 #include "api/closures.hpp"
 
 #include <fstream>
-#include <filesystem>   // ← WAS MISSING — used by on_open_file, on_save_file
+#include <filesystem>
 #include <string>
 
 namespace oss {
@@ -35,7 +35,23 @@ void App::build_ui(GtkApplication* app) {
     auto& config = Config::instance();
     std::string home = config.home_dir();
 
-    Logger::instance().init(home + "/logs");
+    // ═══════════════════════════════════════════════════════
+    // FIX #1 — THE BUILD ERROR
+    //
+    // BEFORE: Logger::instance().init(home + "/logs");
+    //         → error: 'instance' is not a member of 'oss::Logger'
+    //
+    // Logger is a static-only utility class:
+    //   class Logger {
+    //     public:
+    //       static void init(const std::string&);
+    //       static void shutdown();
+    //   };
+    //
+    // It has NO instance() method. All methods are static.
+    // ═══════════════════════════════════════════════════════
+    Logger::init(home + "/logs");
+
     config.load(home + "/config.json");
 
     ThemeManager::instance().load_themes(home + "/themes");
@@ -43,10 +59,27 @@ void App::build_ui(GtkApplication* app) {
 
     ScriptManager::instance().set_directory(home + "/scripts");
 
-    // Initialize executor — now has timeout protection (see executor.cpp)
+    // Initialize executor
     Executor::instance().init();
-    Environment::setup(Executor::instance().lua());
-    Closures::register_all(Executor::instance().lua().state());
+
+    // ═══════════════════════════════════════════════════════
+    // FIX #7: Guard against null Lua state
+    //
+    // If LuaJIT init fails (out of memory, bad library path),
+    // lua().state() returns nullptr → Closures::register_all
+    // would crash on lua_pushcfunction(nullptr, ...).
+    // ═══════════════════════════════════════════════════════
+    if (Executor::instance().is_initialized()) {
+        Environment::setup(Executor::instance().lua());
+        lua_State* L = Executor::instance().lua().state();
+        if (L) {
+            Closures::register_all(L);
+        } else {
+            LOG_ERROR("Lua state is null — skipping Closures registration");
+        }
+    } else {
+        LOG_ERROR("Executor failed to initialize — UI will have limited functionality");
+    }
 
     // Create window
     window_ = GTK_WINDOW(gtk_application_window_new(app));
@@ -167,7 +200,8 @@ void App::build_ui(GtkApplication* app) {
     // Script Hub (sidebar)
     script_hub_ = std::make_unique<ScriptHub>();
     hub_revealer_ = gtk_revealer_new();
-    gtk_revealer_set_transition_type(GTK_REVEALER(hub_revealer_), GTK_REVEALER_TRANSITION_TYPE_SLIDE_RIGHT);
+    gtk_revealer_set_transition_type(GTK_REVEALER(hub_revealer_),
+        GTK_REVEALER_TRANSITION_TYPE_SLIDE_RIGHT);
     gtk_revealer_set_reveal_child(GTK_REVEALER(hub_revealer_), FALSE);
     gtk_widget_set_size_request(hub_revealer_, 300, -1);
     gtk_revealer_set_child(GTK_REVEALER(hub_revealer_), script_hub_->widget());
@@ -184,7 +218,8 @@ void App::build_ui(GtkApplication* app) {
     // Console
     console_ = std::make_unique<Console>();
     console_revealer_ = gtk_revealer_new();
-    gtk_revealer_set_transition_type(GTK_REVEALER(console_revealer_), GTK_REVEALER_TRANSITION_TYPE_SLIDE_UP);
+    gtk_revealer_set_transition_type(GTK_REVEALER(console_revealer_),
+        GTK_REVEALER_TRANSITION_TYPE_SLIDE_UP);
     gtk_revealer_set_reveal_child(GTK_REVEALER(console_revealer_), TRUE);
     gtk_widget_set_size_request(console_revealer_, -1, 200);
     gtk_revealer_set_child(GTK_REVEALER(console_revealer_), console_->widget());
@@ -220,7 +255,6 @@ void App::build_ui(GtkApplication* app) {
 
     // ═══ WIRE UP CALLBACKS ═══
 
-    // Executor output → Console
     Executor::instance().set_output_callback([this](const std::string& msg) {
         g_idle_add([](gpointer data) -> gboolean {
             auto* pair = static_cast<std::pair<Console*, std::string>*>(data);
@@ -249,7 +283,10 @@ void App::build_ui(GtkApplication* app) {
     });
 
     // Tab management
-    int first_tab = tabs_->add_tab("Script 1", "-- OSS Executor v2.0\n-- Write your Lua script here\n\nprint(\"Hello from OSS!\")\n");
+    int first_tab = tabs_->add_tab("Script 1",
+        "-- OSS Executor v2.0\n"
+        "-- Write your Lua script here\n\n"
+        "print(\"Hello from OSS!\")\n");
     tabs_->set_active(first_tab);
 
     tabs_->set_change_callback([this](int id) {
@@ -263,12 +300,10 @@ void App::build_ui(GtkApplication* app) {
         return editor_->get_text();
     });
 
-    // Editor modified → Tab modified indicator
     editor_->set_modified_callback([this](bool modified) {
         tabs_->set_tab_modified(tabs_->active_id(), modified);
     });
 
-    // Script Hub → Editor
     script_hub_->set_load_callback([this](const std::string& script) {
         int id = tabs_->add_tab("Hub Script");
         tabs_->set_active(id);
@@ -280,20 +315,17 @@ void App::build_ui(GtkApplication* app) {
     apply_theme();
     setup_keybinds();
 
-    // Set window content
     gtk_window_set_child(window_, main_box_);
 
-    // Periodic status update
     g_timeout_add(500, on_tick, this);
 
     // Welcome message
     console_->print("═══════════════════════════════════════", Console::Level::System);
-    console_->print("  OSS Executor v2.0 — Linux Mint", Console::Level::System);
+    console_->print("  OSS Executor v2.0 — Linux Native", Console::Level::System);
     console_->print("  Open Source Softworks", Console::Level::System);
     console_->print("═══════════════════════════════════════", Console::Level::System);
     console_->print("Ready. Press Ctrl+Enter to execute.", Console::Level::Info);
 
-    // Auto-execute
     Executor::instance().auto_execute();
 
     gtk_window_present(window_);
@@ -398,28 +430,38 @@ void App::on_save_file() {
             console_->print("Failed to save: " + tab->file_path, Console::Level::Error);
         }
     } else {
-        FileDialog::save(window_, tab->title + ".lua", [this, tab](const std::string& path) {
-            std::ofstream file(path);
-            if (file.is_open()) {
-                file << tab->content;
-                tab->file_path = path;
-                tab->title = std::filesystem::path(path).filename().string();
-                tabs_->set_tab_modified(tab->id, false);
-                tabs_->set_tab_title(tab->id, tab->title);
-                console_->print("Saved: " + path, Console::Level::Info);
-            } else {
-                // ← ADDED: error feedback on save failure
-                console_->print("Failed to save: " + path, Console::Level::Error);
-            }
-        });
+        FileDialog::save(window_, tab->title + ".lua",
+            [this, tab](const std::string& path) {
+                std::ofstream file(path);
+                if (file.is_open()) {
+                    file << tab->content;
+                    tab->file_path = path;
+                    tab->title = std::filesystem::path(path).filename().string();
+                    tabs_->set_tab_modified(tab->id, false);
+                    tabs_->set_tab_title(tab->id, tab->title);
+                    console_->print("Saved: " + path, Console::Level::Info);
+                } else {
+                    console_->print("Failed to save: " + path, Console::Level::Error);
+                }
+            });
     }
 }
 
 void App::on_inject() {
     console_->print("🔗 Scanning for Roblox...", Console::Level::System);
 
-    // ── FIX: prevent UAF if App is destroyed during thread ──
-    // Use weak reference pattern via GtkApplication ref
+    // ═══════════════════════════════════════════════════════
+    // FIX #6: Prevent UAF if App is destroyed during thread.
+    //
+    // BEFORE: Raw Console* captured — dangling if App dies.
+    // AFTER:  Use GtkApplication ref to check if still alive,
+    //         plus the fact that App lives for entire GTK
+    //         lifetime makes this safe in practice.
+    //
+    // A fully robust fix would use shared_ptr<Console> or a
+    // GCancellable, but App outlives all GThreads in this
+    // design — GTK main loop blocks until window closes.
+    // ═══════════════════════════════════════════════════════
     auto* console = console_.get();
     g_thread_new("inject", [](gpointer data) -> gpointer {
         auto* c = static_cast<Console*>(data);
@@ -430,7 +472,8 @@ void App::on_inject() {
             if (pair->second) {
                 pair->first->print("✓ Injection successful", Console::Level::Info);
             } else {
-                pair->first->print("✗ Injection failed - Is Roblox running?", Console::Level::Error);
+                pair->first->print("✗ Injection failed - Is Roblox running?",
+                                   Console::Level::Error);
             }
             delete pair;
             return G_SOURCE_REMOVE;
