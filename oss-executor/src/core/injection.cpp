@@ -103,52 +103,39 @@ std::vector<pid_t> Injection::descendants(pid_t root) {
     std::vector<pid_t> all;
     std::vector<pid_t> frontier;
 
-    try {
-        for (const auto& entry : fs::directory_iterator("/proc")) {
-            if (!entry.is_directory()) continue;
-            std::string dn = entry.path().filename().string();
-            if (!std::all_of(dn.begin(), dn.end(), ::isdigit)) continue;
-            pid_t pid = std::stoi(dn);
-            if (pid == root) continue;
-            try {
-                std::ifstream sf(entry.path() / "stat");
-                if (!sf.is_open()) continue;
-                std::string line;
-                std::getline(sf, line);
-                auto ce = line.rfind(')');
-                if (ce == std::string::npos) continue;
-                std::istringstream iss(line.substr(ce + 2));
-                char state; pid_t ppid;
-                iss >> state >> ppid;
-                if (ppid == root) frontier.push_back(pid);
-            } catch (...) {}
-        }
-    } catch (...) {}
+    auto collect_children = [](pid_t parent) -> std::vector<pid_t> {
+        std::vector<pid_t> children;
+        try {
+            for (const auto& entry : fs::directory_iterator("/proc")) {
+                if (!entry.is_directory()) continue;
+                std::string dn = entry.path().filename().string();
+                if (!std::all_of(dn.begin(), dn.end(), ::isdigit)) continue;
+                pid_t pid = std::stoi(dn);
+                if (pid == parent) continue;
+                try {
+                    std::ifstream sf(entry.path() / "stat");
+                    if (!sf.is_open()) continue;
+                    std::string line;
+                    std::getline(sf, line);
+                    auto ce = line.rfind(')');
+                    if (ce == std::string::npos) continue;
+                    std::istringstream iss(line.substr(ce + 2));
+                    char state; pid_t ppid;
+                    iss >> state >> ppid;
+                    if (ppid == parent) children.push_back(pid);
+                } catch (...) {}
+            }
+        } catch (...) {}
+        return children;
+    };
 
+    frontier = collect_children(root);
     while (!frontier.empty()) {
         std::vector<pid_t> next;
         for (auto p : frontier) {
             all.push_back(p);
-            try {
-                for (const auto& entry : fs::directory_iterator("/proc")) {
-                    if (!entry.is_directory()) continue;
-                    std::string dn = entry.path().filename().string();
-                    if (!std::all_of(dn.begin(), dn.end(), ::isdigit)) continue;
-                    pid_t pid = std::stoi(dn);
-                    try {
-                        std::ifstream sf(entry.path() / "stat");
-                        if (!sf.is_open()) continue;
-                        std::string line;
-                        std::getline(sf, line);
-                        auto ce = line.rfind(')');
-                        if (ce == std::string::npos) continue;
-                        std::istringstream iss(line.substr(ce + 2));
-                        char state; pid_t ppid;
-                        iss >> state >> ppid;
-                        if (ppid == p) next.push_back(pid);
-                    } catch (...) {}
-                }
-            } catch (...) {}
+            auto ch = collect_children(p);
+            next.insert(next.end(), ch.begin(), ch.end());
         }
         frontier = std::move(next);
     }
@@ -213,6 +200,18 @@ void Injection::set_status(InjectionStatus s, const std::string& msg) {
     }
     if (cb) cb(s, msg);
     LOG_INFO("[injection] {}", msg);
+}
+
+bool Injection::write_to_process(uintptr_t addr, const void* data, size_t len) {
+    pid_t pid = memory_.get_pid();
+    if (pid <= 0) return false;
+    std::string path = "/proc/" + std::to_string(pid) + "/mem";
+    std::ofstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!f.is_open()) return false;
+    f.seekp(static_cast<std::streamoff>(addr));
+    if (!f.good()) return false;
+    f.write(static_cast<const char*>(data), static_cast<std::streamsize>(len));
+    return f.good();
 }
 
 void Injection::adopt_target(pid_t pid, const std::string& via) {
@@ -332,17 +331,12 @@ bool Injection::scan_for_roblox() {
 bool Injection::should_scan_region(const MemoryRegion& r) const {
     if (!r.readable()) return false;
     if (r.size() < REGION_MIN || r.size() > REGION_MAX) return false;
-
     if (r.path.empty()) return true;
-
-    if (r.path[0] == '[') return true;
-
+    if (!r.path.empty() && r.path[0] == '[') return true;
     for (const auto& kw : PATH_KEYWORDS)
         if (r.path.find(kw) != std::string::npos) return true;
-
     if (r.path[0] == '/' && r.path.find("/lib") != std::string::npos)
         return false;
-
     return r.path[0] != '/';
 }
 
@@ -415,7 +409,6 @@ bool Injection::locate_luau_vm() {
         vm_scan_.region_path = best_path;
         vm_scan_.validated   = false;
         vm_marker_addr_      = best_addr;
-
         LOG_WARN("Luau VM probable (unvalidated): '{}' at 0x{:X} in '{}'",
                  best_marker, best_addr, best_path);
         return true;
@@ -484,13 +477,10 @@ bool Injection::inject() {
 
     if (found) {
         mode_ = InjectionMode::Full;
-
         std::ostringstream hex;
-        hex << std::hex << vm_scan_.marker_addr;
-
+        hex << "0x" << std::hex << vm_scan_.marker_addr;
         set_status(InjectionStatus::Injected,
-                   "Injection complete — Luau VM at 0x" + hex.str());
-
+                   "Injection complete — Luau VM at " + hex.str());
         LOG_INFO("Mode: Full | marker='{}' @ 0x{:X} | validated={} | "
                  "region='{}' base=0x{:X}",
                  vm_scan_.marker_name, vm_scan_.marker_addr,
@@ -546,8 +536,8 @@ bool Injection::execute_script(const std::string& source) {
             std::memcpy(payload.data(), &len, 4);
             std::memcpy(payload.data() + 4, source.data(), source.size());
 
-            bool wrote = memory_.write_buffer(write_addr, payload.data(),
-                                               payload.size());
+            bool wrote = write_to_process(write_addr, payload.data(),
+                                           payload.size());
             if (wrote) {
                 set_status(InjectionStatus::Injected, "Script dispatched");
                 LOG_INFO("Wrote {} bytes to 0x{:X}", payload.size(), write_addr);
