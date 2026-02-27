@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <sstream>
+#include <map>
 
 namespace oss {
 
@@ -161,22 +162,22 @@ static int lua_drawing_remove_bridge(lua_State* L) {
 
 static const char* ROBLOX_MOCK_LUA = R"LUA(
 
-local Signal = {}
-Signal.__index = Signal
-Signal.__type  = "RBXScriptSignal"
+local Signal={}
+Signal.__index=Signal
+Signal.__type="RBXScriptSignal"
 function Signal.new(name)
-    return setmetatable({_name=name or "Signal",_connections={}}, Signal)
+    return setmetatable({_name=name or "Signal",_connections={}},Signal)
 end
 function Signal:Connect(fn)
     if type(fn)~="function" then return end
-    local conn = setmetatable({Connected=true,_fn=fn,_signal=self},{
+    local conn=setmetatable({Connected=true,_fn=fn,_signal=self},{
         __type="RBXScriptConnection",
         __index={Disconnect=function(self) self.Connected=false end}
     })
-    table.insert(self._connections, conn)
+    table.insert(self._connections,conn)
     return conn
 end
-Signal.connect = Signal.Connect
+Signal.connect=Signal.Connect
 function Signal:Wait() return 0 end
 function Signal:Fire(...)
     for _,conn in ipairs(self._connections) do
@@ -184,9 +185,8 @@ function Signal:Fire(...)
     end
 end
 
-local Vector3 = {}
-Vector3.__index = Vector3
-Vector3.__type  = "Vector3"
+local Vector3={}
+Vector3.__type="Vector3"
 function Vector3.new(x,y,z)
     return setmetatable({
         X=x or 0,Y=y or 0,Z=z or 0,x=x or 0,y=y or 0,z=z or 0,
@@ -213,10 +213,17 @@ function Vector3.__unm(a) return Vector3.new(-a.X,-a.Y,-a.Z) end
 function Vector3.__eq(a,b) return a.X==b.X and a.Y==b.Y and a.Z==b.Z end
 function Vector3.__tostring(v) return string.format("%.4f, %.4f, %.4f",v.X,v.Y,v.Z) end
 function Vector3.__len(v) return v.Magnitude end
+Vector3.__index=function(self,key)
+    if key=="Unit" then
+        local m=self.Magnitude
+        if m==0 then return Vector3.new(0,0,0) end
+        return Vector3.new(self.X/m,self.Y/m,self.Z/m)
+    end
+    return rawget(Vector3,key)
+end
 
-local Vector2 = {}
-Vector2.__index = Vector2
-Vector2.__type  = "Vector2"
+local Vector2={}
+Vector2.__type="Vector2"
 function Vector2.new(x,y)
     return setmetatable({X=x or 0,Y=y or 0,x=x or 0,y=y or 0,
         Magnitude=math.sqrt((x or 0)^2+(y or 0)^2)},Vector2)
@@ -235,10 +242,18 @@ function Vector2.__div(a,b)
     return Vector2.new(a.X/b.X,a.Y/b.Y)
 end
 function Vector2.__tostring(v) return string.format("%.4f, %.4f",v.X,v.Y) end
+Vector2.__index=function(self,key)
+    if key=="Unit" then
+        local m=self.Magnitude
+        if m==0 then return Vector2.new(0,0) end
+        return Vector2.new(self.X/m,self.Y/m)
+    end
+    return rawget(Vector2,key)
+end
 
-local Color3 = {}
-Color3.__index = Color3
-Color3.__type  = "Color3"
+local Color3={}
+Color3.__index=Color3
+Color3.__type="Color3"
 function Color3.new(r,g,b) return setmetatable({R=r or 0,G=g or 0,B=b or 0},Color3) end
 function Color3.fromRGB(r,g,b) return Color3.new((r or 0)/255,(g or 0)/255,(b or 0)/255) end
 function Color3.fromHSV(h,s,v)
@@ -264,14 +279,14 @@ end
 function Color3.__tostring(c) return string.format("%.4f, %.4f, %.4f",c.R,c.G,c.B) end
 function Color3.__eq(a,b) return a.R==b.R and a.G==b.G and a.B==b.B end
 
-local UDim = {}
-UDim.__index = UDim
-UDim.__type  = "UDim"
+local UDim={}
+UDim.__index=UDim
+UDim.__type="UDim"
 function UDim.new(s,o) return setmetatable({Scale=s or 0,Offset=o or 0},UDim) end
 
-local UDim2 = {}
-UDim2.__index = UDim2
-UDim2.__type  = "UDim2"
+local UDim2={}
+UDim2.__index=UDim2
+UDim2.__type="UDim2"
 function UDim2.new(xs,xo,ys,yo)
     return setmetatable({X=UDim.new(xs or 0,xo or 0),Y=UDim.new(ys or 0,yo or 0),
         Width=UDim.new(xs or 0,xo or 0),Height=UDim.new(ys or 0,yo or 0)},UDim2)
@@ -280,9 +295,9 @@ function UDim2.fromScale(xs,ys) return UDim2.new(xs,0,ys,0) end
 function UDim2.fromOffset(xo,yo) return UDim2.new(0,xo,0,yo) end
 function UDim2.__tostring(u) return string.format("{%g, %d}, {%g, %d}",u.X.Scale,u.X.Offset,u.Y.Scale,u.Y.Offset) end
 
-local CFrame = {}
-CFrame.__index = CFrame
-CFrame.__type  = "CFrame"
+local CFrame={}
+CFrame.__index=CFrame
+CFrame.__type="CFrame"
 function CFrame.new(x,y,z)
     if type(x)=="table" and x.X then
         return setmetatable({Position=x,X=x.X,Y=x.Y,Z=x.Z,
@@ -306,7 +321,10 @@ function CFrame:GetComponents() return self.X,self.Y,self.Z,1,0,0,0,1,0,0,0,1 en
 function CFrame.lookAt(pos,target,up)
     up=up or Vector3.new(0,1,0)
     local cf=CFrame.new(pos.X,pos.Y,pos.Z)
-    rawset(cf,"LookVector",(target-pos))
+    local dir=target-pos
+    local m=dir.Magnitude
+    if m>0 then rawset(cf,"LookVector",Vector3.new(dir.X/m,dir.Y/m,dir.Z/m))
+    else rawset(cf,"LookVector",Vector3.new(0,0,-1)) end
     return cf
 end
 function CFrame.__mul(a,b)
@@ -315,28 +333,48 @@ function CFrame.__mul(a,b)
 end
 function CFrame.__tostring(cf) return string.format("%.4f, %.4f, %.4f, ...",cf.X,cf.Y,cf.Z) end
 
+local _instance_events={}
+for _,v in ipairs({
+    "Changed","ChildAdded","ChildRemoved","AncestryChanged","Destroying",
+    "MouseButton1Click","MouseButton1Down","MouseButton1Up",
+    "MouseButton2Click","MouseButton2Down","MouseButton2Up",
+    "MouseEnter","MouseLeave","MouseMoved","MouseWheelForward","MouseWheelBackward",
+    "InputBegan","InputEnded","InputChanged",
+    "TouchTap","TouchLongPress","TouchPan","TouchPinch","TouchRotate","TouchSwipe",
+    "Activated","Deactivated","FocusLost","FocusGained",
+    "Touched","TouchEnded","SelectionGained","SelectionLost",
+    "CharacterAdded","CharacterRemoving","CharacterAppearanceLoaded",
+    "PlayerAdded","PlayerRemoving","RenderStepped","Heartbeat","Stepped",
+    "TextChanged","ReturnPressedFromOnScreenKeyboard"
+}) do _instance_events[v]=true end
+
 local function make_instance(class_name,name,parent)
     local children={}
     local properties={}
     local events={}
     local inst={}
     local mt={__type="Instance",__tostring=function() return name or class_name end}
+
+    local function find_child(_,child_name)
+        for _,c in ipairs(children) do
+            if type(c)=="table" then
+                if c.Name==child_name or tostring(c)==child_name then return c end
+            elseif tostring(c)==child_name then return c end
+        end
+        return nil
+    end
+
     mt.__index=function(self,key)
         if key=="Name" then return name or class_name end
         if key=="ClassName" then return class_name end
         if key=="Parent" then return parent end
         if key=="IsA" then return function(_,check) return check==class_name or check=="Instance" or check=="GuiObject" or check=="BasePart" end end
-        if key=="FindFirstChild" then
-            return function(_,child_name)
-                for _,c in ipairs(children) do
-                    if (type(c)=="table" and rawget(c,"Name")==child_name) or tostring(c)==child_name then return c end
-                end
-                return nil
-            end
-        end
+        if key=="FindFirstChild" then return find_child end
         if key=="FindFirstChildOfClass" then
             return function(_,cls)
-                for _,c in ipairs(children) do if type(c)=="table" and rawget(c,"ClassName")==cls then return c end end
+                for _,c in ipairs(children) do
+                    if type(c)=="table" and c.ClassName==cls then return c end
+                end
                 return nil
             end
         end
@@ -344,15 +382,15 @@ local function make_instance(class_name,name,parent)
             return function(_,cls)
                 for _,c in ipairs(children) do
                     if type(c)=="table" then
-                        local isa=rawget(c,"IsA")
+                        local isa=c.IsA
                         if isa and isa(c,cls) then return c end
-                        if rawget(c,"ClassName")==cls then return c end
+                        if c.ClassName==cls then return c end
                     end
                 end
                 return nil
             end
         end
-        if key=="WaitForChild" then return function(_,cn) return rawget(mt,"__index")(self,"FindFirstChild")(self,cn) end end
+        if key=="WaitForChild" then return find_child end
         if key=="GetChildren" or key=="getChildren" then return function() return children end end
         if key=="GetDescendants" then return function() return children end end
         if key=="Clone" then return function() return make_instance(class_name,name,nil) end end
@@ -369,11 +407,11 @@ local function make_instance(class_name,name,parent)
         if key=="GetAttribute" then return function(_,attr) return properties["_attr_"..tostring(attr)] end end
         if key=="SetAttribute" then return function(_,attr,val) properties["_attr_"..tostring(attr)]=val end end
         if key=="GetAttributes" then return function() return {} end end
-        if key=="Changed" or key=="ChildAdded" or key=="ChildRemoved" or key=="AncestryChanged" or key=="Destroying" then
+        if properties[key]~=nil then return properties[key] end
+        if _instance_events[key] then
             if not events[key] then events[key]=Signal.new(key) end
             return events[key]
         end
-        if properties[key]~=nil then return properties[key] end
         return nil
     end
     mt.__newindex=function(self,key,value)
@@ -618,21 +656,26 @@ _G.Vector3=Vector3;_G.Vector2=Vector2
 _G.Color3=Color3;_G.UDim=UDim;_G.UDim2=UDim2
 _G.CFrame=CFrame;_G.Drawing=Drawing
 
-wait=function(t) return t or 0,t or 0 end
-spawn=function(fn) if type(fn)=="function" then pcall(fn) end end
-delay=function(t,fn) if type(fn)=="function" then pcall(fn) end end
-tick=function() return os.clock() end
-time=function() return os.clock() end
-elapsedTime=function() return os.clock() end
-settings=function() return {Rendering={QualityLevel=10}} end
+local _c_wait=wait
+local _c_spawn=spawn
+local _c_delay=delay
 
-task={
-    wait=function(t) return t or 0 end,
-    spawn=function(fn,...) if type(fn)=="function" then pcall(fn,...) end end,
-    defer=function(fn,...) if type(fn)=="function" then pcall(fn,...) end end,
-    delay=function(t,fn,...) if type(fn)=="function" then pcall(fn,...) end end,
-    cancel=function() end,synchronize=function() end,desynchronize=function() end,
-}
+wait=_c_wait or function(t) return t or 0,t or 0 end
+spawn=_c_spawn or function(fn) if type(fn)=="function" then pcall(fn) end end
+delay=_c_delay or function(t,fn) if type(fn)=="function" then pcall(fn) end end
+tick=tick or function() return os.clock() end
+time=time or function() return os.clock() end
+elapsedTime=elapsedTime or function() return os.clock() end
+settings=settings or function() return {Rendering={QualityLevel=10}} end
+
+task=task or {}
+task.wait=task.wait or _c_wait or function(t) return t or 0 end
+task.spawn=task.spawn or function(fn,...) if type(fn)=="function" then pcall(fn,...) end end
+task.defer=task.defer or function(fn,...) if type(fn)=="function" then pcall(fn,...) end end
+task.delay=task.delay or function(t,fn,...) if type(fn)=="function" then pcall(fn,...) end end
+task.cancel=task.cancel or function() end
+task.synchronize=task.synchronize or function() end
+task.desynchronize=task.desynchronize or function() end
 
 shared=shared or {}
 _G=_G or {}
@@ -697,17 +740,36 @@ end
 if not string.split then
     function string.split(str,sep)
         sep=sep or ","
-        local parts={}
-        str:gsub("([^"..sep.."]*)"..sep.."?",function(c)
-            if #c>0 or #parts==0 then table.insert(parts,c) end
-        end)
-        return parts
+        if sep=="" then
+            local p={}
+            for i=1,#str do p[i]=str:sub(i,i) end
+            return p
+        end
+        local p={}
+        local s=1
+        while true do
+            local i,j=string.find(str,sep,s,true)
+            if not i then
+                p[#p+1]=str:sub(s)
+                break
+            end
+            p[#p+1]=str:sub(s,i-1)
+            s=j+1
+        end
+        return p
     end
 end
 
 syn={
     request=_G._oss_http_request or function() return {} end,
-    crypt={base64encode=function(s) return s end,base64decode=function(s) return s end},
+    crypt=type(crypt)=="table" and {
+        base64encode=crypt.base64encode or function(s) return s end,
+        base64decode=crypt.base64decode or function(s) return s end,
+        sha256=crypt.sha256 or function(s) return s end,
+    } or {
+        base64encode=function(s) return s end,
+        base64decode=function(s) return s end,
+    },
 }
 request=syn.request
 http_request=syn.request
