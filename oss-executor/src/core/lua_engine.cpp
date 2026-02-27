@@ -1076,7 +1076,7 @@ int LuaEngine::lua_http_get(lua_State* L) {
     auto resp = Http::instance().get(url);
     lua_newtable(L);
     lua_pushstring(L, resp.body.c_str());    lua_setfield(L, -2, "Body");
-    lua_pushinteger(L, resp.status_code);    lua_setfield(L, -2, "StatusCode");
+    lua_pushinteger(L, static_cast<lua_Integer>(resp.status_code));    lua_setfield(L, -2, "StatusCode");
     lua_pushboolean(L, resp.success());      lua_setfield(L, -2, "Success");
     if (!resp.error.empty()) {
         lua_pushstring(L, resp.error.c_str()); lua_setfield(L, -2, "Error");
@@ -1104,7 +1104,7 @@ int LuaEngine::lua_http_post(lua_State* L) {
     auto resp = Http::instance().post(url, body, headers);
     lua_newtable(L);
     lua_pushstring(L, resp.body.c_str()); lua_setfield(L, -2, "Body");
-    lua_pushinteger(L, resp.status_code); lua_setfield(L, -2, "StatusCode");
+    lua_pushinteger(L, static_cast<lua_Integer>(resp.status_code)); lua_setfield(L, -2, "StatusCode");
     lua_pushboolean(L, resp.success());   lua_setfield(L, -2, "Success");
     return 1;
 }
@@ -1350,3 +1350,4 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
