@@ -12,6 +12,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK4   REQUIRED IMPORTED_TARGET gtk4)
 pkg_check_modules(LUAJIT REQUIRED IMPORTED_TARGET luajit)
+pkg_check_modules(CAIRO  REQUIRED IMPORTED_TARGET cairo)
 
 find_package(CURL    REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -61,6 +62,7 @@ set(SOURCES
     src/ui/theme.cpp
     src/utils/config.cpp
     src/utils/crypto.cpp
+    src/utils/http.cpp
     src/utils/logger.cpp
 )
 
@@ -77,6 +79,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::GTK4
     PkgConfig::LUAJIT
+    PkgConfig::CAIRO
     CURL::libcurl
     OpenSSL::SSL
     OpenSSL::Crypto
