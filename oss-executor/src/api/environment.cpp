@@ -1,4 +1,5 @@
 #include "environment.hpp"
+#include "core/lua_engine.hpp"
 #include "utils/http.hpp"
 #include "utils/logger.hpp"
 #include <cmath>
@@ -1113,3 +1114,4 @@ void Environment::setup(LuaEngine& engine) {
 }
 
 } // namespace oss
+
