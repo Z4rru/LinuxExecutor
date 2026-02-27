@@ -66,7 +66,12 @@ private:
         auto colon = line.find(':');
         if (colon != std::string::npos) {
             std::string key = line.substr(0, colon);
-            std::string val = (colon + 2 < line.size()) ? line.substr(colon + 2) : "";
+            std::string val;
+            size_t val_start = colon + 1;
+            while (val_start < line.size() && line[val_start] == ' ')
+                ++val_start;
+            if (val_start < line.size())
+                val = line.substr(val_start);
             while (!val.empty() && (val.back() == '\r' || val.back() == '\n'))
                 val.pop_back();
             (*headers)[key] = val;
@@ -97,7 +102,6 @@ private:
         curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "OSSExecutor/2.0");
 
-        // RAII wrapper — auto-cleans even if an exception is thrown
         struct SlistDeleter {
             void operator()(curl_slist* p) { if (p) curl_slist_free_all(p); }
         };
@@ -125,8 +129,6 @@ private:
             curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE,
                               &response.status_code);
         }
-
-        // header_list auto-freed here by unique_ptr destructor
 
         return response;
     }
