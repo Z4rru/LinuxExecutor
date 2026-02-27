@@ -3,6 +3,19 @@
 #include "utils/crypto.hpp"
 #include "utils/config.hpp"
 
+// ═══════════════════════════════════════════════════════════════
+// ★ FIX: Include environment.hpp so we can call Environment::setup()
+//
+// BEFORE: This header was never included. Environment::setup() was
+//         never called. The comprehensive Roblox mock (game:GetService,
+//         workspace, Drawing, Vector3, etc.) was DEAD CODE.
+//
+//         Scripts doing loadstring(game:HttpGet(...))() would fail
+//         because game was a minimal table {HttpGet = ...} with no
+//         GetService, no GetPlayers, no workspace, no Drawing, etc.
+// ═══════════════════════════════════════════════════════════════
+#include "api/environment.hpp"
+
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -17,18 +30,12 @@ static thread_local LuaEngine* current_engine = nullptr;
 LuaEngine::LuaEngine() = default;
 
 LuaEngine::~LuaEngine() {
-    // Destructor: no other thread should be using this object
     shutdown_internal();
 }
 
 bool LuaEngine::init() {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // ═══════════════════════════════════════════════════════
-    // ██  FIX: Call shutdown_internal() — NOT shutdown()    ██
-    // ██  shutdown() would try to lock mutex_ again →       ██
-    // ██  std::mutex is non-recursive → DEADLOCK            ██
-    // ═══════════════════════════════════════════════════════
     if (L_) shutdown_internal();
 
     L_ = luaL_newstate();
@@ -39,16 +46,25 @@ bool LuaEngine::init() {
 
     luaL_openlibs(L_);
     setup_environment();
+    register_custom_libs();
 
     // ═══════════════════════════════════════════════════════
-    // ██  FIX: register_custom_libs() and sandbox() call   ██
-    // ██  execute_internal() — NOT execute().               ██
-    // ██  We already hold mutex_ here.                     ██
-    // ██                                                    ██
-    // ██  BEFORE: init() → register_custom_libs() →        ██
-    // ██          execute() → lock(mutex_) → ☠ DEADLOCK    ██
+    // ★ FIX: Load the comprehensive Roblox API mock.
+    //
+    // This creates: game (with GetService, HttpGet, etc.),
+    // workspace, Instance.new(), Drawing.new(), Vector3,
+    // CFrame, Color3, UDim2, Enum, task, Signal, typeof,
+    // and all executor globals (syn, hookfunction, etc.).
+    //
+    // Called AFTER register_custom_libs() so http library
+    // is available as fallback, and BEFORE sandbox() so the
+    // mock globals aren't accidentally removed.
+    //
+    // The mock's game:HttpGet() uses _oss_http_get (C function)
+    // which correctly handles the self parameter now.
     // ═══════════════════════════════════════════════════════
-    register_custom_libs();
+    Environment::setup(*this);
+
     sandbox();
 
     running_ = true;
@@ -70,7 +86,6 @@ void LuaEngine::shutdown_internal() {
 }
 
 void LuaEngine::reset() {
-    // Each call independently acquires/releases mutex — no deadlock
     shutdown();
     init();
 }
@@ -82,14 +97,6 @@ bool LuaEngine::execute(const std::string& script, const std::string& chunk_name
 
 bool LuaEngine::execute_internal(const std::string& script,
                                   const std::string& chunk_name) {
-    // ═══════════════════════════════════════════════════════
-    // ██  NOTE: Caller MUST hold mutex_.                    ██
-    // ██  Called by:                                        ██
-    // ██    execute()        — after locking                ██
-    // ██    register_custom_libs() — via init() which locks ██
-    // ██    sandbox()             — via init() which locks  ██
-    // ═══════════════════════════════════════════════════════
-
     if (!L_) {
         if (error_cb_) {
             error_cb_({"Engine not initialized", -1, chunk_name});
@@ -100,16 +107,8 @@ bool LuaEngine::execute_internal(const std::string& script,
     running_.store(true, std::memory_order_release);
     current_engine = this;
 
-    // ═══════════════════════════════════════════════════════
-    // ██  STACK LEAK FIX: Record stack level before we      ██
-    // ██  push anything.  Restore it on all exit paths.     ██
-    // ██                                                     ██
-    // ██  BEFORE: LUA_MULTRET results accumulated on the   ██
-    // ██  stack across repeated execute() calls.            ██
-    // ═══════════════════════════════════════════════════════
     int base_top = lua_gettop(L_);
 
-    // Set up cancellation hook
     lua_sethook(L_, [](lua_State* L, lua_Debug*) {
         if (current_engine && !current_engine->is_running()) {
             luaL_error(L, "Script execution cancelled");
@@ -121,7 +120,7 @@ bool LuaEngine::execute_internal(const std::string& script,
 
     if (status != 0) {
         std::string err = lua_tostring(L_, -1);
-        lua_settop(L_, base_top);  // clean stack
+        lua_settop(L_, base_top);
 
         LuaError error;
         error.message = err;
@@ -145,10 +144,8 @@ bool LuaEngine::execute_internal(const std::string& script,
         return false;
     }
 
-    // Stack: [base..., chunk]
     lua_pushcfunction(L_, lua_pcall_handler);
     lua_insert(L_, -2);
-    // Stack: [base..., handler, chunk]
 
     int handler_index = lua_gettop(L_) - 1;
 
@@ -156,7 +153,7 @@ bool LuaEngine::execute_internal(const std::string& script,
 
     if (status != 0) {
         std::string err = lua_tostring(L_, -1);
-        lua_settop(L_, base_top);  // clean everything
+        lua_settop(L_, base_top);
 
         LuaError error;
         error.message = err;
@@ -170,11 +167,6 @@ bool LuaEngine::execute_internal(const std::string& script,
         return false;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // ██  STACK LEAK FIX: Discard handler + all results     ██
-    // ██  BEFORE: lua_remove(handler_index) left results    ██
-    // ██  on the stack — grew with every execute() call.    ██
-    // ═══════════════════════════════════════════════════════
     lua_settop(L_, base_top);
 
     lua_sethook(L_, nullptr, 0, 0);
@@ -244,24 +236,11 @@ std::optional<std::string> LuaEngine::get_global_string(const std::string& name)
     return std::nullopt;
 }
 
-// ═══════════════════════════════════════════════════════════
-// ██  PATH TRAVERSAL FIX                                   ██
-// ██                                                        ██
-// ██  BEFORE:                                               ██
-// ██    canonical.string().find(base_canonical.string())    ██
-// ██    → "/workspace2/evil".find("/workspace") == 0  ✓     ██
-// ██    → BYPASSED — attacker reads /workspace2/            ██
-// ██                                                        ██
-// ██  AFTER:                                                ██
-// ██    Append "/" to base before comparison.                ██
-// ██    → "/workspace2/evil".find("/workspace/") == npos ✗  ██
-// ██    → BLOCKED                                           ██
-// ═══════════════════════════════════════════════════════════
 bool LuaEngine::is_sandboxed(const std::string& full_path,
                               const std::string& base_dir) {
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(full_path, ec);
-    if (ec) return false;  // can't resolve → deny
+    if (ec) return false;
     auto base_canonical = std::filesystem::weakly_canonical(base_dir, ec);
     if (ec) return false;
 
@@ -336,17 +315,24 @@ void LuaEngine::register_custom_libs() {
     set_global_bool("_OSS", true);
 
     // ═══════════════════════════════════════════════════════
-    // ██  DEADLOCK FIX: Call execute_internal(), NOT        ██
-    // ██  execute().  We are called from init() which       ██
-    // ██  already holds mutex_.                             ██
+    // ★ FIX: game table is now a FALLBACK only.
+    //
+    // Environment::setup() (called after this in init())
+    // will overwrite `game` with the comprehensive mock
+    // that has GetService, GetPlayers, workspace, etc.
+    //
+    // This fallback only survives if Environment::setup()
+    // fails for some reason. Using `game = game or {...}`
+    // so it also won't clobber an existing mock if call
+    // order ever changes.
     // ═══════════════════════════════════════════════════════
     execute_internal(R"(
         task = task or {}
-        task.wait = wait
-        task.spawn = spawn
+        task.wait = task.wait or wait
+        task.spawn = task.spawn or spawn
 
         syn = syn or {}
-        syn.request = function(opts)
+        syn.request = syn.request or function(opts)
             if opts.Method == "POST" then
                 return http.post(opts.Url, opts.Body or "", opts.Headers or {})
             else
@@ -354,17 +340,16 @@ void LuaEngine::register_custom_libs() {
             end
         end
 
-        request = syn.request
-        http_request = syn.request
+        request = request or syn.request
+        http_request = http_request or syn.request
 
+        -- Fallback game table — Environment::setup() overrides this
+        -- with the full mock (GetService, workspace, Drawing, etc.)
         game = game or {HttpGet = function(_, url) return http.get(url).Body end}
     )", "=env_setup");
 }
 
 void LuaEngine::sandbox() {
-    // ═══════════════════════════════════════════════════════
-    // ██  DEADLOCK FIX: execute_internal(), NOT execute()   ██
-    // ═══════════════════════════════════════════════════════
     execute_internal(R"(
         local safe_os = {
             time = os.time,
@@ -509,7 +494,7 @@ int LuaEngine::lua_spawn(lua_State* L) {
         }
     }
 
-    return 1;  // return thread handle to Lua
+    return 1;
 }
 
 int LuaEngine::lua_readfile(lua_State* L) {
@@ -583,10 +568,6 @@ int LuaEngine::lua_isfile(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    // ═══════════════════════════════════════════════════════
-    // ██  FIX: Added sandbox check — was completely missing ██
-    // ██  BEFORE: isfile("../../etc/passwd") → true         ██
-    // ═══════════════════════════════════════════════════════
     if (!is_sandboxed(full_path, base)) {
         lua_pushboolean(L, false);
         return 1;
@@ -602,13 +583,9 @@ int LuaEngine::lua_listfiles(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full_path = base + path;
 
-    // ═══════════════════════════════════════════════════════
-    // ██  FIX: Added sandbox check — was completely missing ██
-    // ██  BEFORE: listfiles("../../") → lists parent dirs   ██
-    // ═══════════════════════════════════════════════════════
     if (!is_sandboxed(full_path, base)) {
         lua_newtable(L);
-        return 1;  // return empty table, don't leak info
+        return 1;
     }
 
     lua_newtable(L);
@@ -623,9 +600,7 @@ int LuaEngine::lua_listfiles(lua_State* L) {
                     entry.path().filename().string().c_str());
                 lua_rawseti(L, -2, index++);
             }
-        } catch (const std::filesystem::filesystem_error& /*e*/) {
-            // Permission denied or broken symlink — return partial list
-        }
+        } catch (const std::filesystem::filesystem_error&) {}
     }
 
     return 1;
