@@ -95,34 +95,28 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed explanations.
 MIT License — See [LICENSE](LICENSE)
 
 
-debug:
--- Test 1: EnumMock ordering (was crashing)
-local p = Instance.new("Part")
-print("Part material:", p.Material.Name)  -- should print "Plastic"
 
--- Test 2: table.find (was missing)
-local t = {10, 20, 30}
-print("table.find:", table.find(t, 20))   -- should print 2
+local line = Drawing.new("Line")
+line.From = Vector2.new(100, 100)
+line.To = Vector2.new(500, 500)
+line.Color = Color3.fromRGB(255, 0, 0)
+line.Thickness = 3
+line.Visible = true
 
--- Test 3: math.clamp (was missing)
-print("math.clamp:", math.clamp(5, 1, 3)) -- should print 3
+local text = Drawing.new("Text")
+text.Text = "OSS Overlay Working"
+text.Position = Vector2.new(200, 50)
+text.Size = 24
+text.Color = Color3.fromRGB(0, 255, 0)
+text.Outline = true
+text.Visible = true
 
--- Test 4: math.log two-arg (was broken)
-print("math.log:", math.log(8, 2))        -- should print 3
+local circle = Drawing.new("Circle")
+circle.Position = Vector2.new(960, 540)
+circle.Radius = 100
+circle.Color = Color3.fromRGB(0, 150, 255)
+circle.Thickness = 2
+circle.Filled = false
+circle.Visible = true
 
--- Test 5: table.move (was missing)
-local a = {1,2,3,4,5}
-table.move(a, 3, 5, 1)
-print("table.move:", a[1], a[2], a[3])    -- should print 3 4 5
-
--- Test 6: HttpGet error reporting (was silent)
-local ok, err = pcall(function()
-    game:HttpGet("https://httpstat.us/404")
-end)
-print("HttpGet 404:", ok, err)            -- should print false + error message
-
--- Test 7: loadstring error reporting (was hidden)
-local fn, err = loadstring("this is not valid lua ???")
-print("Bad loadstring:", fn, err)         -- should print nil + compile error
-
-print("All tests passed!")
+print("Drawing overlay test complete - 3 objects created")
