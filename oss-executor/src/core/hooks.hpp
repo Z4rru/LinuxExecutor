@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <sys/mman.h>
 #include <cstring>
+#include <fstream>
+#include <string>
 
 namespace oss {
 
@@ -146,3 +148,4 @@ private:
 };
 
 } // namespace oss
+
