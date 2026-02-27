@@ -9,20 +9,6 @@
 #include <optional>
 #include <atomic>
 
-// ═══════════════════════════════════════════════════════════════
-// FIX #4: Use <luajit-2.1/lua.h> consistently.
-//
-// BEFORE: #include <lua.h>
-//         → Works because CMake adds -isystem /usr/include/luajit-2.1
-//         → But if system also has plain Lua (/usr/include/lua.h),
-//           the WRONG header could be picked up depending on
-//           include order.
-//
-// environment.hpp already uses <luajit-2.1/lua.h>.
-// Match it here to prevent version mismatch errors like:
-//   "undefined reference to luaJIT_setmode" (only in LuaJIT)
-//   "LUA_GLOBALSINDEX not defined" (LuaJIT-only constant)
-// ═══════════════════════════════════════════════════════════════
 extern "C" {
 #include <luajit-2.1/lua.h>
 #include <luajit-2.1/lualib.h>
