@@ -35,15 +35,13 @@ public:
             std::ifstream f(path);
             if (!f.is_open()) return false;
 
-            data_ = json::parse(f, nullptr, /*allow_exceptions=*/true,
-                                /*ignore_comments=*/true);
+            data_ = json::parse(f, nullptr, true, true);
 
-            // Merge with defaults for any missing keys
             auto defaults = get_defaults();
             merge_defaults(data_, defaults);
 
             return true;
-        } catch (const std::exception& /*e*/) {
+        } catch (const std::exception&) {
             data_ = get_defaults();
             return false;
         }
@@ -73,15 +71,9 @@ public:
         data_[ptr] = value;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // WARNING: The returned reference is only safe while no
-    // other thread calls set()/load()/save().  Copy the json
-    // object if you need it across an async boundary:
-    //   json snapshot = Config::instance().raw();
-    // ═══════════════════════════════════════════════════════
     json raw() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return data_;  // return by VALUE — safe across threads
+        return data_;
     }
 
     std::string home_dir() const {
@@ -95,11 +87,6 @@ public:
 
 private:
     Config() {
-        // ═══════════════════════════════════════════════════
-        // ██  FIX for "open dir error: No such file or      ██
-        // ██  directory" — create ALL directories on first   ██
-        // ██  construction, before anything tries to read.   ██
-        // ═══════════════════════════════════════════════════
         auto home = home_dir();
         try {
             std::filesystem::create_directories(home);
@@ -108,9 +95,7 @@ private:
             std::filesystem::create_directories(home + "/scripts/autoexec");
             std::filesystem::create_directories(home + "/themes");
             std::filesystem::create_directories(home + "/cache");
-        } catch (const std::filesystem::filesystem_error& /*e*/) {
-            // If we can't create dirs (read-only fs, permissions),
-            // continue — individual operations will fail gracefully.
+        } catch (const std::filesystem::filesystem_error&) {
         }
     }
 
