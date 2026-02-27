@@ -2,7 +2,7 @@
 
 namespace oss {
 
-class LuaEngine;  // forward declaration
+class LuaEngine;
 
 class Environment {
 public:
