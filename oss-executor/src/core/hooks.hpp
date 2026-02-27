@@ -85,19 +85,19 @@ private:
     HookManager(const HookManager&) = delete;
     HookManager& operator=(const HookManager&) = delete;
 
-    bool make_writable(uintptr_t addr, size_t size);
-    bool restore_protection(uintptr_t addr, size_t size, int old_prot);
-    bool is_address_in_own_process(uintptr_t addr);
-
-    uintptr_t find_got_entry(const std::string& library, const std::string& symbol);
-    std::vector<MemRegionInfo> parse_self_maps();
-
     struct MemRegionInfo {
         uintptr_t start;
         uintptr_t end;
         int prot;
         std::string path;
     };
+
+    bool make_writable(uintptr_t addr, size_t size);
+    bool restore_protection(uintptr_t addr, size_t size, int old_prot);
+    bool is_address_in_own_process(uintptr_t addr);
+
+    uintptr_t find_got_entry(const std::string& library, const std::string& symbol);
+    std::vector<MemRegionInfo> parse_self_maps();
 
     std::unordered_map<uintptr_t, Hook> hooks_;
     std::unordered_map<std::string, PLTHook> plt_hooks_;
