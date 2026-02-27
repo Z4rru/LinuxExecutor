@@ -1,16 +1,14 @@
 #include "environment.hpp"
-#include "core/lua_engine.hpp"
-#include "utils/http.hpp"
-#include "utils/logger.hpp"
+#include "../core/lua_engine.hpp"
+#include "../utils/http.hpp"
+#include "../utils/logger.hpp"
 #include <cmath>
 #include <cstring>
 #include <sstream>
 
 namespace oss {
 
-// ── C-side helpers registered into Lua ──────────────────────────
-
-// typeof() — checks for __type in metatable, falls back to type()
+// ── typeof() ─────────────────────────────────────────────────
 static int lua_typeof(lua_State* L) {
     if (lua_getmetatable(L, 1)) {
         lua_getfield(L, -1, "__type");
@@ -24,55 +22,59 @@ static int lua_typeof(lua_State* L) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ★ FIX: game:HttpGet(url) — SELF-PARAMETER CRASH
+// ★ THE FIX: game:HttpGet(url)
 //
-// BEFORE:
-//   const char* url = luaL_checkstring(L, 1);   ← THROWS when arg1 is table
-//   if (lua_istable(L, 1)) {                     ← never reached
-//       url = luaL_checkstring(L, 2);
-//
-// When Lua executes game:HttpGet(url), it desugars to
-// game.HttpGet(game, url), so the C function receives:
+// game:HttpGet(url) desugars to game.HttpGet(game, url)
 //   stack[1] = game   (table)
 //   stack[2] = url    (string)
 //
-// luaL_checkstring(L, 1) immediately throws:
-//   "string expected, got table"
-//
-// AFTER:
-//   Check lua_type FIRST (non-throwing), then luaL_checkstring
-//   on the correct index.
+// Check lua_type FIRST (non-throwing), then checkstring
+// on the correct index.
 // ═══════════════════════════════════════════════════════════════
 static int lua_http_get(lua_State* L) {
-    // Determine which argument holds the URL
     int url_index = 1;
 
-    // Method call: game:HttpGet(url) → args are (self, url)
-    // self can be a table (mock game) or userdata (real instance)
     int arg1_type = lua_type(L, 1);
     if (arg1_type == LUA_TTABLE || arg1_type == LUA_TUSERDATA) {
         url_index = 2;
     }
 
-    // NOW it's safe to checkstring — we know which arg is the URL
+    if (lua_gettop(L) < url_index) {
+        return luaL_error(L, "HttpGet: expected URL argument");
+    }
+
     const char* url = luaL_checkstring(L, url_index);
 
+    // ── URL validation ──
+    if (!url || strlen(url) == 0) {
+        return luaL_error(L, "HttpGet: URL cannot be empty");
+    }
+
+    std::string surl(url);
+    if (surl.rfind("http://", 0) != 0 &&
+        surl.rfind("https://", 0) != 0) {
+        return luaL_error(L,
+            "HttpGet: URL must start with http:// or https://");
+    }
+
     try {
-        auto response = Http::instance().get(url);
+        auto response = Http::instance().get(surl);
         if (response.success()) {
-            lua_pushlstring(L, response.body.data(), response.body.size());
+            lua_pushlstring(L, response.body.data(),
+                            response.body.size());
         } else {
             lua_pushstring(L, "");
-            LOG_WARN("HttpGet failed for '{}': HTTP {}", url, response.status_code);
+            LOG_WARN("HttpGet failed for '{}': HTTP {}",
+                     surl, response.status_code);
         }
     } catch (const std::exception& e) {
         lua_pushstring(L, "");
-        LOG_ERROR("HttpGet exception for '{}': {}", url, e.what());
+        LOG_ERROR("HttpGet exception for '{}': {}", surl, e.what());
     }
     return 1;
 }
 
-// http.request{Url=..., Method=...} — syn.request compatible
+// ── http.request — syn.request compatible ────────────────────
 static int lua_http_request(lua_State* L) {
     luaL_checktype(L, 1, LUA_TTABLE);
 
@@ -103,12 +105,16 @@ static int lua_http_request(lua_State* L) {
     }
 
     lua_newtable(L);
+
     lua_pushinteger(L, resp.status_code);
     lua_setfield(L, -2, "StatusCode");
+
     lua_pushlstring(L, resp.body.data(), resp.body.size());
     lua_setfield(L, -2, "Body");
+
     lua_pushboolean(L, resp.success());
     lua_setfield(L, -2, "Success");
+
     lua_newtable(L);
     for (const auto& [k, v] : resp.headers) {
         lua_pushstring(L, v.c_str());
@@ -119,22 +125,19 @@ static int lua_http_request(lua_State* L) {
     return 1;
 }
 
-// identifyexecutor() / getexecutorname()
+// ── identifyexecutor() ──────────────────────────────────────
 static int lua_identify_executor(lua_State* L) {
     lua_pushstring(L, "OSS Executor");
-    lua_pushstring(L, "2.0.0");
+    lua_pushstring(L, "1.0.0");
     return 2;
 }
 
-// ── The big Lua-side mock setup ─────────────────────────────────
-
+// ═════════════════════════════════════════════════════════════
+// The full Roblox mock Lua code
+// ═════════════════════════════════════════════════════════════
 static const char* ROBLOX_MOCK_LUA = R"LUA(
--- ═════════════════════════════════════════════════════════════
--- ROBLOX API MOCK — runs inside LuaJIT sandbox
--- Makes loadstring(game:HttpGet(...))() not crash
--- ═════════════════════════════════════════════════════════════
 
--- ── Signal (RBXScriptSignal mock) ────────────────────────────
+-- ── Signal ───────────────────────────────────────────────────
 local Signal = {}
 Signal.__index = Signal
 Signal.__type  = "RBXScriptSignal"
@@ -165,15 +168,11 @@ function Signal:Connect(fn)
 end
 Signal.connect = Signal.Connect
 
-function Signal:Wait()
-    return 0
-end
+function Signal:Wait() return 0 end
 
 function Signal:Fire(...)
     for _, conn in ipairs(self._connections) do
-        if conn.Connected then
-            pcall(conn._fn, ...)
-        end
+        if conn.Connected then pcall(conn._fn, ...) end
     end
 end
 
@@ -187,50 +186,35 @@ function Vector3.new(x, y, z)
         X = x or 0, Y = y or 0, Z = z or 0,
         x = x or 0, y = y or 0, z = z or 0,
         Magnitude = math.sqrt((x or 0)^2 + (y or 0)^2 + (z or 0)^2),
-        Unit = nil,
     }, Vector3)
 end
 Vector3.zero = Vector3.new(0, 0, 0)
 Vector3.one  = Vector3.new(1, 1, 1)
 
-function Vector3:Lerp(goal, alpha)
+function Vector3:Lerp(g, a)
     return Vector3.new(
-        self.X + (goal.X - self.X) * alpha,
-        self.Y + (goal.Y - self.Y) * alpha,
-        self.Z + (goal.Z - self.Z) * alpha
-    )
+        self.X+(g.X-self.X)*a, self.Y+(g.Y-self.Y)*a, self.Z+(g.Z-self.Z)*a)
 end
-function Vector3:Dot(other)
-    return self.X * other.X + self.Y * other.Y + self.Z * other.Z
+function Vector3:Dot(o)
+    return self.X*o.X + self.Y*o.Y + self.Z*o.Z
 end
-function Vector3:Cross(other)
+function Vector3:Cross(o)
     return Vector3.new(
-        self.Y * other.Z - self.Z * other.Y,
-        self.Z * other.X - self.X * other.Z,
-        self.X * other.Y - self.Y * other.X
-    )
+        self.Y*o.Z-self.Z*o.Y, self.Z*o.X-self.X*o.Z, self.X*o.Y-self.Y*o.X)
 end
-function Vector3.__add(a, b)
-    return Vector3.new(a.X + b.X, a.Y + b.Y, a.Z + b.Z)
+function Vector3.__add(a,b) return Vector3.new(a.X+b.X,a.Y+b.Y,a.Z+b.Z) end
+function Vector3.__sub(a,b) return Vector3.new(a.X-b.X,a.Y-b.Y,a.Z-b.Z) end
+function Vector3.__mul(a,b)
+    if type(a)=="number" then return Vector3.new(a*b.X,a*b.Y,a*b.Z) end
+    if type(b)=="number" then return Vector3.new(a.X*b,a.Y*b,a.Z*b) end
+    return Vector3.new(a.X*b.X,a.Y*b.Y,a.Z*b.Z)
 end
-function Vector3.__sub(a, b)
-    return Vector3.new(a.X - b.X, a.Y - b.Y, a.Z - b.Z)
+function Vector3.__div(a,b)
+    if type(b)=="number" then return Vector3.new(a.X/b,a.Y/b,a.Z/b) end
+    return Vector3.new(a.X/b.X,a.Y/b.Y,a.Z/b.Z)
 end
-function Vector3.__mul(a, b)
-    if type(a) == "number" then return Vector3.new(a * b.X, a * b.Y, a * b.Z) end
-    if type(b) == "number" then return Vector3.new(a.X * b, a.Y * b, a.Z * b) end
-    return Vector3.new(a.X * b.X, a.Y * b.Y, a.Z * b.Z)
-end
-function Vector3.__div(a, b)
-    if type(b) == "number" then return Vector3.new(a.X / b, a.Y / b, a.Z / b) end
-    return Vector3.new(a.X / b.X, a.Y / b.Y, a.Z / b.Z)
-end
-function Vector3.__unm(a)
-    return Vector3.new(-a.X, -a.Y, -a.Z)
-end
-function Vector3.__eq(a, b)
-    return a.X == b.X and a.Y == b.Y and a.Z == b.Z
-end
+function Vector3.__unm(a) return Vector3.new(-a.X,-a.Y,-a.Z) end
+function Vector3.__eq(a,b) return a.X==b.X and a.Y==b.Y and a.Z==b.Z end
 function Vector3.__tostring(v)
     return string.format("%.4f, %.4f, %.4f", v.X, v.Y, v.Z)
 end
@@ -239,27 +223,24 @@ end
 local Vector2 = {}
 Vector2.__index = Vector2
 Vector2.__type  = "Vector2"
-
-function Vector2.new(x, y)
+function Vector2.new(x,y)
     return setmetatable({
-        X = x or 0, Y = y or 0,
-        x = x or 0, y = y or 0,
-        Magnitude = math.sqrt((x or 0)^2 + (y or 0)^2),
+        X=x or 0, Y=y or 0, x=x or 0, y=y or 0,
+        Magnitude=math.sqrt((x or 0)^2+(y or 0)^2),
     }, Vector2)
 end
-Vector2.zero = Vector2.new(0, 0)
-Vector2.one  = Vector2.new(1, 1)
-
-function Vector2.__add(a, b) return Vector2.new(a.X + b.X, a.Y + b.Y) end
-function Vector2.__sub(a, b) return Vector2.new(a.X - b.X, a.Y - b.Y) end
-function Vector2.__mul(a, b)
-    if type(a) == "number" then return Vector2.new(a * b.X, a * b.Y) end
-    if type(b) == "number" then return Vector2.new(a.X * b, a.Y * b) end
-    return Vector2.new(a.X * b.X, a.Y * b.Y)
+Vector2.zero = Vector2.new(0,0)
+Vector2.one  = Vector2.new(1,1)
+function Vector2.__add(a,b) return Vector2.new(a.X+b.X,a.Y+b.Y) end
+function Vector2.__sub(a,b) return Vector2.new(a.X-b.X,a.Y-b.Y) end
+function Vector2.__mul(a,b)
+    if type(a)=="number" then return Vector2.new(a*b.X,a*b.Y) end
+    if type(b)=="number" then return Vector2.new(a.X*b,a.Y*b) end
+    return Vector2.new(a.X*b.X,a.Y*b.Y)
 end
-function Vector2.__div(a, b)
-    if type(b) == "number" then return Vector2.new(a.X / b, a.Y / b) end
-    return Vector2.new(a.X / b.X, a.Y / b.Y)
+function Vector2.__div(a,b)
+    if type(b)=="number" then return Vector2.new(a.X/b,a.Y/b) end
+    return Vector2.new(a.X/b.X,a.Y/b.Y)
 end
 function Vector2.__tostring(v)
     return string.format("%.4f, %.4f", v.X, v.Y)
@@ -269,33 +250,31 @@ end
 local Color3 = {}
 Color3.__index = Color3
 Color3.__type  = "Color3"
-
-function Color3.new(r, g, b)
-    return setmetatable({ R = r or 0, G = g or 0, B = b or 0 }, Color3)
+function Color3.new(r,g,b)
+    return setmetatable({R=r or 0,G=g or 0,B=b or 0}, Color3)
 end
-function Color3.fromRGB(r, g, b)
-    return Color3.new((r or 0)/255, (g or 0)/255, (b or 0)/255)
+function Color3.fromRGB(r,g,b)
+    return Color3.new((r or 0)/255,(g or 0)/255,(b or 0)/255)
 end
-function Color3.fromHSV(h, s, v)
-    local c = v * s
-    local x = c * (1 - math.abs((h * 6) % 2 - 1))
-    local m = v - c
-    local r, g, b = m, m, m
-    local sector = math.floor(h * 6) % 6
-    if     sector == 0 then r, g = r + c, g + x
-    elseif sector == 1 then r, g = r + x, g + c
-    elseif sector == 2 then g, b = g + c, b + x
-    elseif sector == 3 then g, b = g + x, b + c
-    elseif sector == 4 then r, b = r + x, b + c
-    else                    r, b = r + c, b + x end
-    return Color3.new(r, g, b)
+function Color3.fromHSV(h,s,v)
+    local c=v*s
+    local x=c*(1-math.abs((h*6)%2-1))
+    local m=v-c
+    local r,g,b=m,m,m
+    local sector=math.floor(h*6)%6
+    if     sector==0 then r,g=r+c,g+x
+    elseif sector==1 then r,g=r+x,g+c
+    elseif sector==2 then g,b=g+c,b+x
+    elseif sector==3 then g,b=g+x,b+c
+    elseif sector==4 then r,b=r+x,b+c
+    else                  r,b=r+c,b+x end
+    return Color3.new(r,g,b)
 end
-function Color3:Lerp(goal, alpha)
+function Color3:Lerp(goal,alpha)
     return Color3.new(
-        self.R + (goal.R - self.R) * alpha,
-        self.G + (goal.G - self.G) * alpha,
-        self.B + (goal.B - self.B) * alpha
-    )
+        self.R+(goal.R-self.R)*alpha,
+        self.G+(goal.G-self.G)*alpha,
+        self.B+(goal.B-self.B)*alpha)
 end
 function Color3.__tostring(c)
     return string.format("%.4f, %.4f, %.4f", c.R, c.G, c.B)
@@ -305,23 +284,23 @@ end
 local UDim = {}
 UDim.__index = UDim
 UDim.__type  = "UDim"
-function UDim.new(scale, offset)
-    return setmetatable({ Scale = scale or 0, Offset = offset or 0 }, UDim)
+function UDim.new(s,o)
+    return setmetatable({Scale=s or 0, Offset=o or 0}, UDim)
 end
 
 local UDim2 = {}
 UDim2.__index = UDim2
 UDim2.__type  = "UDim2"
-function UDim2.new(xs, xo, ys, yo)
+function UDim2.new(xs,xo,ys,yo)
     return setmetatable({
-        X = UDim.new(xs or 0, xo or 0),
-        Y = UDim.new(ys or 0, yo or 0),
-        Width  = UDim.new(xs or 0, xo or 0),
-        Height = UDim.new(ys or 0, yo or 0),
+        X=UDim.new(xs or 0,xo or 0),
+        Y=UDim.new(ys or 0,yo or 0),
+        Width=UDim.new(xs or 0,xo or 0),
+        Height=UDim.new(ys or 0,yo or 0),
     }, UDim2)
 end
-function UDim2.fromScale(xs, ys) return UDim2.new(xs, 0, ys, 0) end
-function UDim2.fromOffset(xo, yo) return UDim2.new(0, xo, 0, yo) end
+function UDim2.fromScale(xs,ys) return UDim2.new(xs,0,ys,0) end
+function UDim2.fromOffset(xo,yo) return UDim2.new(0,xo,0,yo) end
 function UDim2.__tostring(u)
     return string.format("{%g, %d}, {%g, %d}",
         u.X.Scale, u.X.Offset, u.Y.Scale, u.Y.Offset)
@@ -331,49 +310,40 @@ end
 local CFrame = {}
 CFrame.__index = CFrame
 CFrame.__type  = "CFrame"
-
-function CFrame.new(x, y, z)
-    if type(x) == "table" and x.X then
+function CFrame.new(x,y,z)
+    if type(x)=="table" and x.X then
         return setmetatable({
-            Position   = x,
-            X = x.X, Y = x.Y, Z = x.Z,
-            LookVector = Vector3.new(0, 0, -1),
-            RightVector= Vector3.new(1, 0, 0),
-            UpVector   = Vector3.new(0, 1, 0),
-            p          = x,
+            Position=x, X=x.X, Y=x.Y, Z=x.Z,
+            LookVector=Vector3.new(0,0,-1),
+            RightVector=Vector3.new(1,0,0),
+            UpVector=Vector3.new(0,1,0), p=x,
         }, CFrame)
     end
-    local pos = Vector3.new(x or 0, y or 0, z or 0)
+    local pos=Vector3.new(x or 0,y or 0,z or 0)
     return setmetatable({
-        Position   = pos,
-        X = pos.X, Y = pos.Y, Z = pos.Z,
-        LookVector = Vector3.new(0, 0, -1),
-        RightVector= Vector3.new(1, 0, 0),
-        UpVector   = Vector3.new(0, 1, 0),
-        p          = pos,
+        Position=pos, X=pos.X, Y=pos.Y, Z=pos.Z,
+        LookVector=Vector3.new(0,0,-1),
+        RightVector=Vector3.new(1,0,0),
+        UpVector=Vector3.new(0,1,0), p=pos,
     }, CFrame)
 end
-CFrame.identity = CFrame.new(0, 0, 0)
-
-function CFrame:Inverse() return CFrame.new(-self.X, -self.Y, -self.Z) end
-function CFrame:Lerp(goal, alpha)
+CFrame.identity = CFrame.new(0,0,0)
+function CFrame:Inverse() return CFrame.new(-self.X,-self.Y,-self.Z) end
+function CFrame:Lerp(g,a)
     return CFrame.new(
-        self.X + (goal.X - self.X) * alpha,
-        self.Y + (goal.Y - self.Y) * alpha,
-        self.Z + (goal.Z - self.Z) * alpha
-    )
+        self.X+(g.X-self.X)*a, self.Y+(g.Y-self.Y)*a, self.Z+(g.Z-self.Z)*a)
 end
-function CFrame:PointToWorldSpace(v3)
-    return Vector3.new(self.X + v3.X, self.Y + v3.Y, self.Z + v3.Z)
+function CFrame:PointToWorldSpace(v)
+    return Vector3.new(self.X+v.X, self.Y+v.Y, self.Z+v.Z)
 end
-function CFrame:PointToObjectSpace(v3)
-    return Vector3.new(v3.X - self.X, v3.Y - self.Y, v3.Z - self.Z)
+function CFrame:PointToObjectSpace(v)
+    return Vector3.new(v.X-self.X, v.Y-self.Y, v.Z-self.Z)
 end
-function CFrame.__mul(a, b)
-    if getmetatable(b) == Vector3 then
-        return Vector3.new(a.X + b.X, a.Y + b.Y, a.Z + b.Z)
+function CFrame.__mul(a,b)
+    if getmetatable(b)==Vector3 then
+        return Vector3.new(a.X+b.X, a.Y+b.Y, a.Z+b.Z)
     end
-    return CFrame.new(a.X + b.X, a.Y + b.Y, a.Z + b.Z)
+    return CFrame.new(a.X+b.X, a.Y+b.Y, a.Z+b.Z)
 end
 function CFrame.__tostring(cf)
     return string.format("%.4f, %.4f, %.4f, ...", cf.X, cf.Y, cf.Z)
@@ -384,87 +354,72 @@ local function make_instance(class_name, name, parent)
     local children = {}
     local properties = {}
     local events = {}
-
     local inst = {}
     local mt = {
         __type = "Instance",
         __tostring = function() return name or class_name end,
     }
-
     mt.__index = function(self, key)
-        if key == "Name"      then return name or class_name end
-        if key == "ClassName" then return class_name end
-        if key == "Parent"    then return parent end
-
-        if key == "IsA" then
-            return function(_, check)
-                return check == class_name or check == "Instance"
-                       or check == "GuiObject" or check == "BasePart"
+        if key=="Name"      then return name or class_name end
+        if key=="ClassName" then return class_name end
+        if key=="Parent"    then return parent end
+        if key=="IsA" then
+            return function(_,check)
+                return check==class_name or check=="Instance"
+                    or check=="GuiObject" or check=="BasePart"
             end
         end
-        if key == "FindFirstChild" then
-            return function(_, child_name)
-                for _, c in ipairs(children) do
-                    if (type(c) == "table" and rawget(c, "Name") == child_name)
-                       or tostring(c) == child_name then
-                        return c
-                    end
+        if key=="FindFirstChild" then
+            return function(_,child_name)
+                for _,c in ipairs(children) do
+                    if (type(c)=="table" and rawget(c,"Name")==child_name)
+                       or tostring(c)==child_name then return c end
                 end
                 return nil
             end
         end
-        if key == "FindFirstChildOfClass" then
-            return function(_, cls)
-                for _, c in ipairs(children) do
-                    if type(c) == "table" and rawget(c, "ClassName") == cls then
-                        return c
-                    end
+        if key=="FindFirstChildOfClass" then
+            return function(_,cls)
+                for _,c in ipairs(children) do
+                    if type(c)=="table" and rawget(c,"ClassName")==cls then
+                        return c end
                 end
                 return nil
             end
         end
-        if key == "WaitForChild" then
-            return function(_, child_name)
-                return rawget(mt, "__index")(self, "FindFirstChild")(self, child_name)
+        if key=="WaitForChild" then
+            return function(_,cn)
+                return rawget(mt,"__index")(self,"FindFirstChild")(self,cn)
             end
         end
-        if key == "GetChildren" or key == "getChildren" then
+        if key=="GetChildren" or key=="getChildren" then
             return function() return children end
         end
-        if key == "GetDescendants" then
+        if key=="GetDescendants" then
             return function() return children end
         end
-        if key == "Clone" then
-            return function()
-                return make_instance(class_name, name, nil)
-            end
+        if key=="Clone" then
+            return function() return make_instance(class_name,name,nil) end
         end
-        if key == "Destroy" or key == "Remove" then
+        if key=="Destroy" or key=="Remove" then
             return function() end
         end
-        if key == "ClearAllChildren" then
-            return function() children = {} end
+        if key=="ClearAllChildren" then
+            return function() children={} end
         end
-
-        if key == "Changed" or key == "ChildAdded" or key == "ChildRemoved"
-           or key == "AncestryChanged" or key == "Destroying" then
-            if not events[key] then events[key] = Signal.new(key) end
+        if key=="Changed" or key=="ChildAdded" or key=="ChildRemoved"
+           or key=="AncestryChanged" or key=="Destroying" then
+            if not events[key] then events[key]=Signal.new(key) end
             return events[key]
         end
-
-        if properties[key] ~= nil then return properties[key] end
+        if properties[key]~=nil then return properties[key] end
         return nil
     end
-
     mt.__newindex = function(self, key, value)
-        if key == "Name" then name = value
-        elseif key == "Parent" then
-            parent = value
-        else
-            properties[key] = value
-        end
+        if key=="Name" then name=value
+        elseif key=="Parent" then parent=value
+        else properties[key]=value end
     end
-
     setmetatable(inst, mt)
     return inst, children, properties
 end
@@ -472,93 +427,61 @@ end
 -- ── Instance.new() ───────────────────────────────────────────
 local InstanceModule = {}
 function InstanceModule.new(class_name, parent)
-    local inst, children, props = make_instance(class_name, class_name, parent)
-
-    if class_name == "ScreenGui" or class_name == "BillboardGui"
-       or class_name == "SurfaceGui" then
-        props.Enabled = true
-        props.ResetOnSpawn = true
-    elseif class_name == "Frame" or class_name == "TextLabel"
-           or class_name == "TextButton" or class_name == "ImageLabel" then
-        props.Size = UDim2.new(0, 100, 0, 100)
-        props.Position = UDim2.new(0, 0, 0, 0)
-        props.BackgroundColor3 = Color3.new(1, 1, 1)
-        props.BackgroundTransparency = 0
-        props.Visible = true
-        props.Text = ""
-        props.TextColor3 = Color3.new(0, 0, 0)
-        props.TextSize = 14
-        props.Font = 0
-        props.ZIndex = 1
-    elseif class_name == "Part" or class_name == "MeshPart"
-           or class_name == "UnionOperation" then
-        props.Position = Vector3.new(0, 0, 0)
-        props.Size = Vector3.new(4, 1, 2)
-        props.CFrame = CFrame.new(0, 0, 0)
-        props.Anchored = false
-        props.CanCollide = true
-        props.Transparency = 0
-        props.BrickColor = "Medium stone grey"
-        props.Color = Color3.fromRGB(163, 162, 165)
-    elseif class_name == "Folder" then
-        -- container
-    elseif class_name == "UICorner" then
-        props.CornerRadius = UDim.new(0, 8)
-    elseif class_name == "UIStroke" then
-        props.Thickness = 1
-        props.Color = Color3.new(0, 0, 0)
-        props.Transparency = 0
+    local inst,children,props = make_instance(class_name,class_name,parent)
+    if class_name=="ScreenGui" or class_name=="BillboardGui"
+       or class_name=="SurfaceGui" then
+        props.Enabled=true; props.ResetOnSpawn=true
+    elseif class_name=="Frame" or class_name=="TextLabel"
+           or class_name=="TextButton" or class_name=="ImageLabel" then
+        props.Size=UDim2.new(0,100,0,100)
+        props.Position=UDim2.new(0,0,0,0)
+        props.BackgroundColor3=Color3.new(1,1,1)
+        props.BackgroundTransparency=0
+        props.Visible=true; props.Text=""
+        props.TextColor3=Color3.new(0,0,0)
+        props.TextSize=14; props.Font=0; props.ZIndex=1
+    elseif class_name=="Part" or class_name=="MeshPart"
+           or class_name=="UnionOperation" then
+        props.Position=Vector3.new(0,0,0)
+        props.Size=Vector3.new(4,1,2)
+        props.CFrame=CFrame.new(0,0,0)
+        props.Anchored=false; props.CanCollide=true
+        props.Transparency=0
+        props.BrickColor="Medium stone grey"
+        props.Color=Color3.fromRGB(163,162,165)
+    elseif class_name=="UICorner" then
+        props.CornerRadius=UDim.new(0,8)
+    elseif class_name=="UIStroke" then
+        props.Thickness=1
+        props.Color=Color3.new(0,0,0)
+        props.Transparency=0
     end
-
     return inst
 end
 
--- ── Drawing library mock ─────────────────────────────────────
+-- ── Drawing library ──────────────────────────────────────────
 local DrawingMT = {}
 DrawingMT.__index = DrawingMT
 DrawingMT.__type  = "Drawing"
-
 local Drawing = {
-    Fonts = {
-        UI     = 0,
-        System = 1,
-        Plex   = 2,
-        Monospace = 3,
-    }
+    Fonts = { UI=0, System=1, Plex=2, Monospace=3 }
 }
-
 function Drawing.new(class_name)
     local obj = {
-        Visible      = false,
-        Color        = Color3.new(1, 1, 1),
-        Transparency = 0,
-        Thickness    = 1,
-        ZIndex       = 0,
-        From         = Vector2.new(0, 0),
-        To           = Vector2.new(0, 0),
-        Text         = "",
-        Size         = 14,
-        Center       = false,
-        Outline      = false,
-        OutlineColor = Color3.new(0, 0, 0),
-        Position     = Vector2.new(0, 0),
-        TextBounds   = Vector2.new(0, 0),
-        Font         = 0,
-        Radius       = 50,
-        NumSides     = 32,
-        Filled       = false,
-        PointA       = Vector2.new(0, 0),
-        PointB       = Vector2.new(0, 0),
-        PointC       = Vector2.new(0, 0),
-        PointD       = Vector2.new(0, 0),
-        Data         = "",
-        Rounding     = 0,
-        _class       = class_name or "Line",
+        Visible=false, Color=Color3.new(1,1,1),
+        Transparency=0, Thickness=1, ZIndex=0,
+        From=Vector2.new(0,0), To=Vector2.new(0,0),
+        Text="", Size=14, Center=false, Outline=false,
+        OutlineColor=Color3.new(0,0,0),
+        Position=Vector2.new(0,0),
+        TextBounds=Vector2.new(0,0), Font=0,
+        Radius=50, NumSides=32, Filled=false,
+        PointA=Vector2.new(0,0), PointB=Vector2.new(0,0),
+        PointC=Vector2.new(0,0), PointD=Vector2.new(0,0),
+        Data="", Rounding=0, _class=class_name or "Line",
     }
-
-    function obj:Remove() self.Visible = false end
-    function obj:Destroy() self.Visible = false end
-
+    function obj:Remove() self.Visible=false end
+    function obj:Destroy() self.Visible=false end
     return setmetatable(obj, DrawingMT)
 end
 
@@ -566,15 +489,11 @@ end
 local EnumMock = setmetatable({}, {
     __index = function(self, enum_type)
         local enum = setmetatable({}, {
-            __index = function(_, item_name)
-                return {
-                    Name  = item_name,
-                    Value = 0,
-                    EnumType = enum_type,
-                }
+            __index = function(_,item_name)
+                return { Name=item_name, Value=0, EnumType=enum_type }
             end,
             __type = "Enum",
-            __tostring = function() return "Enum." .. enum_type end,
+            __tostring = function() return "Enum."..enum_type end,
         })
         rawset(self, enum_type, enum)
         return enum
@@ -582,169 +501,127 @@ local EnumMock = setmetatable({}, {
     __type = "Enums",
 })
 
--- ── Service stubs ────────────────────────────────────────────
+-- ── Services ─────────────────────────────────────────────────
 local service_cache = {}
 
 local function get_camera()
-    local cam, _, props = make_instance("Camera", "Camera")
-    props.CFrame          = CFrame.new(0, 10, 0)
-    props.ViewportSize    = Vector2.new(1920, 1080)
-    props.FieldOfView     = 70
-    props.NearPlaneZ      = 0.1
-    props.FarPlaneZ       = 10000
-    props.Focus           = CFrame.new(0, 0, 0)
-    props.CameraType      = EnumMock.CameraType.Custom
-    props.CameraSubject   = nil
-
-    rawset(cam, "WorldToViewportPoint", function(_, v3)
-        return Vector3.new(960, 540, (v3 and v3.Z or 10)), true
+    local cam,_,props = make_instance("Camera","Camera")
+    props.CFrame=CFrame.new(0,10,0)
+    props.ViewportSize=Vector2.new(1920,1080)
+    props.FieldOfView=70
+    props.NearPlaneZ=0.1; props.FarPlaneZ=10000
+    props.Focus=CFrame.new(0,0,0)
+    props.CameraType=EnumMock.CameraType.Custom
+    props.CameraSubject=nil
+    rawset(cam,"WorldToViewportPoint",function(_,v3)
+        return Vector3.new(960,540,(v3 and v3.Z or 10)), true
     end)
-    rawset(cam, "WorldToScreenPoint", function(self, v3)
+    rawset(cam,"WorldToScreenPoint",function(self,v3)
         return self:WorldToViewportPoint(v3)
     end)
-    rawset(cam, "ViewportPointToRay", function(_, x, y)
-        return {
-            Origin    = Vector3.new(x or 0, y or 0, 0),
-            Direction = Vector3.new(0, 0, -1),
-        }
+    rawset(cam,"ViewportPointToRay",function(_,x,y)
+        return {Origin=Vector3.new(x or 0,y or 0,0),
+                Direction=Vector3.new(0,0,-1)}
     end)
-
     return cam
 end
 
 local function make_service(name)
     if service_cache[name] then return service_cache[name] end
+    local svc,children,props = make_instance(name,name)
 
-    local svc, children, props = make_instance(name, name)
+    if name=="Players" then
+        local lp,_,lp_props = make_instance("Player","LocalPlayer")
+        lp_props.Name="LocalPlayer"; lp_props.DisplayName="Player"
+        lp_props.UserId=1
+        lp_props.TeamColor=Color3.new(1,1,1); lp_props.Team=nil
 
-    if name == "Players" then
-        local lp, _, lp_props = make_instance("Player", "LocalPlayer")
-        lp_props.Name            = "LocalPlayer"
-        lp_props.DisplayName     = "Player"
-        lp_props.UserId          = 1
-        lp_props.TeamColor       = Color3.new(1, 1, 1)
-        lp_props.Team            = nil
+        local char,char_children = make_instance("Model","LocalPlayer")
+        local hrp,_,hrp_props = make_instance("Part","HumanoidRootPart",char)
+        hrp_props.Position=Vector3.new(0,3,0)
+        hrp_props.CFrame=CFrame.new(0,3,0)
+        hrp_props.Size=Vector3.new(2,2,1)
 
-        local char, char_children = make_instance("Model", "LocalPlayer")
-        local hrp, _, hrp_props   = make_instance("Part", "HumanoidRootPart", char)
-        hrp_props.Position = Vector3.new(0, 3, 0)
-        hrp_props.CFrame   = CFrame.new(0, 3, 0)
-        hrp_props.Size     = Vector3.new(2, 2, 1)
+        local head,_,head_props = make_instance("Part","Head",char)
+        head_props.Position=Vector3.new(0,4.5,0)
+        head_props.CFrame=CFrame.new(0,4.5,0)
+        head_props.Size=Vector3.new(2,1,1)
 
-        local head, _, head_props = make_instance("Part", "Head", char)
-        head_props.Position = Vector3.new(0, 4.5, 0)
-        head_props.CFrame   = CFrame.new(0, 4.5, 0)
-        head_props.Size     = Vector3.new(2, 1, 1)
-
-        local hum, _, hum_props = make_instance("Humanoid", "Humanoid", char)
-        hum_props.Health    = 100
-        hum_props.MaxHealth = 100
-        hum_props.WalkSpeed = 16
-        hum_props.JumpPower = 50
+        local hum,_,hum_props = make_instance("Humanoid","Humanoid",char)
+        hum_props.Health=100; hum_props.MaxHealth=100
+        hum_props.WalkSpeed=16; hum_props.JumpPower=50
 
         table.insert(char_children, hrp)
         table.insert(char_children, head)
         table.insert(char_children, hum)
 
         lp_props.Character = char
-
-        rawset(lp, "GetMouse", function()
-            local mouse, _, mp = make_instance("Mouse", "Mouse")
-            mp.X = 0
-            mp.Y = 0
-            mp.Hit = CFrame.new(0, 0, 0)
-            mp.Target = nil
+        rawset(lp,"GetMouse",function()
+            local mouse,_,mp = make_instance("Mouse","Mouse")
+            mp.X=0; mp.Y=0; mp.Hit=CFrame.new(0,0,0); mp.Target=nil
             return mouse
         end)
-
         props.LocalPlayer = lp
         table.insert(children, lp)
+        rawset(svc,"GetPlayers",function() return {lp} end)
+        props.PlayerAdded=Signal.new("PlayerAdded")
+        props.PlayerRemoving=Signal.new("PlayerRemoving")
 
-        rawset(svc, "GetPlayers", function()
-            return { lp }
+    elseif name=="RunService" then
+        props.RenderStepped=Signal.new("RenderStepped")
+        props.Heartbeat=Signal.new("Heartbeat")
+        props.Stepped=Signal.new("Stepped")
+        rawset(svc,"IsClient",function() return true end)
+        rawset(svc,"IsServer",function() return false end)
+        rawset(svc,"IsStudio",function() return false end)
+        rawset(svc,"BindToRenderStep",function(_,n,p,fn)
+            if type(fn)=="function" then props.RenderStepped:Connect(fn) end
+        end)
+        rawset(svc,"UnbindFromRenderStep",function() end)
+
+    elseif name=="Workspace" then
+        props.CurrentCamera=get_camera()
+        props.Gravity=196.2; props.DistributedGameTime=0
+        rawset(svc,"Raycast",function() return nil end)
+
+    elseif name=="UserInputService" then
+        props.MouseEnabled=true; props.KeyboardEnabled=true
+        props.TouchEnabled=false; props.GamepadEnabled=false
+        props.MouseBehavior=EnumMock.MouseBehavior.Default
+        props.InputBegan=Signal.new("InputBegan")
+        props.InputEnded=Signal.new("InputEnded")
+        props.InputChanged=Signal.new("InputChanged")
+        rawset(svc,"GetMouseLocation",function()
+            return Vector2.new(960,540) end)
+        rawset(svc,"IsKeyDown",function() return false end)
+        rawset(svc,"IsMouseButtonPressed",function() return false end)
+
+    elseif name=="CoreGui" or name=="StarterGui" then
+        rawset(svc,"SetCoreGuiEnabled",function() end)
+        rawset(svc,"GetCoreGuiEnabled",function() return true end)
+
+    elseif name=="TweenService" then
+        rawset(svc,"Create",function(_,inst,info,pt)
+            return {Play=function()end, Cancel=function()end,
+                    Pause=function()end,
+                    Completed=Signal.new("Completed")}
         end)
 
-        props.PlayerAdded   = Signal.new("PlayerAdded")
-        props.PlayerRemoving = Signal.new("PlayerRemoving")
-
-    elseif name == "RunService" then
-        props.RenderStepped  = Signal.new("RenderStepped")
-        props.Heartbeat      = Signal.new("Heartbeat")
-        props.Stepped        = Signal.new("Stepped")
-
-        rawset(svc, "IsClient", function() return true end)
-        rawset(svc, "IsServer", function() return false end)
-        rawset(svc, "IsStudio", function() return false end)
-        rawset(svc, "BindToRenderStep", function(_, name_arg, priority, fn)
-            if type(fn) == "function" then
-                props.RenderStepped:Connect(fn)
-            end
-        end)
-        rawset(svc, "UnbindFromRenderStep", function() end)
-
-    elseif name == "Workspace" then
-        props.CurrentCamera  = get_camera()
-        props.Gravity        = 196.2
-        props.DistributedGameTime = 0
-        rawset(svc, "Raycast", function(_, origin, direction, params)
-            return nil
-        end)
-
-    elseif name == "UserInputService" then
-        props.MouseEnabled    = true
-        props.KeyboardEnabled = true
-        props.TouchEnabled    = false
-        props.GamepadEnabled  = false
-        props.MouseBehavior   = EnumMock.MouseBehavior.Default
-        props.InputBegan      = Signal.new("InputBegan")
-        props.InputEnded      = Signal.new("InputEnded")
-        props.InputChanged    = Signal.new("InputChanged")
-
-        rawset(svc, "GetMouseLocation", function()
-            return Vector2.new(960, 540)
-        end)
-        rawset(svc, "IsKeyDown", function() return false end)
-        rawset(svc, "IsMouseButtonPressed", function() return false end)
-
-    elseif name == "CoreGui" or name == "StarterGui" then
-        rawset(svc, "SetCoreGuiEnabled", function() end)
-        rawset(svc, "GetCoreGuiEnabled", function() return true end)
-
-    elseif name == "TweenService" then
-        rawset(svc, "Create", function(_, instance, info, props_table)
-            local tween = {
-                Play   = function() end,
-                Cancel = function() end,
-                Pause  = function() end,
-                Completed = Signal.new("Completed"),
-            }
-            return tween
-        end)
-
-    elseif name == "HttpService" then
-        rawset(svc, "JSONEncode", function(_, obj)
-            if type(obj) == "string" then return '"' .. obj .. '"' end
+    elseif name=="HttpService" then
+        rawset(svc,"JSONEncode",function(_,obj)
+            if type(obj)=="string" then return '"'..obj..'"' end
             return tostring(obj)
         end)
-        rawset(svc, "JSONDecode", function(_, str)
-            return {}
-        end)
-        rawset(svc, "GenerateGUID", function(_, wrap)
-            local g = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
-            g = g:gsub("[xy]", function(c)
-                local v = (c == "x") and math.random(0, 15) or math.random(8, 11)
-                return string.format("%x", v)
+        rawset(svc,"JSONDecode",function() return {} end)
+        rawset(svc,"GenerateGUID",function(_,wrap)
+            local g="xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
+            g=g:gsub("[xy]",function(c)
+                local v=(c=="x") and math.random(0,15) or math.random(8,11)
+                return string.format("%x",v)
             end)
-            if wrap == false then return g end
-            return "{" .. g .. "}"
+            if wrap==false then return g end
+            return "{"..g.."}"
         end)
-
-    elseif name == "ReplicatedStorage" or name == "ServerStorage"
-           or name == "ServerScriptService" or name == "Lighting"
-           or name == "SoundService" or name == "Chat"
-           or name == "Teams" or name == "TestService"
-           or name == "ProximityPromptService" then
-        -- generic empty service
     end
 
     service_cache[name] = svc
@@ -752,12 +629,8 @@ local function make_service(name)
 end
 
 -- ═════════════════════════════════════════════════════════════
--- ★ FIX: game:HttpGet now works because the C-side
--- lua_http_get checks lua_type BEFORE luaL_checkstring.
---
--- The __index metamethod returns the C function, then Lua
--- calls it as game.HttpGet(game, url) — the C function
--- sees arg1=table, shifts to arg2 for the URL.
+-- ★ game:HttpGet — returns _oss_http_get (the C function)
+-- which handles the self parameter correctly
 -- ═════════════════════════════════════════════════════════════
 local game_mt = {
     __type = "DataModel",
@@ -765,185 +638,139 @@ local game_mt = {
 }
 
 game_mt.__index = function(self, key)
-    if key == "GetService" then
-        return function(_, service_name)
-            return make_service(service_name)
-        end
+    if key=="GetService" then
+        return function(_,sn) return make_service(sn) end
     end
-    if key == "FindService" then
-        return function(_, service_name)
-            return make_service(service_name)
-        end
+    if key=="FindService" then
+        return function(_,sn) return make_service(sn) end
     end
 
-    if key == "HttpGet" or key == "HttpGetAsync" then
+    -- ★ HttpGet returns the C function; when called as
+    --   game:HttpGet(url) → C sees (game_table, url_string)
+    --   and the C code checks lua_type(L,1) to skip self
+    if key=="HttpGet" or key=="HttpGetAsync" then
         return _G._oss_http_get
     end
-    if key == "HttpPost" or key == "HttpPostAsync" then
-        return function(_, url, body)
-            return ""
-        end
+    if key=="HttpPost" or key=="HttpPostAsync" then
+        return function(_,url,body) return "" end
     end
 
-    if key == "PlaceId"      then return 0 end
-    if key == "PlaceVersion" then return 1 end
-    if key == "GameId"       then return 0 end
-    if key == "JobId"        then return "" end
-    if key == "CreatorId"    then return 0 end
-    if key == "CreatorType"  then return "User" end
+    if key=="PlaceId"      then return 0 end
+    if key=="PlaceVersion" then return 1 end
+    if key=="GameId"       then return 0 end
+    if key=="JobId"        then return "" end
+    if key=="CreatorId"    then return 0 end
+    if key=="CreatorType"  then return "User" end
 
-    if key == "IsA" then
-        return function(_, class)
-            return class == "DataModel" or class == "Instance"
+    if key=="IsA" then
+        return function(_,class)
+            return class=="DataModel" or class=="Instance"
         end
     end
-
-    if key == "FindFirstChild" or key == "WaitForChild" then
-        return function(_, name)
-            return make_service(name)
-        end
+    if key=="FindFirstChild" or key=="WaitForChild" then
+        return function(_,n) return make_service(n) end
     end
-
-    if key == "GetChildren" or key == "GetDescendants" then
+    if key=="GetChildren" or key=="GetDescendants" then
         return function() return {} end
     end
+    if key=="BindToClose" then return function() end end
 
-    if key == "BindToClose" then
-        return function() end
-    end
-
-    local ok, svc = pcall(make_service, key)
+    local ok,svc = pcall(make_service, key)
     if ok and svc then return svc end
-
     return nil
 end
 
 game = setmetatable({}, game_mt)
-
 workspace = make_service("Workspace")
-
 Instance = InstanceModule
-Enum     = EnumMock
+Enum = EnumMock
 
-_G.Vector3 = Vector3
-_G.Vector2 = Vector2
-_G.Color3  = Color3
-_G.UDim    = UDim
-_G.UDim2   = UDim2
-_G.CFrame  = CFrame
-_G.Drawing = Drawing
+_G.Vector3=Vector3; _G.Vector2=Vector2
+_G.Color3=Color3; _G.UDim=UDim; _G.UDim2=UDim2
+_G.CFrame=CFrame; _G.Drawing=Drawing
 
-wait = function(t)
-    return t or 0, t or 0
-end
-
-spawn = function(fn)
-    if type(fn) == "function" then pcall(fn) end
-end
-
-delay = function(t, fn)
-    if type(fn) == "function" then pcall(fn) end
-end
-
-tick = function()
-    return os.clock()
-end
-
-time = function()
-    return os.clock()
-end
+wait = function(t) return t or 0, t or 0 end
+spawn = function(fn) if type(fn)=="function" then pcall(fn) end end
+delay = function(t,fn) if type(fn)=="function" then pcall(fn) end end
+tick = function() return os.clock() end
+time = function() return os.clock() end
 
 task = {
-    wait  = function(t) return t or 0 end,
-    spawn = function(fn, ...) if type(fn) == "function" then pcall(fn, ...) end end,
-    defer = function(fn, ...) if type(fn) == "function" then pcall(fn, ...) end end,
-    delay = function(t, fn, ...) if type(fn) == "function" then pcall(fn, ...) end end,
-    cancel = function() end,
-    synchronize = function() end,
-    desynchronize = function() end,
+    wait=function(t) return t or 0 end,
+    spawn=function(fn,...) if type(fn)=="function" then pcall(fn,...) end end,
+    defer=function(fn,...) if type(fn)=="function" then pcall(fn,...) end end,
+    delay=function(t,fn,...) if type(fn)=="function" then pcall(fn,...) end end,
+    cancel=function() end,
+    synchronize=function() end,
+    desynchronize=function() end,
 }
 
 shared = shared or {}
-_G     = _G    or {}
+_G = _G or {}
 
 TweenInfo = {}
-function TweenInfo.new(time_val, style, direction, repeat_count, reverses, delay_time)
-    return {
-        Time = time_val or 1,
-        EasingStyle = style or EnumMock.EasingStyle.Quad,
-        EasingDirection = direction or EnumMock.EasingDirection.Out,
-        RepeatCount = repeat_count or 0,
-        Reverses = reverses or false,
-        DelayTime = delay_time or 0,
-    }
+function TweenInfo.new(tv,s,d,rc,rev,dt)
+    return {Time=tv or 1,
+            EasingStyle=s or EnumMock.EasingStyle.Quad,
+            EasingDirection=d or EnumMock.EasingDirection.Out,
+            RepeatCount=rc or 0, Reverses=rev or false,
+            DelayTime=dt or 0}
 end
 
 Ray = {}
-function Ray.new(origin, direction)
-    return {
-        Origin    = origin or Vector3.new(),
-        Direction = direction or Vector3.new(0, 0, -1),
-        Unit      = nil,
-    }
-end
+function Ray.new(o,d) return {Origin=o or Vector3.new(),
+    Direction=d or Vector3.new(0,0,-1)} end
 
 RaycastParams = {}
 function RaycastParams.new()
-    return {
-        FilterType = EnumMock.RaycastFilterType.Exclude,
-        FilterDescendantsInstances = {},
-    }
+    return {FilterType=EnumMock.RaycastFilterType.Exclude,
+            FilterDescendantsInstances={}}
 end
 
 NumberSequenceKeypoint = {}
-function NumberSequenceKeypoint.new(t, v, e)
-    return { Time = t or 0, Value = v or 0, Envelope = e or 0 }
+function NumberSequenceKeypoint.new(t,v,e)
+    return {Time=t or 0, Value=v or 0, Envelope=e or 0}
 end
 NumberSequence = {}
 function NumberSequence.new(...)
-    local args = {...}
-    if type(args[1]) == "number" then
-        return { Keypoints = {
-            NumberSequenceKeypoint.new(0, args[1]),
-            NumberSequenceKeypoint.new(1, args[2] or args[1]),
-        }}
+    local args={...}
+    if type(args[1])=="number" then
+        return {Keypoints={
+            NumberSequenceKeypoint.new(0,args[1]),
+            NumberSequenceKeypoint.new(1,args[2] or args[1])}}
     end
-    return { Keypoints = args[1] or {} }
+    return {Keypoints=args[1] or {}}
 end
 
 ColorSequenceKeypoint = {}
-function ColorSequenceKeypoint.new(t, c)
-    return { Time = t or 0, Value = c or Color3.new() }
+function ColorSequenceKeypoint.new(t,c)
+    return {Time=t or 0, Value=c or Color3.new()}
 end
 ColorSequence = {}
 function ColorSequence.new(...)
-    local args = {...}
-    if getmetatable(args[1]) == Color3 then
-        return { Keypoints = {
-            ColorSequenceKeypoint.new(0, args[1]),
-            ColorSequenceKeypoint.new(1, args[2] or args[1]),
-        }}
+    local args={...}
+    if getmetatable(args[1])==Color3 then
+        return {Keypoints={
+            ColorSequenceKeypoint.new(0,args[1]),
+            ColorSequenceKeypoint.new(1,args[2] or args[1])}}
     end
-    return { Keypoints = args[1] or {} }
+    return {Keypoints=args[1] or {}}
 end
 
 BrickColor = {}
-function BrickColor.new(name_or_r, g, b)
-    if type(name_or_r) == "string" then
-        return { Name = name_or_r, Color = Color3.new(0.64, 0.64, 0.64) }
+function BrickColor.new(nr,g,b)
+    if type(nr)=="string" then
+        return {Name=nr, Color=Color3.new(0.64,0.64,0.64)}
     end
-    return { Name = "Custom", Color = Color3.fromRGB(name_or_r or 0, g or 0, b or 0) }
+    return {Name="Custom", Color=Color3.fromRGB(nr or 0,g or 0,b or 0)}
 end
 
 if not string.split then
-    function string.split(str, sep)
-        sep = sep or ","
-        local parts = {}
-        local pattern = "([^" .. sep .. "]*)" .. sep .. "?"
-        str:gsub(pattern, function(c)
-            if #c > 0 or #parts == 0 then
-                table.insert(parts, c)
-            end
+    function string.split(str,sep)
+        sep=sep or ","
+        local parts={}
+        str:gsub("([^"..sep.."]*)"..sep.."?", function(c)
+            if #c>0 or #parts==0 then table.insert(parts,c) end
         end)
         return parts
     end
@@ -952,57 +779,50 @@ end
 syn = {
     request = _G._oss_http_request or function() return {} end,
     crypt = {
-        base64encode = function(s) return s end,
-        base64decode = function(s) return s end,
+        base64encode=function(s) return s end,
+        base64decode=function(s) return s end,
     },
 }
-
 request      = syn.request
 http_request = syn.request
 
-getgenv = function() return _G end
-getrenv = function() return _G end
-getreg  = function() return {} end
-getgc   = function() return {} end
+getgenv=function() return _G end
+getrenv=function() return _G end
+getreg=function() return {} end
+getgc=function() return {} end
+gethui=function() return make_service("CoreGui") end
 
-gethui = function()
-    return make_service("CoreGui")
-end
+isexecutorclosure=function() return false end
+checkcaller=function() return false end
+islclosure=function(f) return type(f)=="function" end
+iscclosure=function(f) return type(f)=="function" end
+hookfunction=function(old) return old end
+newcclosure=function(fn) return fn end
+hookmetamethod=function() return function() end end
+getrawmetatable=function(t) return getmetatable(t) end
+setrawmetatable=function(t,mt) return setmetatable(t,mt) end
+setreadonly=function() end
+isreadonly=function() return false end
 
-isexecutorclosure = function() return false end
-checkcaller       = function() return false end
-islclosure        = function(f) return type(f) == "function" end
-iscclosure        = function(f) return type(f) == "function" end
+fireclickdetector=function() end
+firetouchinterest=function() end
+fireproximityprompt=function() end
+setclipboard=function() end
+getclipboard=function() return "" end
 
-hookfunction = function(old, new) return old end
-newcclosure  = function(fn) return fn end
-hookmetamethod = function(obj, method, hook) return function() end end
-
-getrawmetatable = function(t) return getmetatable(t) end
-setrawmetatable = function(t, mt) return setmetatable(t, mt) end
-setreadonly     = function() end
-isreadonly      = function() return false end
-
-fireclickdetector   = function() end
-firetouchinterest   = function() end
-fireproximityprompt = function() end
-
-setclipboard = function() end
-getclipboard = function() return "" end
-
-readfile    = readfile    or function(path) return "" end
-writefile   = writefile   or function(path, data) end
-appendfile  = appendfile  or function(path, data) end
-isfile      = isfile      or function(path) return false end
-isfolder    = isfolder    or function(path) return false end
-listfiles   = listfiles   or function(path) return {} end
-makefolder  = makefolder  or function(path) end
-delfolder   = delfolder   or function(path) end
-delfile     = delfile     or function(path) end
+readfile=readfile or function() return "" end
+writefile=writefile or function() end
+appendfile=appendfile or function() end
+isfile=isfile or function() return false end
+isfolder=isfolder or function() return false end
+listfiles=listfiles or function() return {} end
+makefolder=makefolder or function() end
+delfolder=delfolder or function() end
+delfile=delfile or function() end
 
 )LUA";
 
-// ═══════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════
 
 void Environment::setup(LuaEngine& engine) {
     lua_State* L = engine.state();
@@ -1011,10 +831,13 @@ void Environment::setup(LuaEngine& engine) {
         return;
     }
 
-    // ── Register C functions that need real system access ────
-
+    // Register C functions that need real system access
     lua_pushcfunction(L, lua_http_get);
     lua_setglobal(L, "_oss_http_get");
+
+    // Also register as standalone global HttpGet
+    lua_pushcfunction(L, lua_http_get);
+    lua_setglobal(L, "HttpGet");
 
     lua_pushcfunction(L, lua_http_request);
     lua_setglobal(L, "_oss_http_request");
@@ -1033,15 +856,15 @@ void Environment::setup(LuaEngine& engine) {
     });
     lua_setglobal(L, "printidentity");
 
-    // ── Run the Lua mock setup ──────────────────────────────
+    // Run the Lua mock setup
     int status = luaL_dostring(L, ROBLOX_MOCK_LUA);
     if (status != 0) {
         const char* err = lua_tostring(L, -1);
-        LOG_ERROR("Failed to initialize Roblox mock environment: {}",
+        LOG_ERROR("Failed to init Roblox mock: {}",
                   err ? err : "unknown error");
         lua_pop(L, 1);
     } else {
-        LOG_INFO("Roblox API mock environment initialized successfully");
+        LOG_INFO("Roblox API mock environment initialized");
     }
 }
 
