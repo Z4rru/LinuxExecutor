@@ -9,10 +9,24 @@
 #include <optional>
 #include <atomic>
 
+// ═══════════════════════════════════════════════════════════════
+// FIX #4: Use <luajit-2.1/lua.h> consistently.
+//
+// BEFORE: #include <lua.h>
+//         → Works because CMake adds -isystem /usr/include/luajit-2.1
+//         → But if system also has plain Lua (/usr/include/lua.h),
+//           the WRONG header could be picked up depending on
+//           include order.
+//
+// environment.hpp already uses <luajit-2.1/lua.h>.
+// Match it here to prevent version mismatch errors like:
+//   "undefined reference to luaJIT_setmode" (only in LuaJIT)
+//   "LUA_GLOBALSINDEX not defined" (LuaJIT-only constant)
+// ═══════════════════════════════════════════════════════════════
 extern "C" {
-#include <lua.h>
-#include <lualib.h>
-#include <lauxlib.h>
+#include <luajit-2.1/lua.h>
+#include <luajit-2.1/lualib.h>
+#include <luajit-2.1/lauxlib.h>
 }
 
 #include "utils/logger.hpp"
@@ -62,28 +76,10 @@ public:
     void stop() { running_.store(false, std::memory_order_release); }
 
 private:
-    // ═══════════════════════════════════════════════════════
-    // ██  DEADLOCK FIX: Internal versions of execute() and  ██
-    // ██  shutdown() that do NOT acquire mutex_.             ██
-    // ██                                                     ██
-    // ██  init() holds mutex_ and calls:                     ██
-    // ██    → shutdown_internal()  (to reset if re-init)     ██
-    // ██    → execute_internal()   (for env_setup/sandbox)   ██
-    // ██                                                     ██
-    // ██  Public execute()/shutdown() acquire mutex_ then    ██
-    // ██  delegate to the _internal versions.                ██
-    // ═══════════════════════════════════════════════════════
     bool execute_internal(const std::string& script,
                           const std::string& chunk_name);
     void shutdown_internal();
 
-    // ═══════════════════════════════════════════════════════
-    // ██  PATH TRAVERSAL FIX: Validates that resolved path  ██
-    // ██  is strictly inside the sandbox directory.          ██
-    // ██                                                     ██
-    // ██  BEFORE: used string::find which matched            ██
-    // ██  /workspace2/ as being inside /workspace/           ██
-    // ═══════════════════════════════════════════════════════
     static bool is_sandboxed(const std::string& full_path,
                              const std::string& base_dir);
 
@@ -91,7 +87,6 @@ private:
     void register_custom_libs();
     void sandbox();
 
-    // Lua C callbacks
     static int lua_print(lua_State* L);
     static int lua_warn_handler(lua_State* L);
     static int lua_pcall_handler(lua_State* L);
