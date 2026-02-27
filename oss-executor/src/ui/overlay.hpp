@@ -2,11 +2,11 @@
 
 #include <gtk/gtk.h>
 #include <string>
-#include <vector>
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
 #include <functional>
+#include <vector>
 
 namespace oss {
 
@@ -48,11 +48,10 @@ struct DrawingObject {
 class Overlay {
 public:
     static Overlay& instance();
-
     Overlay(const Overlay&) = delete;
     Overlay& operator=(const Overlay&) = delete;
 
-    void init(GtkApplication* app);
+    void init();
     void shutdown();
     void show();
     void hide();
@@ -63,6 +62,7 @@ public:
     void remove_object(int id);
     void clear_objects();
     void request_redraw();
+    int object_count() const;
 
     template<typename F>
     void update_object(int id, F&& func) {
@@ -70,11 +70,9 @@ public:
         auto it = objects_.find(id);
         if (it != objects_.end()) {
             func(it->second);
-            dirty_ = true;
+            dirty_.store(true, std::memory_order_release);
         }
     }
-
-    int object_count() const;
 
 private:
     Overlay() = default;
