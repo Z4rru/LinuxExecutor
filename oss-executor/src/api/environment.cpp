@@ -8,7 +8,6 @@
 
 namespace oss {
 
-// ── typeof() ─────────────────────────────────────────────────
 static int lua_typeof(lua_State* L) {
     if (lua_getmetatable(L, 1)) {
         lua_getfield(L, -1, "__type");
@@ -22,14 +21,11 @@ static int lua_typeof(lua_State* L) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ★ THE FIX: game:HttpGet(url)
+// ★ FIX: game:HttpGet(url)
 //
-// game:HttpGet(url) desugars to game.HttpGet(game, url)
-//   stack[1] = game   (table)
-//   stack[2] = url    (string)
-//
-// Check lua_type FIRST (non-throwing), then checkstring
-// on the correct index.
+// game:HttpGet(url) → Lua passes (game_table, url_string)
+// Check lua_type(L,1) FIRST — non-throwing — then checkstring
+// on the correct stack index.
 // ═══════════════════════════════════════════════════════════════
 static int lua_http_get(lua_State* L) {
     int url_index = 1;
@@ -45,7 +41,6 @@ static int lua_http_get(lua_State* L) {
 
     const char* url = luaL_checkstring(L, url_index);
 
-    // ── URL validation ──
     if (!url || strlen(url) == 0) {
         return luaL_error(L, "HttpGet: URL cannot be empty");
     }
@@ -74,7 +69,6 @@ static int lua_http_get(lua_State* L) {
     return 1;
 }
 
-// ── http.request — syn.request compatible ────────────────────
 static int lua_http_request(lua_State* L) {
     luaL_checktype(L, 1, LUA_TTABLE);
 
@@ -94,27 +88,36 @@ static int lua_http_request(lua_State* L) {
     std::string method = luaL_optstring(L, -1, "GET");
     lua_pop(L, 1);
 
+    std::map<std::string, std::string> req_headers;
+    lua_getfield(L, 1, "Headers");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        while (lua_next(L, -2) != 0) {
+            if (lua_isstring(L, -2) && lua_isstring(L, -1)) {
+                req_headers[lua_tostring(L, -2)] = lua_tostring(L, -1);
+            }
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+
     HttpResponse resp;
     if (method == "POST") {
         lua_getfield(L, 1, "Body");
         std::string body = luaL_optstring(L, -1, "");
         lua_pop(L, 1);
-        resp = Http::instance().post(url, body);
+        resp = Http::instance().post(url, body, req_headers);
     } else {
-        resp = Http::instance().get(url);
+        resp = Http::instance().get(url, req_headers);
     }
 
     lua_newtable(L);
-
-    lua_pushinteger(L, resp.status_code);
+    lua_pushinteger(L, static_cast<lua_Integer>(resp.status_code));
     lua_setfield(L, -2, "StatusCode");
-
     lua_pushlstring(L, resp.body.data(), resp.body.size());
     lua_setfield(L, -2, "Body");
-
     lua_pushboolean(L, resp.success());
     lua_setfield(L, -2, "Success");
-
     lua_newtable(L);
     for (const auto& [k, v] : resp.headers) {
         lua_pushstring(L, v.c_str());
@@ -125,19 +128,14 @@ static int lua_http_request(lua_State* L) {
     return 1;
 }
 
-// ── identifyexecutor() ──────────────────────────────────────
 static int lua_identify_executor(lua_State* L) {
     lua_pushstring(L, "OSS Executor");
-    lua_pushstring(L, "1.0.0");
+    lua_pushstring(L, "2.0.0");
     return 2;
 }
 
-// ═════════════════════════════════════════════════════════════
-// The full Roblox mock Lua code
-// ═════════════════════════════════════════════════════════════
 static const char* ROBLOX_MOCK_LUA = R"LUA(
 
--- ── Signal ───────────────────────────────────────────────────
 local Signal = {}
 Signal.__index = Signal
 Signal.__type  = "RBXScriptSignal"
@@ -176,7 +174,6 @@ function Signal:Fire(...)
     end
 end
 
--- ── Vector3 ──────────────────────────────────────────────────
 local Vector3 = {}
 Vector3.__index = Vector3
 Vector3.__type  = "Vector3"
@@ -219,7 +216,6 @@ function Vector3.__tostring(v)
     return string.format("%.4f, %.4f, %.4f", v.X, v.Y, v.Z)
 end
 
--- ── Vector2 ──────────────────────────────────────────────────
 local Vector2 = {}
 Vector2.__index = Vector2
 Vector2.__type  = "Vector2"
@@ -246,7 +242,6 @@ function Vector2.__tostring(v)
     return string.format("%.4f, %.4f", v.X, v.Y)
 end
 
--- ── Color3 ───────────────────────────────────────────────────
 local Color3 = {}
 Color3.__index = Color3
 Color3.__type  = "Color3"
@@ -280,7 +275,6 @@ function Color3.__tostring(c)
     return string.format("%.4f, %.4f, %.4f", c.R, c.G, c.B)
 end
 
--- ── UDim / UDim2 ─────────────────────────────────────────────
 local UDim = {}
 UDim.__index = UDim
 UDim.__type  = "UDim"
@@ -306,7 +300,6 @@ function UDim2.__tostring(u)
         u.X.Scale, u.X.Offset, u.Y.Scale, u.Y.Offset)
 end
 
--- ── CFrame ───────────────────────────────────────────────────
 local CFrame = {}
 CFrame.__index = CFrame
 CFrame.__type  = "CFrame"
@@ -349,7 +342,6 @@ function CFrame.__tostring(cf)
     return string.format("%.4f, %.4f, %.4f, ...", cf.X, cf.Y, cf.Z)
 end
 
--- ── Instance mock ────────────────────────────────────────────
 local function make_instance(class_name, name, parent)
     local children = {}
     local properties = {}
@@ -424,7 +416,6 @@ local function make_instance(class_name, name, parent)
     return inst, children, properties
 end
 
--- ── Instance.new() ───────────────────────────────────────────
 local InstanceModule = {}
 function InstanceModule.new(class_name, parent)
     local inst,children,props = make_instance(class_name,class_name,parent)
@@ -459,7 +450,6 @@ function InstanceModule.new(class_name, parent)
     return inst
 end
 
--- ── Drawing library ──────────────────────────────────────────
 local DrawingMT = {}
 DrawingMT.__index = DrawingMT
 DrawingMT.__type  = "Drawing"
@@ -485,7 +475,6 @@ function Drawing.new(class_name)
     return setmetatable(obj, DrawingMT)
 end
 
--- ── Enum mock ────────────────────────────────────────────────
 local EnumMock = setmetatable({}, {
     __index = function(self, enum_type)
         local enum = setmetatable({}, {
@@ -501,7 +490,6 @@ local EnumMock = setmetatable({}, {
     __type = "Enums",
 })
 
--- ── Services ─────────────────────────────────────────────────
 local service_cache = {}
 
 local function get_camera()
@@ -628,10 +616,6 @@ local function make_service(name)
     return svc
 end
 
--- ═════════════════════════════════════════════════════════════
--- ★ game:HttpGet — returns _oss_http_get (the C function)
--- which handles the self parameter correctly
--- ═════════════════════════════════════════════════════════════
 local game_mt = {
     __type = "DataModel",
     __tostring = function() return "Game" end,
@@ -645,9 +629,6 @@ game_mt.__index = function(self, key)
         return function(_,sn) return make_service(sn) end
     end
 
-    -- ★ HttpGet returns the C function; when called as
-    --   game:HttpGet(url) → C sees (game_table, url_string)
-    --   and the C code checks lua_type(L,1) to skip self
     if key=="HttpGet" or key=="HttpGetAsync" then
         return _G._oss_http_get
     end
@@ -822,8 +803,6 @@ delfile=delfile or function() end
 
 )LUA";
 
-// ═════════════════════════════════════════════════════════════
-
 void Environment::setup(LuaEngine& engine) {
     lua_State* L = engine.state();
     if (!L) {
@@ -831,11 +810,9 @@ void Environment::setup(LuaEngine& engine) {
         return;
     }
 
-    // Register C functions that need real system access
     lua_pushcfunction(L, lua_http_get);
     lua_setglobal(L, "_oss_http_get");
 
-    // Also register as standalone global HttpGet
     lua_pushcfunction(L, lua_http_get);
     lua_setglobal(L, "HttpGet");
 
@@ -850,13 +827,12 @@ void Environment::setup(LuaEngine& engine) {
     lua_pushcfunction(L, lua_identify_executor);
     lua_setglobal(L, "getexecutorname");
 
-    lua_pushcfunction(L, [](lua_State* L) -> int {
-        lua_pushstring(L, "Current identity is 7");
+    lua_pushcfunction(L, [](lua_State* state) -> int {
+        lua_pushstring(state, "Current identity is 7");
         return 1;
     });
     lua_setglobal(L, "printidentity");
 
-    // Run the Lua mock setup
     int status = luaL_dostring(L, ROBLOX_MOCK_LUA);
     if (status != 0) {
         const char* err = lua_tostring(L, -1);
