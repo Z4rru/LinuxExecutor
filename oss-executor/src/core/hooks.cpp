@@ -22,13 +22,6 @@ HookManager::~HookManager() {
     remove_all();
 }
 
-struct HookManager::MemRegionInfo {
-    uintptr_t start;
-    uintptr_t end;
-    int prot;
-    std::string path;
-};
-
 std::vector<HookManager::MemRegionInfo> HookManager::parse_self_maps() {
     std::vector<MemRegionInfo> regions;
     std::ifstream maps("/proc/self/maps");
@@ -504,18 +497,23 @@ void HookManager::remove_all() {
 void HookManager::remove_all_remote(Memory& mem) {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    pid_t target_pid = mem.get_pid();
+
     for (auto& [name, hook] : remote_hooks_) {
-        if (hook.active && hook.pid == mem.get_pid() &&
+        if (hook.active && hook.pid == target_pid &&
             !hook.original_bytes.empty()) {
             mem.write_bytes(hook.target, hook.original_bytes);
         }
     }
 
-    std::erase_if(remote_hooks_, [&](const auto& pair) {
-        return pair.second.pid == mem.get_pid();
-    });
+    for (auto it = remote_hooks_.begin(); it != remote_hooks_.end(); ) {
+        if (it->second.pid == target_pid)
+            it = remote_hooks_.erase(it);
+        else
+            ++it;
+    }
 
-    LOG_INFO("All remote hooks for pid {} removed", mem.get_pid());
+    LOG_INFO("All remote hooks for pid {} removed", target_pid);
 }
 
 size_t HookManager::hook_count() const {
