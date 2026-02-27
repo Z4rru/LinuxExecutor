@@ -2,18 +2,6 @@
 #include "utils/http.hpp"
 #include "utils/crypto.hpp"
 #include "utils/config.hpp"
-
-// ═══════════════════════════════════════════════════════════════
-// ★ FIX: Include environment.hpp so we can call Environment::setup()
-//
-// BEFORE: This header was never included. Environment::setup() was
-//         never called. The comprehensive Roblox mock (game:GetService,
-//         workspace, Drawing, Vector3, etc.) was DEAD CODE.
-//
-//         Scripts doing loadstring(game:HttpGet(...))() would fail
-//         because game was a minimal table {HttpGet = ...} with no
-//         GetService, no GetPlayers, no workspace, no Drawing, etc.
-// ═══════════════════════════════════════════════════════════════
 #include "api/environment.hpp"
 
 #include <filesystem>
@@ -47,24 +35,7 @@ bool LuaEngine::init() {
     luaL_openlibs(L_);
     setup_environment();
     register_custom_libs();
-
-    // ═══════════════════════════════════════════════════════
-    // ★ FIX: Load the comprehensive Roblox API mock.
-    //
-    // This creates: game (with GetService, HttpGet, etc.),
-    // workspace, Instance.new(), Drawing.new(), Vector3,
-    // CFrame, Color3, UDim2, Enum, task, Signal, typeof,
-    // and all executor globals (syn, hookfunction, etc.).
-    //
-    // Called AFTER register_custom_libs() so http library
-    // is available as fallback, and BEFORE sandbox() so the
-    // mock globals aren't accidentally removed.
-    //
-    // The mock's game:HttpGet() uses _oss_http_get (C function)
-    // which correctly handles the self parameter now.
-    // ═══════════════════════════════════════════════════════
     Environment::setup(*this);
-
     sandbox();
 
     running_ = true;
@@ -260,7 +231,6 @@ void LuaEngine::setup_environment() {
 }
 
 void LuaEngine::register_custom_libs() {
-    // File system functions
     register_function("readfile", lua_readfile);
     register_function("writefile", lua_writefile);
     register_function("appendfile", lua_appendfile);
@@ -269,7 +239,6 @@ void LuaEngine::register_custom_libs() {
     register_function("delfolder", lua_delfolder);
     register_function("makefolder", lua_makefolder);
 
-    // HTTP functions
     static const luaL_Reg http_lib[] = {
         {"get", lua_http_get},
         {"post", lua_http_post},
@@ -282,7 +251,6 @@ void LuaEngine::register_custom_libs() {
     lua_setglobal(L_, "http_get");
     lua_pop(L_, 1);
 
-    // Utility functions
     register_function("wait", lua_wait);
     register_function("spawn", lua_spawn);
     register_function("getclipboard", lua_getclipboard);
@@ -291,7 +259,6 @@ void LuaEngine::register_custom_libs() {
     register_function("getexecutorname", lua_getexecutorname);
     register_function("gethwid", lua_get_hwid);
 
-    // Console functions
     static const luaL_Reg console_lib[] = {
         {"print", lua_rconsole_print},
         {"clear", lua_rconsole_clear},
@@ -299,7 +266,6 @@ void LuaEngine::register_custom_libs() {
     };
     register_library("rconsole", console_lib);
 
-    // Crypto functions
     static const luaL_Reg crypt_lib[] = {
         {"base64encode", lua_base64_encode},
         {"base64decode", lua_base64_decode},
@@ -308,24 +274,11 @@ void LuaEngine::register_custom_libs() {
     };
     register_library("crypt", crypt_lib);
 
-    // Executor identity globals
     set_global_string("_EXECUTOR", "OSS Executor");
     set_global_string("_EXECUTOR_VERSION", "2.0.0");
     set_global_number("_EXECUTOR_LEVEL", 8);
     set_global_bool("_OSS", true);
 
-    // ═══════════════════════════════════════════════════════
-    // ★ FIX: game table is now a FALLBACK only.
-    //
-    // Environment::setup() (called after this in init())
-    // will overwrite `game` with the comprehensive mock
-    // that has GetService, GetPlayers, workspace, etc.
-    //
-    // This fallback only survives if Environment::setup()
-    // fails for some reason. Using `game = game or {...}`
-    // so it also won't clobber an existing mock if call
-    // order ever changes.
-    // ═══════════════════════════════════════════════════════
     execute_internal(R"(
         task = task or {}
         task.wait = task.wait or wait
@@ -343,8 +296,6 @@ void LuaEngine::register_custom_libs() {
         request = request or syn.request
         http_request = http_request or syn.request
 
-        -- Fallback game table — Environment::setup() overrides this
-        -- with the full mock (GetService, workspace, Drawing, etc.)
         game = game or {HttpGet = function(_, url) return http.get(url).Body end}
     )", "=env_setup");
 }
@@ -363,8 +314,6 @@ void LuaEngine::sandbox() {
         dofile = nil
     )", "=sandbox");
 }
-
-// ── Static Lua callbacks ──────────────────────────────────
 
 int LuaEngine::lua_print(lua_State* L) {
     int nargs = lua_gettop(L);
@@ -476,7 +425,8 @@ int LuaEngine::lua_wait(lua_State* L) {
     auto ms = std::chrono::milliseconds(static_cast<int>(seconds * 1000));
     std::this_thread::sleep_for(ms);
     lua_pushnumber(L, seconds);
-    return 1;
+    lua_pushnumber(L, seconds);
+    return 2;
 }
 
 int LuaEngine::lua_spawn(lua_State* L) {
