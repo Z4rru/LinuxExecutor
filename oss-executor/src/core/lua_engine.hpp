@@ -61,6 +61,7 @@ struct DrawingObject {
     float pa_x = 0, pa_y = 0;
     float pb_x = 0, pb_y = 0;
     float pc_x = 0, pc_y = 0;
+    float pd_x = 0, pd_y = 0;
 };
 
 struct ScheduledTask {
