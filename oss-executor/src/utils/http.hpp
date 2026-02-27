@@ -97,13 +97,18 @@ private:
         curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "OSSExecutor/2.0");
 
-        struct curl_slist* header_list = nullptr;
+        // RAII wrapper — auto-cleans even if an exception is thrown
+        struct SlistDeleter {
+            void operator()(curl_slist* p) { if (p) curl_slist_free_all(p); }
+        };
+        std::unique_ptr<curl_slist, SlistDeleter> header_list;
         for (const auto& [key, val] : headers) {
-            header_list = curl_slist_append(header_list,
-                (key + ": " + val).c_str());
+            header_list.reset(
+                curl_slist_append(header_list.release(),
+                    (key + ": " + val).c_str()));
         }
         if (header_list) {
-            curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list);
+            curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
         }
 
         if (method == "POST") {
@@ -121,7 +126,7 @@ private:
                               &response.status_code);
         }
 
-        if (header_list) curl_slist_free_all(header_list);
+        // header_list auto-freed here by unique_ptr destructor
 
         return response;
     }
