@@ -75,6 +75,7 @@ private:
 
     void set_status(InjectionStatus s, const std::string& msg);
     bool process_alive() const;
+    bool write_to_process(uintptr_t addr, const void* data, size_t len);
 
     bool scan_direct();
     bool scan_wine_cmdline();
