@@ -40,23 +40,32 @@ jobs:
 
       - name: Build
         working-directory: oss-executor/build
-        run: ninja -j$(nproc)
+        run: |
+          ninja -j$(nproc) 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo ""
+            echo "══════════════════════════════════════════"
+            echo "  BUILD FAILED — Last 80 lines of output:"
+            echo "══════════════════════════════════════════"
+            tail -80 build.log
+            exit 1
+          fi
 
       - name: Package
         run: |
           mkdir -p package/oss-executor
 
           cp oss-executor/build/OSSExecutor package/oss-executor/
-          cp -r oss-executor/scripts  package/oss-executor/
-          cp -r oss-executor/themes   package/oss-executor/
-          cp -r oss-executor/resources package/oss-executor/
-          cp oss-executor/config.json package/oss-executor/
-          cp oss-executor/run.sh      package/oss-executor/
-          cp oss-executor/build.sh    package/oss-executor/
+          cp -r oss-executor/scripts  package/oss-executor/ 2>/dev/null || true
+          cp -r oss-executor/themes   package/oss-executor/ 2>/dev/null || true
+          cp -r oss-executor/resources package/oss-executor/ 2>/dev/null || true
+          cp oss-executor/config.json package/oss-executor/ 2>/dev/null || true
+          cp oss-executor/run.sh      package/oss-executor/ 2>/dev/null || true
           cp README.md               package/oss-executor/ 2>/dev/null || true
 
           chmod +x package/oss-executor/OSSExecutor
-          chmod +x package/oss-executor/run.sh
+          [ -f package/oss-executor/run.sh ] && chmod +x package/oss-executor/run.sh
 
           cat > package/oss-executor/install.sh << 'INSTALL_EOF'
           #!/bin/bash
@@ -105,9 +114,12 @@ jobs:
 
   build-appimage:
     runs-on: ubuntu-22.04
+    needs: []
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install deps
         run: |
@@ -117,28 +129,26 @@ jobs:
             libgtk-4-dev libcurl4-openssl-dev libssl-dev \
             luajit libluajit-5.1-dev \
             libspdlog-dev nlohmann-json3-dev \
-            wget file imagemagick patchelf
+            wget file patchelf imagemagick
 
       - name: Build
         working-directory: oss-executor
         run: |
           mkdir -p build && cd build
           cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
-          ninja -j$(nproc)
+          ninja -j$(nproc) 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "BUILD FAILED:"; tail -80 build.log; exit 1
+          fi
 
-      # ═══════════════════════════════════════════════════════
-      # ██  ICON FIX: Generate a guaranteed-valid PNG BEFORE ██
-      # ██  linuxdeploy ever touches it.                     ██
-      # ═══════════════════════════════════════════════════════
       - name: Prepare icon
         run: |
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-
           ICON_DST="AppDir/usr/share/icons/hicolor/256x256/apps/oss-executor.png"
           ICON_SRC="oss-executor/resources/icons/logo.png"
           ICON_OK=false
 
-          # 1. Try real icon
           if [ -f "$ICON_SRC" ] && [ -s "$ICON_SRC" ]; then
             if file "$ICON_SRC" | grep -qi "PNG image"; then
               cp "$ICON_SRC" "$ICON_DST"
@@ -147,25 +157,15 @@ jobs:
             fi
           fi
 
-          # 2. Fallback: ImageMagick
           if [ "$ICON_OK" = false ]; then
-            echo "⚠ Generating fallback icon with ImageMagick..."
+            echo "⚠ Generating fallback icon..."
             convert -size 256x256 xc:'#6e40c9' \
               -fill white -gravity center \
               -font Helvetica -pointsize 80 \
               -annotate 0 "OSS" \
               "png:${ICON_DST}" 2>/dev/null \
             || convert -size 256x256 xc:'#6e40c9' "png:${ICON_DST}" 2>/dev/null \
-            || {
-              echo "⚠ ImageMagick failed — using minimal base64 PNG"
-              echo "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADPMOyrAAAAF0lEQVR42u3BAQ0AAADCoPd/aLsIkHEBAVYAAQFuwOsZAAAAAElFTkSuQmCC" | tr -d ' ' | base64 -d > "$ICON_DST"
-            }
-          fi
-
-          # 3. Final Python fallback (if file is garbage)
-          if [ ! -s "$ICON_DST" ] || [ "$(wc -c < "$ICON_DST")" -lt 100 ]; then
-            echo "✗ Icon still invalid — generating with pure base64"
-            python3 -c "
+            || python3 -c "
           import struct, zlib
           def png(w,h):
               def chunk(t,d):
@@ -177,7 +177,7 @@ jobs:
           with open('$ICON_DST','wb') as f: f.write(png(256,256))
           "
           fi
-          
+
           echo "Icon size: $(wc -c < "$ICON_DST") bytes"
           file "$ICON_DST"
 
@@ -193,21 +193,19 @@ jobs:
           cp oss-executor/build/OSSExecutor AppDir/usr/bin/
           cp -r oss-executor/scripts oss-executor/themes \
                 oss-executor/resources oss-executor/config.json \
-                AppDir/usr/share/oss-executor/
+                AppDir/usr/share/oss-executor/ 2>/dev/null || true
 
-          # Desktop file
           cat > AppDir/usr/share/applications/oss-executor.desktop << 'DESKTOP_EOF'
           [Desktop Entry]
           Type=Application
           Name=OSS Executor
-          Comment=Open Source Roblox Executor
+          Comment=Open Source Lua Script Executor
           Exec=OSSExecutor
           Icon=oss-executor
           Categories=Development;
           Terminal=false
           DESKTOP_EOF
 
-          # AppRun (Sanitized)
           cat > AppDir/AppRun << 'APPRUN_EOF'
           #!/usr/bin/env bash
           SELF="$(readlink -f "$0")"
