@@ -103,7 +103,6 @@ set(SOURCES
     src/ui/theme.cpp
     src/utils/config.cpp
     src/utils/crypto.cpp
-    src/utils/http.cpp
     src/utils/logger.cpp
 )
 
@@ -156,3 +155,4 @@ install(TARGETS ${PROJECT_NAME} DESTINATION bin)
 install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
+
