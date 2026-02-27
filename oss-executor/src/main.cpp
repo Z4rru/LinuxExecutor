@@ -9,6 +9,9 @@ static void fix_gio_before_anything() {
     setenv("GSK_RENDERER", "gl", 0);
     setenv("GTK_IM_MODULE", "", 1);
     setenv("LIBGL_DRI3_DISABLE", "1", 0);
+    setenv("EGL_LOG_LEVEL", "fatal", 0);
+    setenv("GTK_A11Y", "none", 0);
+    setenv("NO_AT_BRIDGE", "1", 0);
 }
 
 #include "ui/app.hpp"
