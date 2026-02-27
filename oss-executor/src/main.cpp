@@ -1,6 +1,3 @@
-// ══════════════════════════════════════════════════════════════
-// GIO/GVFS FIX — Must execute before ANY GLib/GTK header loads
-// ══════════════════════════════════════════════════════════════
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
@@ -10,16 +7,9 @@ static void fix_gio_before_anything() {
     setenv("GIO_MODULE_DIR", "", 1);
     setenv("GIO_USE_VFS", "local", 1);
     setenv("GSK_RENDERER", "gl", 0);
-
-    // ★ FIX: Suppress IBus input method module
-    // libibus-1.0.so links against newer GLib → "undefined symbol: g_task_set_static_name"
-    // Setting GTK_IM_MODULE to empty or "none" prevents GTK from loading it
     setenv("GTK_IM_MODULE", "", 1);
-
-    // Suppress "Could not get DRI3 device" warning (cosmetic, not a real problem)
     setenv("LIBGL_DRI3_DISABLE", "1", 0);
 }
-// ══════════════════════════════════════════════════════════════
 
 #include "ui/app.hpp"
 #include "core/executor.hpp"
@@ -28,23 +18,14 @@ static void fix_gio_before_anything() {
 #include <csignal>
 #include <iostream>
 
-// ★ FIX: Don't call shutdown() inside a signal handler.
-//   shutdown() uses mutexes/memory-allocation which can deadlock.
-//   Just set a flag and exit immediately.
-static volatile sig_atomic_t g_shutdown_requested = 0;
-
-static void signal_handler(int sig) {
-    g_shutdown_requested = 1;
+static void signal_handler(int) {
     const char* msg = "\n[!] Signal received, shutting down...\n";
-    // write() is async-signal-safe, unlike printf/cout/spdlog
     ssize_t unused = write(STDERR_FILENO, msg, strlen(msg));
-    (void)unused;  // suppress unused-result warning
-    _exit(0);      // _exit (not exit) is safe in signal handlers
+    (void)unused;
+    _exit(0);
 }
 
 int main(int argc, char** argv) {
-    fix_gio_before_anything();
-
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
@@ -66,4 +47,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-
