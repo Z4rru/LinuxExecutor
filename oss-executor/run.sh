@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+cd "$SCRIPT_DIR"
+
 export OSS_HOME="${HOME}/.oss-executor"
 
-# ── GIO/GVFS isolation ──────────────────────────────────────
-# Prevent loading system GIO modules compiled against a different
-# GLib version. Fixes "undefined symbol: g_task_set_static_name"
 export GIO_MODULE_DIR=""
 export GIO_USE_VFS="local"
 
-# ── Renderer fix for Linux Mint / Cinnamon ──────────────────
 export GSK_RENDERER="${GSK_RENDERER:-gl}"
 
-# ── GTK debug noise suppression ─────────────────────────────
-export GTK_A11Y=none          # Suppress accessibility bus warnings
-export NO_AT_BRIDGE=1         # Suppress AT-SPI bridge warnings
+export GTK_A11Y=none
+export NO_AT_BRIDGE=1
+
+export LIBGL_DRI3_DISABLE=1
+export EGL_LOG_LEVEL=fatal
 
 if [ ! -f build/OSSExecutor ]; then
     echo "[!] Not built yet. Running build..."
