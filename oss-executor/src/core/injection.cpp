@@ -10,7 +10,7 @@
 
 namespace oss {
 
-// ── helpers (unchanged) ─────────────────────────────────────────
+// ── helpers ─────────────────────────────────────────────────────
 
 static std::string read_proc_cmdline(pid_t pid) {
     try {
@@ -59,7 +59,7 @@ static std::vector<pid_t> get_descendant_pids(pid_t parent) {
     return result;
 }
 
-// ── scan_for_roblox (unchanged — all 5 phases) ─────────────────
+// ── scan_for_roblox ─────────────────────────────────────────────
 
 bool Injection::scan_for_roblox() {
     set_status(InjectionStatus::Scanning, "Scanning for Roblox...");
@@ -185,26 +185,34 @@ bool Injection::detach() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FIX #5 + #7: inject()
+// ★ FIX: inject() — improved Luau VM detection
 //
-// Bug #5: Scanned for LuaJIT bytecode header 0x1B 0x4C 0x4A ("ESC LJ").
-//         Roblox uses LUAU, not LuaJIT.  The pattern NEVER matches.
+// BEFORE (3 problems):
 //
-//         Luau bytecode starts with a version byte (currently 3–6)
-//         followed by a string count varint.  But single-byte
-//         patterns produce massive false positives.
+//   1. Scan cap was 4MB per region (0x400000).
+//      Roblox binary regions can be 50-200MB.
+//      Markers beyond 4MB offset → never found.
 //
-//         PRACTICAL FIX: Instead of scanning for bytecode headers,
-//         scan for Roblox-specific STRINGS that appear in the data
-//         sections of any live Roblox process.  Finding "CoreGui"
-//         or "rbxasset://" in readable memory confirms we're
-//         attached to the right process AND that the Luau VM has
-//         initialized (these strings are interned by the VM).
+//   2. Region filter skipped ALL file-backed regions
+//      unless path contained "Roblox"/"roblox".
+//      On Wine/Sober, Luau strings can be in heap or
+//      in Wine PE loader regions (ntdll, kernelbase)
+//      that don't have "Roblox" in the path.
 //
-// Bug #7: inject() always returned true even when no VM was found.
-//         Now it sets mode_ to LocalOnly vs Full and returns true
-//         (attached) but the caller can check vm_found() to know
-//         if real injection is possible.
+//   3. Only 4 marker strings. Some are short ("CoreGui"
+//      is 7 bytes) which could false-positive in non-
+//      Roblox processes, but the real issue is that
+//      they might all be in skipped regions.
+//
+// AFTER:
+//   - Scan cap raised to 32MB per region
+//   - Region filter now includes:
+//     • All anonymous regions (heap, anonymous mmap)
+//     • All regions with Roblox/roblox/Sober/sober in path
+//     • All regions with Wine PE extensions (.exe, .dll)
+//     • [heap], [stack] etc. (don't start with /)
+//   - Added more marker strings
+//   - Better logging for diagnosis
 // ═══════════════════════════════════════════════════════════════
 bool Injection::inject() {
     if (!attach()) return false;
@@ -212,38 +220,80 @@ bool Injection::inject() {
     auto regions = memory_.get_regions();
     vm_marker_addr_ = 0;
 
-    // Scan for Luau VM markers — strings that only exist in a
-    // running Roblox process with an initialized Luau state
+    // Strings that only exist in a running Roblox process
+    // with an initialized Luau state
     static const std::vector<std::string> luau_markers = {
-        "CoreGui",          // Roblox service — always present
-        "rbxasset://",      // Roblox asset protocol
-        "LocalScript",      // Instance class name interned by VM
-        "ModuleScript",     // Another interned class name
+        "CoreGui",
+        "rbxasset://",
+        "LocalScript",
+        "ModuleScript",
+        "RenderStepped",           // RunService signal
+        "GetService",              // DataModel method name
+        "HumanoidRootPart",        // common part name
+        "PlayerAdded",             // Players signal
     };
 
-    for (const auto& region : regions) {
-        if (!region.readable()) continue;
-        if (region.size() < 0x1000 || region.size() > 0x10000000) continue;
+    // ── Helper: should we scan this region? ──────────────
+    auto should_scan_region = [](const MemoryRegion& region) -> bool {
+        if (!region.readable()) return false;
 
-        // Skip non-data regions (shared libs, vdso, etc.)
-        if (!region.path.empty() &&
-            region.path.find("Roblox") == std::string::npos &&
-            region.path.find("roblox") == std::string::npos &&
-            region.path[0] == '/') continue;
+        // Skip tiny or impossibly huge regions
+        if (region.size() < 0x1000) return false;
+        if (region.size() > 0x40000000) return false;  // >1GB, skip
+
+        // Always scan anonymous regions (empty path) — heap, mmap
+        if (region.path.empty()) return true;
+
+        // Always scan special pseudo-paths: [heap], [stack], [anon:...]
+        if (!region.path.empty() && region.path[0] == '[') return true;
+
+        // Scan regions whose path contains Roblox-related strings
+        static const std::vector<std::string> path_keywords = {
+            "Roblox", "roblox", "ROBLOX",
+            "Sober", "sober", "vinegar",
+            ".exe", ".dll",             // Wine PE files
+        };
+        for (const auto& kw : path_keywords) {
+            if (region.path.find(kw) != std::string::npos)
+                return true;
+        }
+
+        // Skip other file-backed regions (libc, libm, vdso, etc.)
+        // to avoid false positives and reduce scan time
+        if (region.path[0] == '/') return false;
+
+        // Anything else (shouldn't happen) — scan it
+        return true;
+    };
+
+    size_t regions_scanned = 0;
+    size_t bytes_scanned = 0;
+
+    for (const auto& region : regions) {
+        if (!should_scan_region(region)) continue;
+
+        regions_scanned++;
 
         for (const auto& marker : luau_markers) {
             std::vector<uint8_t> pattern(marker.begin(), marker.end());
             std::string mask(pattern.size(), 'x');
 
+            // ★ FIX: Raised from 4MB to 32MB — Roblox regions
+            // can be very large, markers may be far into them
             size_t scan_len = std::min(region.size(),
-                                        static_cast<size_t>(0x400000));
+                                        static_cast<size_t>(0x2000000));
+            bytes_scanned += scan_len;
 
             auto result = memory_.pattern_scan(pattern, mask,
                                                 region.start, scan_len);
             if (result.has_value()) {
                 vm_marker_addr_ = result.value();
-                LOG_INFO("Found Luau marker '{}' at 0x{:X} in '{}'",
-                         marker, vm_marker_addr_, region.path);
+                LOG_INFO("Found Luau marker '{}' at 0x{:X} in '{}' "
+                         "(scanned {} regions, {:.1f}MB total)",
+                         marker, vm_marker_addr_,
+                         region.path.empty() ? "[anonymous]" : region.path,
+                         regions_scanned,
+                         bytes_scanned / (1024.0 * 1024.0));
                 goto found;
             }
         }
@@ -259,12 +309,20 @@ found:
     } else {
         mode_ = InjectionMode::LocalOnly;
         set_status(InjectionStatus::Injected,
-                   "Attached — local execution mode (no Luau VM found)");
-        LOG_WARN("No Luau VM markers found — local execution mode. "
-                 "Scripts will run in sandbox with mock Roblox APIs.");
+                   "Attached — local execution mode "
+                   "(Luau VM not located, scripts run in sandbox)");
+        LOG_WARN("No Luau VM markers found in {} regions ({:.1f}MB scanned). "
+                 "Possible causes:\n"
+                 "  • Roblox hasn't fully loaded yet (try again in a few seconds)\n"
+                 "  • /proc/{}/mem is not readable (check ptrace_scope)\n"
+                 "  • Process is a launcher, not the game client\n"
+                 "Scripts will run in sandbox with mock Roblox APIs.",
+                 regions_scanned,
+                 bytes_scanned / (1024.0 * 1024.0),
+                 memory_.get_pid());
     }
 
-    return true;   // we DID attach; caller checks vm_found() for details
+    return true;
 }
 
 void Injection::start_auto_scan() {
