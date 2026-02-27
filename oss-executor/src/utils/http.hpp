@@ -24,7 +24,7 @@ public:
         return inst;
     }
 
-    HttpResponse get(const std::string& url, 
+    HttpResponse get(const std::string& url,
                      const std::map<std::string, std::string>& headers = {}) {
         return request("GET", url, "", headers);
     }
@@ -35,14 +35,14 @@ public:
     }
 
     std::future<HttpResponse> get_async(const std::string& url,
-                                         const std::map<std::string, std::string>& headers = {}) {
+                                        const std::map<std::string, std::string>& headers = {}) {
         return std::async(std::launch::async, [this, url, headers]() {
             return get(url, headers);
         });
     }
 
     std::future<HttpResponse> post_async(const std::string& url, const std::string& body,
-                                          const std::map<std::string, std::string>& headers = {}) {
+                                         const std::map<std::string, std::string>& headers = {}) {
         return std::async(std::launch::async, [this, url, body, headers]() {
             return post(url, body, headers);
         });
@@ -51,6 +51,8 @@ public:
 private:
     Http() { curl_global_init(CURL_GLOBAL_ALL); }
     ~Http() { curl_global_cleanup(); }
+    Http(const Http&) = delete;
+    Http& operator=(const Http&) = delete;
 
     static size_t write_callback(char* data, size_t size, size_t nmemb, void* userp) {
         auto* response = static_cast<std::string*>(userp);
@@ -64,7 +66,7 @@ private:
         auto colon = line.find(':');
         if (colon != std::string::npos) {
             std::string key = line.substr(0, colon);
-            std::string val = line.substr(colon + 2);
+            std::string val = (colon + 2 < line.size()) ? line.substr(colon + 2) : "";
             while (!val.empty() && (val.back() == '\r' || val.back() == '\n'))
                 val.pop_back();
             (*headers)[key] = val;
@@ -76,11 +78,10 @@ private:
                          const std::string& body,
                          const std::map<std::string, std::string>& headers) {
         HttpResponse response;
-        
+
         auto curl = std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>(
-            curl_easy_init(), curl_easy_cleanup
-        );
-        
+            curl_easy_init(), curl_easy_cleanup);
+
         if (!curl) {
             response.error = "Failed to init CURL";
             return response;
@@ -98,7 +99,7 @@ private:
 
         struct curl_slist* header_list = nullptr;
         for (const auto& [key, val] : headers) {
-            header_list = curl_slist_append(header_list, 
+            header_list = curl_slist_append(header_list,
                 (key + ": " + val).c_str());
         }
         if (header_list) {
@@ -107,19 +108,21 @@ private:
 
         if (method == "POST") {
             curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, body.c_str());
-            curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE, body.size());
+            curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE,
+                             static_cast<long>(body.size()));
         }
 
         CURLcode res = curl_easy_perform(curl.get());
-        
+
         if (res != CURLE_OK) {
             response.error = curl_easy_strerror(res);
         } else {
-            curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response.status_code);
+            curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE,
+                              &response.status_code);
         }
 
         if (header_list) curl_slist_free_all(header_list);
-        
+
         return response;
     }
 };
