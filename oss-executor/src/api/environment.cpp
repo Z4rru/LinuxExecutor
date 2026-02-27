@@ -3,6 +3,7 @@
 #include "../utils/http.hpp"
 #include "../utils/logger.hpp"
 #include "../ui/overlay.hpp"
+#include "closures.hpp"
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -158,6 +159,447 @@ static int lua_drawing_remove_bridge(lua_State* L) {
     int id = static_cast<int>(luaL_checkinteger(L, 1));
     Overlay::instance().remove_object(id);
     return 0;
+}
+
+static int lua_debug_getinfo(lua_State* L) {
+    int level = 0;
+    lua_Debug ar;
+    memset(&ar, 0, sizeof(ar));
+
+    if (lua_isnumber(L, 1)) {
+        level = static_cast<int>(lua_tointeger(L, 1));
+        if (!lua_getstack(L, level, &ar)) {
+            lua_pushnil(L);
+            return 1;
+        }
+        lua_getinfo(L, "nSlu", &ar);
+    } else if (lua_isfunction(L, 1)) {
+        lua_pushvalue(L, 1);
+        lua_getinfo(L, ">nSlu", &ar);
+    } else {
+        return luaL_error(L, "debug.getinfo: expected number or function");
+    }
+
+    lua_newtable(L);
+
+    if (ar.source) {
+        lua_pushstring(L, ar.source);
+        lua_setfield(L, -2, "source");
+        lua_pushstring(L, ar.source);
+        lua_setfield(L, -2, "short_src");
+    }
+
+    if (ar.name) {
+        lua_pushstring(L, ar.name);
+        lua_setfield(L, -2, "name");
+    }
+
+    if (ar.what) {
+        lua_pushstring(L, ar.what);
+        lua_setfield(L, -2, "what");
+    }
+
+    lua_pushinteger(L, ar.currentline);
+    lua_setfield(L, -2, "currentline");
+
+    lua_pushinteger(L, ar.linedefined);
+    lua_setfield(L, -2, "linedefined");
+
+    lua_pushinteger(L, ar.lastlinedefined);
+    lua_setfield(L, -2, "lastlinedefined");
+
+    lua_pushinteger(L, ar.nups);
+    lua_setfield(L, -2, "nups");
+
+    const char* filter = lua_isstring(L, 2) ? lua_tostring(L, 2) : nullptr;
+    if (filter) {
+        lua_pushstring(L, filter);
+        lua_setfield(L, -2, "filter");
+    }
+
+    return 1;
+}
+
+static int lua_debug_getupvalue(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    int idx = static_cast<int>(luaL_checkinteger(L, 2));
+    const char* name = lua_getupvalue(L, 1, idx);
+    if (name) {
+        lua_pushstring(L, name);
+        lua_insert(L, -2);
+        return 2;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+static int lua_debug_setupvalue(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    int idx = static_cast<int>(luaL_checkinteger(L, 2));
+    luaL_checkany(L, 3);
+    lua_pushvalue(L, 3);
+    const char* name = lua_setupvalue(L, 1, idx);
+    if (name) {
+        lua_pushstring(L, name);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+static int lua_debug_getupvalues(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    lua_newtable(L);
+    int idx = 1;
+    while (true) {
+        const char* name = lua_getupvalue(L, 1, idx);
+        if (!name) break;
+        lua_rawseti(L, -2, idx);
+        ++idx;
+    }
+    return 1;
+}
+
+static int lua_debug_setupvalues(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    int idx = 1;
+    lua_pushnil(L);
+    while (lua_next(L, 2)) {
+        lua_pushvalue(L, -1);
+        lua_setupvalue(L, 1, idx);
+        lua_pop(L, 1);
+        ++idx;
+    }
+    return 0;
+}
+
+static int lua_debug_getconstant(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    luaL_checkinteger(L, 2);
+    lua_pushnil(L);
+    return 1;
+}
+
+static int lua_debug_getconstants(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    lua_newtable(L);
+    return 1;
+}
+
+static int lua_debug_setconstant(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    luaL_checkinteger(L, 2);
+    luaL_checkany(L, 3);
+    return 0;
+}
+
+static int lua_debug_getproto(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    luaL_checkinteger(L, 2);
+    lua_pushnil(L);
+    return 1;
+}
+
+static int lua_debug_getprotos(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    lua_newtable(L);
+    return 1;
+}
+
+static int lua_debug_getstack(lua_State* L) {
+    int level = static_cast<int>(luaL_checkinteger(L, 1));
+    int idx = static_cast<int>(luaL_optinteger(L, 2, 0));
+
+    lua_Debug ar;
+    if (!lua_getstack(L, level, &ar)) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    if (idx > 0) {
+        const char* name = lua_getlocal(L, &ar, idx);
+        if (name) return 1;
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_newtable(L);
+    int i = 1;
+    while (true) {
+        const char* name = lua_getlocal(L, &ar, i);
+        if (!name) break;
+        lua_setfield(L, -2, name);
+        ++i;
+    }
+    return 1;
+}
+
+static int lua_debug_setstack(lua_State* L) {
+    int level = static_cast<int>(luaL_checkinteger(L, 1));
+    int idx = static_cast<int>(luaL_checkinteger(L, 2));
+    luaL_checkany(L, 3);
+
+    lua_Debug ar;
+    if (!lua_getstack(L, level, &ar)) return 0;
+
+    lua_pushvalue(L, 3);
+    lua_setlocal(L, &ar, idx);
+    return 0;
+}
+
+static int lua_debug_getmetatable(lua_State* L) {
+    luaL_checkany(L, 1);
+    if (!lua_getmetatable(L, 1))
+        lua_pushnil(L);
+    return 1;
+}
+
+static int lua_debug_setmetatable(lua_State* L) {
+    luaL_checkany(L, 1);
+    if (lua_isnoneornil(L, 2))
+        lua_pushnil(L);
+    else
+        luaL_checktype(L, 2, LUA_TTABLE);
+    lua_setmetatable(L, 1);
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+static int lua_debug_getregistry(lua_State* L) {
+    lua_pushvalue(L, LUA_REGISTRYINDEX);
+    return 1;
+}
+
+static int lua_debug_traceback(lua_State* L) {
+    const char* msg = luaL_optstring(L, 1, "");
+    int level = static_cast<int>(luaL_optinteger(L, 2, 1));
+    luaL_traceback(L, L, msg, level);
+    return 1;
+}
+
+static int lua_debug_profilebegin(lua_State* L) {
+    (void)luaL_checkstring(L, 1);
+    return 0;
+}
+
+static int lua_debug_profileend(lua_State*) {
+    return 0;
+}
+
+static int lua_cache_invalidate(lua_State* L) {
+    luaL_checkany(L, 1);
+    return 0;
+}
+
+static int lua_cache_iscached(lua_State* L) {
+    luaL_checkany(L, 1);
+    lua_pushboolean(L, 0);
+    return 1;
+}
+
+static int lua_cache_replace(lua_State* L) {
+    luaL_checkany(L, 1);
+    luaL_checkany(L, 2);
+    return 0;
+}
+
+static int lua_getrawmetatable(lua_State* L) {
+    luaL_checkany(L, 1);
+    if (!lua_getmetatable(L, 1))
+        lua_pushnil(L);
+    return 1;
+}
+
+static int lua_setrawmetatable(lua_State* L) {
+    luaL_checkany(L, 1);
+    if (lua_isnoneornil(L, 2))
+        lua_pushnil(L);
+    else
+        luaL_checktype(L, 2, LUA_TTABLE);
+    lua_setmetatable(L, 1);
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+static int lua_setreadonly(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    bool readonly = lua_toboolean(L, 2);
+
+    lua_getfield(L, LUA_REGISTRYINDEX, "__readonly_tables");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, "__readonly_tables");
+    }
+
+    lua_pushvalue(L, 1);
+    if (readonly)
+        lua_pushboolean(L, 1);
+    else
+        lua_pushnil(L);
+    lua_rawset(L, -3);
+    lua_pop(L, 1);
+    return 0;
+}
+
+static int lua_isreadonly(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+
+    lua_getfield(L, LUA_REGISTRYINDEX, "__readonly_tables");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    lua_pushvalue(L, 1);
+    lua_rawget(L, -2);
+    lua_pushboolean(L, lua_toboolean(L, -1));
+    return 1;
+}
+
+static int lua_getnamecallmethod(lua_State* L) {
+    lua_getfield(L, LUA_REGISTRYINDEX, "__namecall_method");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        lua_pushstring(L, "");
+    }
+    return 1;
+}
+
+static int lua_getconnections(lua_State* L) {
+    lua_newtable(L);
+    return 1;
+}
+
+static int lua_fireclickdetector(lua_State*) { return 0; }
+static int lua_firetouchinterest(lua_State*) { return 0; }
+static int lua_fireproximityprompt(lua_State*) { return 0; }
+static int lua_setfpscap(lua_State*) { return 0; }
+
+static int lua_getfps(lua_State* L) {
+    lua_pushinteger(L, 60);
+    return 1;
+}
+
+static int lua_getgenv(lua_State* L) {
+    lua_pushvalue(L, LUA_GLOBALSINDEX);
+    return 1;
+}
+
+static int lua_getrenv(lua_State* L) {
+    lua_pushvalue(L, LUA_GLOBALSINDEX);
+    return 1;
+}
+
+static int lua_getreg(lua_State* L) {
+    lua_pushvalue(L, LUA_REGISTRYINDEX);
+    return 1;
+}
+
+static int lua_getgc(lua_State* L) {
+    lua_newtable(L);
+    return 1;
+}
+
+static int lua_gethui(lua_State* L) {
+    lua_getglobal(L, "game");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        return 1;
+    }
+    lua_getfield(L, -1, "GetService");
+    lua_pushvalue(L, -2);
+    lua_pushstring(L, "CoreGui");
+    lua_call(L, 2, 1);
+    return 1;
+}
+
+static int lua_getinstances(lua_State* L) {
+    lua_newtable(L);
+    return 1;
+}
+
+static int lua_getnilinstances(lua_State* L) {
+    lua_newtable(L);
+    return 1;
+}
+
+static int lua_getscripts(lua_State* L) {
+    lua_newtable(L);
+    return 1;
+}
+
+static int lua_getrunningscripts(lua_State* L) {
+    lua_newtable(L);
+    return 1;
+}
+
+static int lua_getloadedmodules(lua_State* L) {
+    lua_newtable(L);
+    return 1;
+}
+
+static int lua_getcallingscript(lua_State* L) {
+    lua_pushnil(L);
+    return 1;
+}
+
+static int lua_printidentity(lua_State* L) {
+    lua_pushstring(L, "Current identity is 7");
+    return 1;
+}
+
+static int lua_isfolder(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    lua_getglobal(L, "listfiles");
+    if (lua_isfunction(L, -1)) {
+        lua_pushstring(L, path);
+        int status = lua_pcall(L, 1, 1, 0);
+        if (status == 0 && lua_istable(L, -1)) {
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+    }
+    lua_settop(L, 1);
+    lua_pushboolean(L, 0);
+    return 1;
+}
+
+static int lua_delfile(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    (void)path;
+    return 0;
+}
+
+static int lua_websocket_connect(lua_State* L) {
+    const char* url = luaL_checkstring(L, 1);
+    (void)url;
+
+    lua_newtable(L);
+
+    lua_newtable(L);
+    lua_setfield(L, -2, "OnMessage");
+
+    lua_newtable(L);
+    lua_setfield(L, -2, "OnClose");
+
+    lua_pushcfunction(L, [](lua_State* Ls) -> int {
+        (void)Ls;
+        return 0;
+    });
+    lua_setfield(L, -2, "Send");
+
+    lua_pushcfunction(L, [](lua_State* Ls) -> int {
+        (void)Ls;
+        return 0;
+    });
+    lua_setfield(L, -2, "Close");
+
+    return 1;
 }
 
 static const char* ROBLOX_MOCK_LUA = R"LUA(
@@ -390,13 +832,60 @@ local function make_instance(class_name,name,parent)
                 return nil
             end
         end
+        if key=="FindFirstAncestor" then
+            return function(self2,n)
+                local p=parent
+                while p do
+                    if type(p)=="table" and (p.Name==n or tostring(p)==n) then return p end
+                    p=type(p)=="table" and p.Parent or nil
+                end
+                return nil
+            end
+        end
+        if key=="FindFirstAncestorOfClass" then
+            return function(self2,cls)
+                local p=parent
+                while p do
+                    if type(p)=="table" and p.ClassName==cls then return p end
+                    p=type(p)=="table" and p.Parent or nil
+                end
+                return nil
+            end
+        end
         if key=="WaitForChild" then return find_child end
         if key=="GetChildren" or key=="getChildren" then return function() return children end end
-        if key=="GetDescendants" then return function() return children end end
+        if key=="GetDescendants" then
+            return function()
+                local result={}
+                local function collect(list)
+                    for _,c in ipairs(list) do
+                        table.insert(result,c)
+                        if type(c)=="table" then
+                            local gc=c.GetChildren
+                            if gc then collect(gc()) end
+                        end
+                    end
+                end
+                collect(children)
+                return result
+            end
+        end
         if key=="Clone" then return function() return make_instance(class_name,name,nil) end end
         if key=="Destroy" or key=="Remove" then return function() end end
         if key=="ClearAllChildren" then return function() children={} end end
-        if key=="GetFullName" then return function() return name or class_name end end
+        if key=="GetFullName" then
+            return function()
+                local parts={name or class_name}
+                local p=parent
+                while p do
+                    if type(p)=="table" then
+                        table.insert(parts,1,p.Name or tostring(p))
+                        p=p.Parent
+                    else break end
+                end
+                return table.concat(parts,".")
+            end
+        end
         if key=="GetPropertyChangedSignal" then
             return function(_,prop_name)
                 local sig_key="_PropChanged_"..tostring(prop_name or "")
@@ -406,19 +895,42 @@ local function make_instance(class_name,name,parent)
         end
         if key=="GetAttribute" then return function(_,attr) return properties["_attr_"..tostring(attr)] end end
         if key=="SetAttribute" then return function(_,attr,val) properties["_attr_"..tostring(attr)]=val end end
-        if key=="GetAttributes" then return function() return {} end end
+        if key=="GetAttributes" then
+            return function()
+                local attrs={}
+                for k,v in pairs(properties) do
+                    if k:sub(1,6)=="_attr_" then attrs[k:sub(7)]=v end
+                end
+                return attrs
+            end
+        end
+        if key=="GetAttributeChangedSignal" then
+            return function(_,attr)
+                local sig_key="_AttrChanged_"..tostring(attr)
+                if not events[sig_key] then events[sig_key]=Signal.new(sig_key) end
+                return events[sig_key]
+            end
+        end
         if properties[key]~=nil then return properties[key] end
         if _instance_events[key] then
             if not events[key] then events[key]=Signal.new(key) end
             return events[key]
         end
+        local child=find_child(nil,key)
+        if child then return child end
         return nil
     end
     mt.__newindex=function(self,key,value)
         if key=="Name" then name=value
-        elseif key=="Parent" then parent=value
+        elseif key=="Parent" then
+            parent=value
+            if type(value)=="table" then
+                local gc=rawget(value,"_children")
+                if gc then table.insert(gc,inst) end
+            end
         else properties[key]=value end
     end
+    rawset(inst,"_children",children)
     setmetatable(inst,mt)
     return inst,children,properties
 end
@@ -439,23 +951,136 @@ local InstanceModule={}
 function InstanceModule.new(class_name,parent)
     local inst,children,props=make_instance(class_name,class_name,parent)
     if class_name=="ScreenGui" or class_name=="BillboardGui" or class_name=="SurfaceGui" then
-        props.Enabled=true;props.ResetOnSpawn=true
+        props.Enabled=true;props.ResetOnSpawn=true;props.DisplayOrder=0
+        props.IgnoreGuiInset=false;props.ZIndexBehavior=EnumMock.ZIndexBehavior.Sibling
     elseif class_name=="Frame" or class_name=="TextLabel" or class_name=="TextButton"
-           or class_name=="ImageLabel" or class_name=="ImageButton" or class_name=="ScrollingFrame" then
+           or class_name=="ImageLabel" or class_name=="ImageButton" or class_name=="ScrollingFrame"
+           or class_name=="TextBox" or class_name=="ViewportFrame" or class_name=="CanvasGroup" then
         props.Size=UDim2.new(0,100,0,100);props.Position=UDim2.new(0,0,0,0)
         props.BackgroundColor3=Color3.new(1,1,1);props.BackgroundTransparency=0
         props.Visible=true;props.Text="";props.TextColor3=Color3.new(0,0,0)
         props.TextSize=14;props.Font=0;props.ZIndex=1
         props.AnchorPoint=Vector2.new(0,0);props.BorderSizePixel=0;props.ClipsDescendants=false
-    elseif class_name=="Part" or class_name=="MeshPart" or class_name=="UnionOperation" or class_name=="WedgePart" then
+        props.LayoutOrder=0;props.Rotation=0;props.AutomaticSize=EnumMock.AutomaticSize.None
+        props.Active=false;props.Selectable=false
+        if class_name=="TextLabel" or class_name=="TextButton" or class_name=="TextBox" then
+            props.TextWrapped=false;props.TextScaled=false;props.RichText=false
+            props.TextXAlignment=EnumMock.TextXAlignment.Center
+            props.TextYAlignment=EnumMock.TextYAlignment.Center
+            props.TextTransparency=0;props.TextStrokeTransparency=1
+            props.TextStrokeColor3=Color3.new(0,0,0)
+            props.MaxVisibleGraphemes=-1;props.LineHeight=1
+            props.ContentText=""
+            props.TextBounds=Vector2.new(0,0)
+            props.TextFits=true
+        end
+        if class_name=="ImageLabel" or class_name=="ImageButton" then
+            props.Image="";props.ImageColor3=Color3.new(1,1,1);props.ImageTransparency=0
+            props.ImageRectOffset=Vector2.new(0,0);props.ImageRectSize=Vector2.new(0,0)
+            props.ScaleType=EnumMock.ScaleType.Stretch;props.SliceCenter=nil
+        end
+        if class_name=="ScrollingFrame" then
+            props.CanvasSize=UDim2.new(0,0,0,0);props.CanvasPosition=Vector2.new(0,0)
+            props.ScrollBarThickness=12;props.ScrollBarImageTransparency=0
+            props.ScrollingDirection=EnumMock.ScrollingDirection.XY
+            props.ScrollingEnabled=true
+        end
+    elseif class_name=="Part" or class_name=="MeshPart" or class_name=="UnionOperation" or class_name=="WedgePart" or class_name=="SpawnLocation" then
         props.Position=Vector3.new(0,0,0);props.Size=Vector3.new(4,1,2)
         props.CFrame=CFrame.new(0,0,0);props.Anchored=false;props.CanCollide=true
         props.Transparency=0;props.BrickColor="Medium stone grey"
         props.Color=Color3.fromRGB(163,162,165);props.Material=EnumMock.Material.Plastic
+        props.CanQuery=true;props.CanTouch=true;props.Massless=false
+        props.Velocity=Vector3.new(0,0,0);props.AssemblyLinearVelocity=Vector3.new(0,0,0)
+        props.AssemblyAngularVelocity=Vector3.new(0,0,0)
+    elseif class_name=="Model" or class_name=="Folder" then
+        if class_name=="Model" then
+            props.PrimaryPart=nil
+            rawset(inst,"GetPivot",function() return CFrame.new(0,0,0) end)
+            rawset(inst,"PivotTo",function() end)
+            rawset(inst,"MoveTo",function() end)
+            rawset(inst,"GetBoundingBox",function() return CFrame.new(),Vector3.new(4,4,4) end)
+            rawset(inst,"SetPrimaryPartCFrame",function() end)
+            rawset(inst,"GetExtentsSize",function() return Vector3.new(4,4,4) end)
+        end
     elseif class_name=="UICorner" then props.CornerRadius=UDim.new(0,8)
-    elseif class_name=="UIStroke" then props.Thickness=1;props.Color=Color3.new(0,0,0);props.Transparency=0
+    elseif class_name=="UIStroke" then
+        props.Thickness=1;props.Color=Color3.new(0,0,0);props.Transparency=0
+        props.ApplyStrokeMode=EnumMock.ApplyStrokeMode.Contextual
+        props.LineJoinMode=EnumMock.LineJoinMode.Round
     elseif class_name=="UIListLayout" or class_name=="UIGridLayout" then
         props.SortOrder=EnumMock.SortOrder.LayoutOrder;props.Padding=UDim.new(0,0)
+        props.FillDirection=EnumMock.FillDirection.Vertical
+        props.HorizontalAlignment=EnumMock.HorizontalAlignment.Left
+        props.VerticalAlignment=EnumMock.VerticalAlignment.Top
+    elseif class_name=="UIPadding" then
+        props.PaddingTop=UDim.new(0,0);props.PaddingBottom=UDim.new(0,0)
+        props.PaddingLeft=UDim.new(0,0);props.PaddingRight=UDim.new(0,0)
+    elseif class_name=="UIScale" then props.Scale=1
+    elseif class_name=="UIAspectRatioConstraint" then props.AspectRatio=1;props.AspectType=EnumMock.AspectType.FitWithinMaxSize
+    elseif class_name=="UISizeConstraint" then
+        props.MinSize=Vector2.new(0,0);props.MaxSize=Vector2.new(math.huge,math.huge)
+    elseif class_name=="UITextSizeConstraint" then
+        props.MinTextSize=1;props.MaxTextSize=100
+    elseif class_name=="UIGradient" then
+        props.Color=nil;props.Transparency=nil
+        props.Offset=Vector2.new(0,0);props.Rotation=0
+    elseif class_name=="Sound" then
+        props.SoundId="";props.Volume=0.5;props.PlaybackSpeed=1;props.Playing=false
+        props.Looped=false;props.TimePosition=0;props.TimeLength=0
+        rawset(inst,"Play",function() props.Playing=true end)
+        rawset(inst,"Stop",function() props.Playing=false end)
+        rawset(inst,"Pause",function() props.Playing=false end)
+        rawset(inst,"Resume",function() props.Playing=true end)
+    elseif class_name=="Animation" then
+        props.AnimationId=""
+    elseif class_name=="Animator" or class_name=="AnimationController" then
+        rawset(inst,"LoadAnimation",function(_,anim)
+            local track,_,tp=make_instance("AnimationTrack","AnimationTrack")
+            tp.IsPlaying=false;tp.Length=1;tp.Speed=1;tp.TimePosition=0
+            tp.Looped=false;tp.Priority=EnumMock.AnimationPriority.Action
+            rawset(track,"Play",function() tp.IsPlaying=true end)
+            rawset(track,"Stop",function() tp.IsPlaying=false end)
+            rawset(track,"AdjustSpeed",function(_,s) tp.Speed=s end)
+            rawset(track,"AdjustWeight",function() end)
+            rawset(track,"GetMarkerReachedSignal",function() return Signal.new("MarkerReached") end)
+            return track
+        end)
+    elseif class_name=="BindableEvent" then
+        local sig=Signal.new("Event")
+        props.Event=sig
+        rawset(inst,"Fire",function(_,...) sig:Fire(...) end)
+    elseif class_name=="BindableFunction" then
+        props.OnInvoke=nil
+        rawset(inst,"Invoke",function(_,...)
+            if props.OnInvoke then return props.OnInvoke(...) end
+        end)
+    elseif class_name=="RemoteEvent" then
+        props.OnClientEvent=Signal.new("OnClientEvent")
+        rawset(inst,"FireServer",function() end)
+    elseif class_name=="RemoteFunction" then
+        props.OnClientInvoke=nil
+        rawset(inst,"InvokeServer",function() return nil end)
+    elseif class_name=="Highlight" then
+        props.Adornee=nil;props.FillColor=Color3.new(1,0,0)
+        props.FillTransparency=0.5;props.OutlineColor=Color3.new(1,1,1)
+        props.OutlineTransparency=0;props.DepthMode=EnumMock.HighlightDepthMode.AlwaysOnTop
+        props.Enabled=true
+    elseif class_name=="BillboardGui" then
+        props.Adornee=nil;props.Size=UDim2.new(0,100,0,100)
+        props.StudsOffset=Vector3.new(0,0,0);props.AlwaysOnTop=false
+        props.MaxDistance=math.huge;props.Enabled=true
+    elseif class_name=="Beam" then
+        props.Attachment0=nil;props.Attachment1=nil
+        props.Color=nil;props.Width0=1;props.Width1=1
+        props.FaceCamera=true;props.Enabled=true
+    elseif class_name=="Attachment" then
+        props.CFrame=CFrame.new();props.Position=Vector3.new()
+        props.WorldCFrame=CFrame.new();props.WorldPosition=Vector3.new()
+    end
+    if parent and type(parent)=="table" then
+        local pc=rawget(parent,"_children")
+        if pc then table.insert(pc,inst) end
     end
     return inst
 end
@@ -469,7 +1094,7 @@ function Drawing.new(class_name)
     local id=0
     if _oss_drawing_new then id=_oss_drawing_new(type_id) end
     local data={
-        _id=id,_class=class_name,
+        _id=id,_class=class_name,_removed=false,
         Visible=false,Color=Color3.new(1,1,1),
         Transparency=0,Thickness=1,ZIndex=0,
         From=Vector2.new(0,0),To=Vector2.new(0,0),
@@ -488,19 +1113,25 @@ function Drawing.new(class_name)
         __index=function(_,key)
             if key=="Remove" or key=="Destroy" then
                 return function()
+                    if data._removed then return end
+                    data._removed=true
                     data.Visible=false
-                    if _oss_drawing_set and id>0 then _oss_drawing_set(id,"Visible",false) end
-                    if _oss_drawing_remove and id>0 then _oss_drawing_remove(id) end
+                    if _oss_drawing_set and id>0 then pcall(_oss_drawing_set,id,"Visible",false) end
+                    if _oss_drawing_remove and id>0 then pcall(_oss_drawing_remove,id) end
                 end
             end
             return data[key]
         end,
         __newindex=function(_,key,value)
+            if data._removed then return end
             data[key]=value
-            if _oss_drawing_set and id>0 then _oss_drawing_set(id,key,value) end
+            if _oss_drawing_set and id>0 then pcall(_oss_drawing_set,id,key,value) end
         end,
     }
     return setmetatable({},mt)
+end
+function Drawing.clear()
+    if _oss_drawing_clear then _oss_drawing_clear() end
 end
 
 local service_cache={}
@@ -527,58 +1158,112 @@ local function make_service(name)
         local lp,_,lp_props=make_instance("Player","LocalPlayer")
         lp_props.Name="LocalPlayer";lp_props.DisplayName="Player";lp_props.UserId=1
         lp_props.TeamColor=Color3.new(1,1,1);lp_props.Team=nil
+        lp_props.AccountAge=365;lp_props.MembershipType=EnumMock.MembershipType.None
+        lp_props.FollowUserId=0
         local char,char_children=make_instance("Model","LocalPlayer")
         local hrp,_,hrp_props=make_instance("Part","HumanoidRootPart",char)
         hrp_props.Position=Vector3.new(0,3,0);hrp_props.CFrame=CFrame.new(0,3,0);hrp_props.Size=Vector3.new(2,2,1)
         local head,_,head_props=make_instance("Part","Head",char)
         head_props.Position=Vector3.new(0,4.5,0);head_props.CFrame=CFrame.new(0,4.5,0);head_props.Size=Vector3.new(2,1,1)
         local hum,_,hum_props=make_instance("Humanoid","Humanoid",char)
-        hum_props.Health=100;hum_props.MaxHealth=100;hum_props.WalkSpeed=16;hum_props.JumpPower=50
-        hum_props.RigType=EnumMock.HumanoidRigType.R15
+        hum_props.Health=100;hum_props.MaxHealth=100;hum_props.WalkSpeed=16;hum_props.JumpPower=50;hum_props.JumpHeight=7.2
+        hum_props.RigType=EnumMock.HumanoidRigType.R15;hum_props.HipHeight=2
+        hum_props.AutoRotate=true;hum_props.Sit=false;hum_props.PlatformStand=false
         rawset(hum,"GetState",function() return EnumMock.HumanoidStateType.Running end)
+        rawset(hum,"ChangeState",function() end)
         rawset(hum,"GetAppliedDescription",function() return make_instance("HumanoidDescription","HumanoidDescription") end)
         rawset(hum,"MoveTo",function() end)
+        rawset(hum,"TakeDamage",function(_,d) hum_props.Health=math.max(0,hum_props.Health-d) end)
+        rawset(hum,"EquipTool",function() end)
+        rawset(hum,"UnequipTools",function() end)
         table.insert(char_children,hrp);table.insert(char_children,head);table.insert(char_children,hum)
+        rawset(char,"GetPivot",function() return hrp_props.CFrame end)
+        rawset(char,"PivotTo",function(_,cf) hrp_props.CFrame=cf;hrp_props.Position=cf.Position end)
         lp_props.Character=char
         rawset(lp,"GetMouse",function()
             local mouse,_,mp=make_instance("Mouse","Mouse")
-            mp.X=0;mp.Y=0;mp.Hit=CFrame.new(0,0,0);mp.Target=nil
+            mp.X=0;mp.Y=0;mp.Hit=CFrame.new(0,0,0);mp.Target=nil;mp.UnitRay={Origin=Vector3.new(),Direction=Vector3.new(0,0,-1)}
+            mp.Origin=CFrame.new();mp.ViewSizeX=1920;mp.ViewSizeY=1080
+            mp.Button1Down=Signal.new("Button1Down");mp.Button1Up=Signal.new("Button1Up")
+            mp.Button2Down=Signal.new("Button2Down");mp.Button2Up=Signal.new("Button2Up")
+            mp.Move=Signal.new("Move");mp.WheelForward=Signal.new("WheelForward");mp.WheelBackward=Signal.new("WheelBackward")
             return mouse
         end)
+        rawset(lp,"Kick",function() end)
+        rawset(lp,"GetFriendsOnline",function() return {} end)
+        rawset(lp,"IsFriendsWith",function() return false end)
+        rawset(lp,"GetRankInGroup",function() return 0 end)
+        rawset(lp,"GetRoleInGroup",function() return "Guest" end)
+        rawset(lp,"IsInGroup",function() return false end)
         props.LocalPlayer=lp;table.insert(children,lp)
         rawset(svc,"GetPlayers",function() return {lp} end)
+        rawset(svc,"GetPlayerByUserId",function(_,uid) if uid==1 then return lp end return nil end)
+        rawset(svc,"GetPlayerFromCharacter",function(_,c) if c==char then return lp end return nil end)
         props.PlayerAdded=Signal.new("PlayerAdded");props.PlayerRemoving=Signal.new("PlayerRemoving")
     elseif name=="RunService" then
         props.RenderStepped=Signal.new("RenderStepped");props.Heartbeat=Signal.new("Heartbeat");props.Stepped=Signal.new("Stepped")
+        props.PreRender=Signal.new("PreRender");props.PreAnimation=Signal.new("PreAnimation")
+        props.PreSimulation=Signal.new("PreSimulation");props.PostSimulation=Signal.new("PostSimulation")
         rawset(svc,"IsClient",function() return true end)
         rawset(svc,"IsServer",function() return false end)
         rawset(svc,"IsStudio",function() return false end)
+        rawset(svc,"IsRunMode",function() return false end)
+        rawset(svc,"IsEdit",function() return false end)
+        rawset(svc,"IsRunning",function() return true end)
         rawset(svc,"BindToRenderStep",function(_,n,p,fn) if type(fn)=="function" then props.RenderStepped:Connect(fn) end end)
         rawset(svc,"UnbindFromRenderStep",function() end)
     elseif name=="Workspace" then
         props.CurrentCamera=get_camera();props.Gravity=196.2;props.DistributedGameTime=0
+        props.FallenPartsDestroyHeight=-500
         rawset(svc,"Raycast",function() return nil end)
         rawset(svc,"FindPartOnRay",function() return nil,Vector3.new() end)
         rawset(svc,"FindPartOnRayWithIgnoreList",function() return nil,Vector3.new() end)
+        rawset(svc,"FindPartOnRayWithWhitelist",function() return nil,Vector3.new() end)
+        rawset(svc,"GetServerTimeNow",function() return os.clock() end)
     elseif name=="UserInputService" then
         props.MouseEnabled=true;props.KeyboardEnabled=true;props.TouchEnabled=false;props.GamepadEnabled=false
-        props.MouseBehavior=EnumMock.MouseBehavior.Default
+        props.MouseBehavior=EnumMock.MouseBehavior.Default;props.MouseDeltaSensitivity=1
+        props.MouseIconEnabled=true;props.BottomBarSize=Vector2.new(0,0)
+        props.NavBarSize=Vector2.new(0,0);props.StatusBarSize=Vector2.new(0,0)
         props.InputBegan=Signal.new("InputBegan");props.InputEnded=Signal.new("InputEnded");props.InputChanged=Signal.new("InputChanged")
+        props.WindowFocused=Signal.new("WindowFocused");props.WindowFocusReleased=Signal.new("WindowFocusReleased")
         rawset(svc,"GetMouseLocation",function() return Vector2.new(960,540) end)
+        rawset(svc,"GetMouseDelta",function() return Vector2.new(0,0) end)
         rawset(svc,"IsKeyDown",function() return false end)
         rawset(svc,"IsMouseButtonPressed",function() return false end)
         rawset(svc,"GetKeysPressed",function() return {} end)
+        rawset(svc,"GetMouseButtonsPressed",function() return {} end)
+        rawset(svc,"GetGamepadConnected",function() return false end)
+        rawset(svc,"GetGamepadState",function() return {} end)
+        rawset(svc,"GetNavigationGamepads",function() return {} end)
+        rawset(svc,"GetConnectedGamepads",function() return {} end)
+        rawset(svc,"GetFocusedTextBox",function() return nil end)
+        rawset(svc,"GetStringForKeyCode",function(_,kc) return tostring(kc) end)
     elseif name=="CoreGui" or name=="StarterGui" then
         rawset(svc,"SetCoreGuiEnabled",function() end)
         rawset(svc,"GetCoreGuiEnabled",function() return true end)
+        rawset(svc,"SetCore",function() end)
+        rawset(svc,"GetCore",function() return nil end)
+        rawset(svc,"RegisterSetCore",function() end)
+        rawset(svc,"RegisterGetCore",function() end)
     elseif name=="TweenService" then
-        rawset(svc,"Create",function(_,inst,info,pt)
-            return {Play=function()end,Cancel=function()end,Pause=function()end,Completed=Signal.new("Completed")}
+        rawset(svc,"Create",function(_,inst2,info,pt)
+            local tween,_,tp=make_instance("Tween","Tween")
+            tp.PlaybackState=EnumMock.PlaybackState.Begin
+            rawset(tween,"Play",function() tp.PlaybackState=EnumMock.PlaybackState.Playing end)
+            rawset(tween,"Cancel",function() tp.PlaybackState=EnumMock.PlaybackState.Cancelled end)
+            rawset(tween,"Pause",function() tp.PlaybackState=EnumMock.PlaybackState.Paused end)
+            tp.Completed=Signal.new("Completed")
+            return tween
+        end)
+        rawset(svc,"GetValue",function(_,alpha,style,dir)
+            return alpha
         end)
     elseif name=="HttpService" then
         rawset(svc,"JSONEncode",function(_,obj)
-            if type(obj)=="string" then return '"'..obj..'"' end
+            if type(obj)=="string" then return '"'..obj:gsub('"','\\"')..'"' end
             if type(obj)=="number" or type(obj)=="boolean" then return tostring(obj) end
+            if obj==nil then return "null" end
             if type(obj)=="table" then
                 local parts={} local is_array=(#obj>0)
                 if is_array then
@@ -600,7 +1285,7 @@ local function make_service(name)
         rawset(svc,"JSONDecode",function(_,str)
             if type(str)~="string" then return {} end
             local s=str:gsub("%[","{"):gsub("%]","}")
-            s=s:gsub("null","nil"):gsub("true","true"):gsub("false","false")
+            s=s:gsub("null","nil"):gsub('"([^"]-)"%s*:',function(k) return '["'..k..'"]='; end)
             local fn=loadstring("return "..s)
             if fn then local ok,result=pcall(fn) if ok then return result end end
             return {}
@@ -617,6 +1302,42 @@ local function make_service(name)
         rawset(svc,"UrlEncode",function(_,str)
             return (str:gsub("[^%w%-_%.~]",function(c) return string.format("%%%02X",string.byte(c)) end))
         end)
+        rawset(svc,"RequestAsync",function(_,opts) return _G._oss_http_request(opts) end)
+    elseif name=="ReplicatedStorage" or name=="ServerStorage" or name=="ServerScriptService"
+        or name=="StarterPack" or name=="StarterPlayer" or name=="StarterPlayerScripts"
+        or name=="StarterCharacterScripts" or name=="Lighting" or name=="SoundService"
+        or name=="Chat" or name=="LocalizationService" or name=="TestService"
+        or name=="ContentProvider" or name=="MarketplaceService" or name=="TeleportService"
+        or name=="PolicyService" or name=="SocialService" then
+    elseif name=="GuiService" then
+        rawset(svc,"GetGuiInset",function() return Vector2.new(0,36),Vector2.new(0,0) end)
+        rawset(svc,"IsTenFootInterface",function() return false end)
+        props.MenuIsOpen=false
+    elseif name=="PathfindingService" then
+        rawset(svc,"CreatePath",function()
+            local path,_,pp=make_instance("Path","Path")
+            rawset(path,"ComputeAsync",function() end)
+            rawset(path,"GetWaypoints",function() return {} end)
+            pp.Status=EnumMock.PathStatus.Success
+            pp.Blocked=Signal.new("Blocked")
+            return path
+        end)
+    elseif name=="PhysicsService" then
+        rawset(svc,"GetCollisionGroupName",function(_,id) return "Default" end)
+        rawset(svc,"GetCollisionGroupId",function(_,name2) return 0 end)
+        rawset(svc,"CollisionGroupContainsPart",function() return false end)
+        rawset(svc,"SetPartCollisionGroup",function() end)
+    elseif name=="Debris" then
+        rawset(svc,"AddItem",function(_,item,lifetime) end)
+    elseif name=="VirtualInputManager" then
+        rawset(svc,"SendKeyEvent",function() end)
+        rawset(svc,"SendMouseButtonEvent",function() end)
+        rawset(svc,"SendMouseMoveEvent",function() end)
+        rawset(svc,"SendMouseWheelEvent",function() end)
+        rawset(svc,"SendTextInputCharacterEvent",function() end)
+    elseif name=="Stats" then
+        rawset(svc,"GetTotalMemoryUsageMb",function() return 512 end)
+        rawset(svc,"GetMemoryUsageMbForTag",function() return 0 end)
     end
 
     service_cache[name]=svc
@@ -641,6 +1362,9 @@ game_mt.__index=function(self,key)
     if key=="BindToClose" then return function() end end
     if key=="IsLoaded" then return function() return true end end
     if key=="GetObjects" then return function() return {} end end
+    if key=="ClassName" then return "DataModel" end
+    if key=="Name" then return "Game" end
+    if key=="GetPropertyChangedSignal" then return function(_,p) return Signal.new("PropChanged_"..p) end end
     local ok,svc=pcall(make_service,key)
     if ok and svc then return svc end
     return nil
@@ -661,21 +1385,12 @@ local _c_spawn=spawn
 local _c_delay=delay
 
 wait=_c_wait or function(t) return t or 0,t or 0 end
-spawn=_c_spawn or function(fn) if type(fn)=="function" then pcall(fn) end end
-delay=_c_delay or function(t,fn) if type(fn)=="function" then pcall(fn) end end
+spawn=_c_spawn or function(fn,...) if type(fn)=="function" then pcall(fn,...) end end
+delay=_c_delay or function(t,fn,...) if type(fn)=="function" then pcall(fn,...) end end
 tick=tick or function() return os.clock() end
 time=time or function() return os.clock() end
 elapsedTime=elapsedTime or function() return os.clock() end
 settings=settings or function() return {Rendering={QualityLevel=10}} end
-
-task=task or {}
-task.wait=task.wait or _c_wait or function(t) return t or 0 end
-task.spawn=task.spawn or function(fn,...) if type(fn)=="function" then pcall(fn,...) end end
-task.defer=task.defer or function(fn,...) if type(fn)=="function" then pcall(fn,...) end end
-task.delay=task.delay or function(t,fn,...) if type(fn)=="function" then pcall(fn,...) end end
-task.cancel=task.cancel or function() end
-task.synchronize=task.synchronize or function() end
-task.desynchronize=task.desynchronize or function() end
 
 shared=shared or {}
 _G=_G or {}
@@ -692,13 +1407,16 @@ function Ray.new(o,d) return {Origin=o or Vector3.new(),Direction=d or Vector3.n
 
 RaycastParams={}
 function RaycastParams.new()
-    return {FilterType=EnumMock.RaycastFilterType.Exclude,FilterDescendantsInstances={},IgnoreWater=true}
+    return {FilterType=EnumMock.RaycastFilterType.Exclude,FilterDescendantsInstances={},IgnoreWater=true,CollisionGroup="Default"}
 end
 
 OverlapParams={}
 function OverlapParams.new()
-    return {FilterType=EnumMock.RaycastFilterType.Exclude,FilterDescendantsInstances={}}
+    return {FilterType=EnumMock.RaycastFilterType.Exclude,FilterDescendantsInstances={},CollisionGroup="Default"}
 end
+
+NumberRange={}
+function NumberRange.new(mn,mx) return {Min=mn or 0,Max=mx or mn or 0} end
 
 NumberSequenceKeypoint={}
 function NumberSequenceKeypoint.new(t,v,e) return {Time=t or 0,Value=v or 0,Envelope=e or 0} end
@@ -729,13 +1447,38 @@ function BrickColor.new(nr,g,b)
 end
 
 PhysicalProperties={}
-function PhysicalProperties.new() return {} end
+function PhysicalProperties.new(d,f,e,fw,ew)
+    return {Density=d or 1,Friction=f or 0.3,Elasticity=e or 0.5,
+        FrictionWeight=fw or 1,ElasticityWeight=ew or 1}
+end
 
 Rect={}
 function Rect.new(x0,y0,x1,y1)
     return {Min=Vector2.new(x0 or 0,y0 or 0),Max=Vector2.new(x1 or 0,y1 or 0),
         Width=(x1 or 0)-(x0 or 0),Height=(y1 or 0)-(y0 or 0)}
 end
+
+Faces={}
+function Faces.new(...) return {Top=false,Bottom=false,Left=false,Right=false,Back=false,Front=false} end
+
+Axes={}
+function Axes.new(...) return {X=false,Y=false,Z=false} end
+
+Region3={}
+function Region3.new(min,max)
+    min=min or Vector3.new();max=max or Vector3.new()
+    return {CFrame=CFrame.new((min.X+max.X)/2,(min.Y+max.Y)/2,(min.Z+max.Z)/2),
+        Size=Vector3.new(max.X-min.X,max.Y-min.Y,max.Z-min.Z)}
+end
+
+Region3int16={}
+function Region3int16.new(min,max) return {Min=min or Vector3.new(),Max=max or Vector3.new()} end
+
+Vector3int16={}
+function Vector3int16.new(x,y,z) return {X=x or 0,Y=y or 0,Z=z or 0} end
+
+Vector2int16={}
+function Vector2int16.new(x,y) return {X=x or 0,Y=y or 0} end
 
 if not string.split then
     function string.split(str,sep)
@@ -759,83 +1502,6 @@ if not string.split then
         return p
     end
 end
-
-syn={
-    request=_G._oss_http_request or function() return {} end,
-    crypt=type(crypt)=="table" and {
-        base64encode=crypt.base64encode or function(s) return s end,
-        base64decode=crypt.base64decode or function(s) return s end,
-        sha256=crypt.sha256 or function(s) return s end,
-    } or {
-        base64encode=function(s) return s end,
-        base64decode=function(s) return s end,
-    },
-}
-request=syn.request
-http_request=syn.request
-
-getgenv=function() return _G end
-getrenv=function() return _G end
-getreg=function() return {} end
-getgc=function() return {} end
-gethui=function() return make_service("CoreGui") end
-getinstances=function() return {} end
-getnilinstances=function() return {} end
-getscripts=function() return {} end
-getrunningscripts=function() return {} end
-getloadedmodules=function() return {} end
-
-isexecutorclosure=function() return false end
-checkcaller=function() return false end
-islclosure=function(f) return type(f)=="function" end
-iscclosure=function(f) return type(f)=="function" end
-hookfunction=function(old,new) return old end
-hookmetamethod=function(_,_,new) return function() end end
-newcclosure=function(fn) return fn end
-getrawmetatable=function(t) return getmetatable(t) end
-setrawmetatable=function(t,mt) return setmetatable(t,mt) end
-setreadonly=function() end
-isreadonly=function() return false end
-getnamecallmethod=function() return "" end
-checkclosure=function() return false end
-getcallingscript=function() return nil end
-getscriptclosure=function() return function() end end
-getconnections=function(signal)
-    if signal and signal._connections then
-        local out={}
-        for _,conn in ipairs(signal._connections) do
-            table.insert(out,{
-                Function=conn._fn,State=conn.Connected,
-                Enable=function() conn.Connected=true end,
-                Disable=function() conn.Connected=false end,
-                Fire=function(...) pcall(conn._fn,...) end,
-            })
-        end
-        return out
-    end
-    return {}
-end
-
-fireclickdetector=function() end
-firetouchinterest=function() end
-fireproximityprompt=function() end
-setclipboard=setclipboard or function() end
-getclipboard=getclipboard or function() return "" end
-setfpscap=function() end
-getfps=function() return 60 end
-
-readfile=readfile or function() return "" end
-writefile=writefile or function() end
-appendfile=appendfile or function() end
-isfile=isfile or function() return false end
-isfolder=isfolder or function(p)
-    local ok,r=pcall(function() return #(listfiles(p) or {})>=0 end)
-    return ok and r
-end
-listfiles=listfiles or function() return {} end
-makefolder=makefolder or function() end
-delfolder=delfolder or function() end
-delfile=delfile or function() end
 
 if not table.find then
     function table.find(t,value,init)
@@ -861,6 +1527,8 @@ if not table.create then
 end
 if not table.pack then function table.pack(...) return {n=select("#",...),...} end end
 if not table.unpack then table.unpack=unpack end
+if not table.foreach then function table.foreach(t,f) for k,v in pairs(t) do local r=f(k,v) if r~=nil then return r end end end end
+if not table.foreachi then function table.foreachi(t,f) for i=1,#t do local r=f(i,t[i]) if r~=nil then return r end end end end
 
 if not math.clamp then function math.clamp(val,lo,hi) if val<lo then return lo end if val>hi then return hi end return val end end
 if not math.sign then function math.sign(n) if n>0 then return 1 end if n<0 then return -1 end return 0 end end
@@ -870,9 +1538,33 @@ do
     math.log=function(x,base) if base then return _log(x)/_log(base) end return _log(x) end
 end
 if not math.noise then
+    local function fade(t) return t*t*t*(t*(t*6-15)+10) end
+    local function lerp2(a,b,t) return a+t*(b-a) end
+    local _perm={}
+    for i=0,255 do _perm[i]=i end
+    for i=255,1,-1 do
+        local j=math.random(0,i)
+        _perm[i],_perm[j]=_perm[j],_perm[i]
+    end
+    for i=0,255 do _perm[i+256]=_perm[i] end
+    local function grad(hash,x,y,z)
+        local h=hash%16
+        local u=(h<8) and x or y
+        local v=(h<4) and y or ((h==12 or h==14) and x or z)
+        return ((h%2==0) and u or -u)+((h%4<2) and v or -v)
+    end
     math.noise=function(x,y,z)
         x=x or 0;y=y or 0;z=z or 0
-        return (math.sin(x*12.9898+y*78.233+z*37.719)*43758.5453)%1-0.5
+        local X=math.floor(x)%256;local Y=math.floor(y)%256;local Z=math.floor(z)%256
+        x=x-math.floor(x);y=y-math.floor(y);z=z-math.floor(z)
+        local u,v,w=fade(x),fade(y),fade(z)
+        local A=_perm[X]+Y;local AA=_perm[A]+Z;local AB=_perm[A+1]+Z
+        local B=_perm[X+1]+Y;local BA=_perm[B]+Z;local BB=_perm[B+1]+Z
+        return lerp2(
+            lerp2(lerp2(grad(_perm[AA],x,y,z),grad(_perm[BA],x-1,y,z),u),
+                  lerp2(grad(_perm[AB],x,y-1,z),grad(_perm[BB],x-1,y-1,z),u),v),
+            lerp2(lerp2(grad(_perm[AA+1],x,y,z-1),grad(_perm[BA+1],x-1,y,z-1),u),
+                  lerp2(grad(_perm[AB+1],x,y-1,z-1),grad(_perm[BB+1],x-1,y-1,z-1),u),v),w)
     end
 end
 
@@ -881,7 +1573,12 @@ if not bit32 then
     if ok then
         bit32={band=bitlib.band,bor=bitlib.bor,bxor=bitlib.bxor,bnot=bitlib.bnot,
             lshift=bitlib.lshift,rshift=bitlib.rshift,arshift=bitlib.arshift,
-            btest=function(a,b) return bitlib.band(a,b)~=0 end}
+            btest=function(a,b) return bitlib.band(a,b)~=0 end,
+            extract=function(n,f,w) w=w or 1;return bitlib.band(bitlib.rshift(n,f),bitlib.lshift(1,w)-1) end,
+            replace=function(n,v,f,w) w=w or 1;local m=bitlib.lshift(1,w)-1;return bitlib.bor(bitlib.band(n,bitlib.bnot(bitlib.lshift(m,f))),bitlib.lshift(bitlib.band(v,m),f)) end,
+            countlz=function(n) if n==0 then return 32 end local c=0;while bitlib.band(n,0x80000000)==0 do n=bitlib.lshift(n,1);c=c+1 end return c end,
+            countrz=function(n) if n==0 then return 32 end local c=0;while bitlib.band(n,1)==0 do n=bitlib.rshift(n,1);c=c+1 end return c end,
+        }
     end
 end
 
@@ -931,11 +1628,7 @@ void Environment::setup(LuaEngine& engine) {
     lua_setglobal(L, "identifyexecutor");
     lua_pushcfunction(L, lua_identify_executor);
     lua_setglobal(L, "getexecutorname");
-
-    lua_pushcfunction(L, [](lua_State* state) -> int {
-        lua_pushstring(state, "Current identity is 7");
-        return 1;
-    });
+    lua_pushcfunction(L, lua_printidentity);
     lua_setglobal(L, "printidentity");
 
     lua_pushcfunction(L, lua_drawing_new_bridge);
@@ -944,6 +1637,16 @@ void Environment::setup(LuaEngine& engine) {
     lua_setglobal(L, "_oss_drawing_set");
     lua_pushcfunction(L, lua_drawing_remove_bridge);
     lua_setglobal(L, "_oss_drawing_remove");
+
+    setup_debug_lib(engine);
+    setup_cache_lib(engine);
+    setup_metatable_lib(engine);
+    setup_input_lib(engine);
+    setup_instance_lib(engine);
+    setup_script_lib(engine);
+    setup_websocket_lib(engine);
+    setup_thread_lib(engine);
+    setup_closure_lib(engine);
 
     int status = luaL_dostring(L, ROBLOX_MOCK_LUA);
     if (status != 0) {
@@ -957,6 +1660,174 @@ void Environment::setup(LuaEngine& engine) {
     lua_setfield(L, LUA_REGISTRYINDEX, "_oss_env_init");
 
     LOG_INFO("Roblox API mock environment initialized");
+}
+
+void Environment::setup_debug_lib(LuaEngine& engine) {
+    lua_State* L = engine.state();
+
+    lua_getglobal(L, "debug");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+    }
+
+    lua_pushcfunction(L, lua_debug_getinfo);
+    lua_setfield(L, -2, "getinfo");
+
+    lua_pushcfunction(L, lua_debug_getupvalue);
+    lua_setfield(L, -2, "getupvalue");
+
+    lua_pushcfunction(L, lua_debug_setupvalue);
+    lua_setfield(L, -2, "setupvalue");
+
+    lua_pushcfunction(L, lua_debug_getupvalues);
+    lua_setfield(L, -2, "getupvalues");
+
+    lua_pushcfunction(L, lua_debug_setupvalues);
+    lua_setfield(L, -2, "setupvalues");
+
+    lua_pushcfunction(L, lua_debug_getconstant);
+    lua_setfield(L, -2, "getconstant");
+
+    lua_pushcfunction(L, lua_debug_getconstants);
+    lua_setfield(L, -2, "getconstants");
+
+    lua_pushcfunction(L, lua_debug_setconstant);
+    lua_setfield(L, -2, "setconstant");
+
+    lua_pushcfunction(L, lua_debug_getproto);
+    lua_setfield(L, -2, "getproto");
+
+    lua_pushcfunction(L, lua_debug_getprotos);
+    lua_setfield(L, -2, "getprotos");
+
+    lua_pushcfunction(L, lua_debug_getstack);
+    lua_setfield(L, -2, "getstack");
+
+    lua_pushcfunction(L, lua_debug_setstack);
+    lua_setfield(L, -2, "setstack");
+
+    lua_pushcfunction(L, lua_debug_getmetatable);
+    lua_setfield(L, -2, "getmetatable");
+
+    lua_pushcfunction(L, lua_debug_setmetatable);
+    lua_setfield(L, -2, "setmetatable");
+
+    lua_pushcfunction(L, lua_debug_getregistry);
+    lua_setfield(L, -2, "getregistry");
+
+    lua_pushcfunction(L, lua_debug_traceback);
+    lua_setfield(L, -2, "traceback");
+
+    lua_pushcfunction(L, lua_debug_profilebegin);
+    lua_setfield(L, -2, "profilebegin");
+
+    lua_pushcfunction(L, lua_debug_profileend);
+    lua_setfield(L, -2, "profileend");
+
+    lua_setglobal(L, "debug");
+
+    engine.register_function("getinfo", lua_debug_getinfo);
+    engine.register_function("getupvalue", lua_debug_getupvalue);
+    engine.register_function("setupvalue", lua_debug_setupvalue);
+    engine.register_function("getupvalues", lua_debug_getupvalues);
+    engine.register_function("setupvalues", lua_debug_setupvalues);
+    engine.register_function("getconstant", lua_debug_getconstant);
+    engine.register_function("getconstants", lua_debug_getconstants);
+    engine.register_function("setconstant", lua_debug_setconstant);
+    engine.register_function("getproto", lua_debug_getproto);
+    engine.register_function("getprotos", lua_debug_getprotos);
+    engine.register_function("getstack", lua_debug_getstack);
+    engine.register_function("setstack", lua_debug_setstack);
+}
+
+void Environment::setup_cache_lib(LuaEngine& engine) {
+    lua_State* L = engine.state();
+
+    lua_newtable(L);
+    lua_pushcfunction(L, lua_cache_invalidate);
+    lua_setfield(L, -2, "invalidate");
+    lua_pushcfunction(L, lua_cache_iscached);
+    lua_setfield(L, -2, "iscached");
+    lua_pushcfunction(L, lua_cache_replace);
+    lua_setfield(L, -2, "replace");
+    lua_setglobal(L, "cache");
+
+    engine.register_function("cache_invalidate", lua_cache_invalidate);
+    engine.register_function("cache_iscached", lua_cache_iscached);
+    engine.register_function("cache_replace", lua_cache_replace);
+}
+
+void Environment::setup_metatable_lib(LuaEngine& engine) {
+    engine.register_function("getrawmetatable", lua_getrawmetatable);
+    engine.register_function("setrawmetatable", lua_setrawmetatable);
+    engine.register_function("setreadonly", lua_setreadonly);
+    engine.register_function("isreadonly", lua_isreadonly);
+    engine.register_function("getnamecallmethod", lua_getnamecallmethod);
+}
+
+void Environment::setup_input_lib(LuaEngine& engine) {
+    engine.register_function("fireclickdetector", lua_fireclickdetector);
+    engine.register_function("firetouchinterest", lua_firetouchinterest);
+    engine.register_function("fireproximityprompt", lua_fireproximityprompt);
+    engine.register_function("setfpscap", lua_setfpscap);
+    engine.register_function("getfps", lua_getfps);
+}
+
+void Environment::setup_instance_lib(LuaEngine& engine) {
+    engine.register_function("getgenv", lua_getgenv);
+    engine.register_function("getrenv", lua_getrenv);
+    engine.register_function("getreg", lua_getreg);
+    engine.register_function("getgc", lua_getgc);
+    engine.register_function("gethui", lua_gethui);
+    engine.register_function("getinstances", lua_getinstances);
+    engine.register_function("getnilinstances", lua_getnilinstances);
+    engine.register_function("getconnections", lua_getconnections);
+}
+
+void Environment::setup_script_lib(LuaEngine& engine) {
+    engine.register_function("getscripts", lua_getscripts);
+    engine.register_function("getrunningscripts", lua_getrunningscripts);
+    engine.register_function("getloadedmodules", lua_getloadedmodules);
+    engine.register_function("getcallingscript", lua_getcallingscript);
+    engine.register_function("isfolder", lua_isfolder);
+    engine.register_function("delfile", lua_delfile);
+}
+
+void Environment::setup_websocket_lib(LuaEngine& engine) {
+    lua_State* L = engine.state();
+    lua_newtable(L);
+    lua_pushcfunction(L, lua_websocket_connect);
+    lua_setfield(L, -2, "connect");
+    lua_setglobal(L, "WebSocket");
+}
+
+void Environment::setup_thread_lib(LuaEngine& engine) {
+    (void)engine;
+}
+
+void Environment::setup_closure_lib(LuaEngine& engine) {
+    Closures::register_all(engine.state());
+}
+
+void Environment::setup_drawing_bridge(LuaEngine& engine) {
+    lua_State* L = engine.state();
+    lua_pushcfunction(L, lua_drawing_new_bridge);
+    lua_setglobal(L, "_oss_drawing_new");
+    lua_pushcfunction(L, lua_drawing_set_bridge);
+    lua_setglobal(L, "_oss_drawing_set");
+    lua_pushcfunction(L, lua_drawing_remove_bridge);
+    lua_setglobal(L, "_oss_drawing_remove");
+}
+
+void Environment::setup_roblox_mock(LuaEngine& engine) {
+    lua_State* L = engine.state();
+    int status = luaL_dostring(L, ROBLOX_MOCK_LUA);
+    if (status != 0) {
+        const char* err = lua_tostring(L, -1);
+        LOG_ERROR("Failed to init Roblox mock: {}", err ? err : "unknown error");
+        lua_pop(L, 1);
+    }
 }
 
 } // namespace oss
