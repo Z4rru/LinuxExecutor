@@ -10,16 +10,16 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
-pkg_check_modules(GLIB REQUIRED glib-2.0)
+pkg_check_modules(GTK4   REQUIRED IMPORTED_TARGET gtk4)
 pkg_check_modules(LUAJIT REQUIRED IMPORTED_TARGET luajit)
-find_package(CURL REQUIRED)
+
+find_package(CURL    REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
 include(FetchContent)
 
-find_package(spdlog 1.12 QUIET)
+find_package(spdlog 1.12 QUIET CONFIG)
 if(NOT spdlog_FOUND)
     message(STATUS "spdlog not found — fetching via FetchContent")
     FetchContent_Declare(spdlog
@@ -30,7 +30,7 @@ if(NOT spdlog_FOUND)
     FetchContent_MakeAvailable(spdlog)
 endif()
 
-find_package(nlohmann_json 3.11 QUIET)
+find_package(nlohmann_json 3.11 QUIET CONFIG)
 if(NOT nlohmann_json_FOUND)
     message(STATUS "nlohmann_json not found — fetching via FetchContent")
     FetchContent_Declare(json
@@ -70,16 +70,20 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
 
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    APP_VERSION="${PROJECT_VERSION}"
+)
+
 target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::GTK4
     PkgConfig::LUAJIT
     CURL::libcurl
     OpenSSL::SSL
     OpenSSL::Crypto
+    Threads::Threads
     spdlog::spdlog
     nlohmann_json::nlohmann_json
     ${CMAKE_DL_LIBS}
-    Threads::Threads
     m
 )
 
@@ -97,8 +101,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/resources
-            $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources
-        COMMENT "Copying resources → build dir")
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources)
 endif()
 
 install(TARGETS ${PROJECT_NAME} DESTINATION bin)
