@@ -969,8 +969,9 @@ int LuaEngine::lua_signal_connect(lua_State* L) {
 
     struct ConnUD { char sig_name[128]; int conn_id; };
     auto* cud = static_cast<ConnUD*>(lua_newuserdata(L, sizeof(ConnUD)));
-    memset(cud->sig_name, 0, sizeof(cud->sig_name));
+        memset(cud->sig_name, 0, sizeof(cud->sig_name));
     strncpy(cud->sig_name, ud->name, sizeof(cud->sig_name) - 1);
+    cud->sig_name[sizeof(cud->sig_name) - 1] = '\0';
     cud->conn_id = conn.id;
     luaL_getmetatable(L, "SignalConnection");
     lua_setmetatable(L, -2);
@@ -1358,5 +1359,6 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
 
 
