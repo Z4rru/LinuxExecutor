@@ -70,15 +70,23 @@ static void read_color(lua_State* L, int idx, double& r, double& g, double& b) {
     if (lua_isnumber(L, -1)) {
         r = lua_tonumber(L, -1); lua_pop(L, 1);
         lua_getfield(L, idx, "G");
-        if (lua_isnumber(L, -1)) g = lua_tonumber(L, -1); lua_pop(L, 1);
+        if (lua_isnumber(L, -1)) g = lua_tonumber(L, -1);
+        lua_pop(L, 1);
         lua_getfield(L, idx, "B");
-        if (lua_isnumber(L, -1)) b = lua_tonumber(L, -1); lua_pop(L, 1);
+        if (lua_isnumber(L, -1)) b = lua_tonumber(L, -1);
+        lua_pop(L, 1);
         return;
     }
     lua_pop(L, 1);
-    lua_rawgeti(L, idx, 1); if (lua_isnumber(L, -1)) r = lua_tonumber(L, -1); lua_pop(L, 1);
-    lua_rawgeti(L, idx, 2); if (lua_isnumber(L, -1)) g = lua_tonumber(L, -1); lua_pop(L, 1);
-    lua_rawgeti(L, idx, 3); if (lua_isnumber(L, -1)) b = lua_tonumber(L, -1); lua_pop(L, 1);
+    lua_rawgeti(L, idx, 1);
+    if (lua_isnumber(L, -1)) r = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_rawgeti(L, idx, 2);
+    if (lua_isnumber(L, -1)) g = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_rawgeti(L, idx, 3);
+    if (lua_isnumber(L, -1)) b = lua_tonumber(L, -1);
+    lua_pop(L, 1);
 }
 
 static void push_vec2(lua_State* L, double x, double y) {
@@ -1350,4 +1358,5 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
 
