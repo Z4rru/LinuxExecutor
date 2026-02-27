@@ -5,12 +5,9 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
-#include <memory>
 #include <optional>
 #include <atomic>
-#include <queue>
 #include <chrono>
-#include <any>
 
 extern "C" {
 #include <luajit-2.1/lua.h>
@@ -26,42 +23,6 @@ struct LuaError {
     std::string message;
     int line = -1;
     std::string source;
-};
-
-struct DrawingObject {
-    enum class Type { Line, Text, Circle, Square, Triangle, Quad, Image };
-
-    int id = 0;
-    Type type = Type::Line;
-    bool visible = false;
-
-    float color_r = 1.0f, color_g = 1.0f, color_b = 1.0f;
-    float transparency = 0.0f;
-    float thickness = 1.0f;
-    int z_index = 0;
-
-    float from_x = 0, from_y = 0;
-    float to_x = 0, to_y = 0;
-
-    std::string text;
-    float text_size = 14.0f;
-    float pos_x = 0, pos_y = 0;
-    bool center = false;
-    bool outline = false;
-    float outline_r = 0, outline_g = 0, outline_b = 0;
-    int font = 0;
-
-    float radius = 50.0f;
-    int num_sides = 32;
-    bool filled = false;
-
-    float size_x = 100.0f, size_y = 100.0f;
-    float rounding = 0;
-
-    float pa_x = 0, pa_y = 0;
-    float pb_x = 0, pb_y = 0;
-    float pc_x = 0, pc_y = 0;
-    float pd_x = 0, pd_y = 0;
 };
 
 struct ScheduledTask {
@@ -92,8 +53,6 @@ class LuaEngine {
 public:
     using OutputCallback = std::function<void(const std::string&)>;
     using ErrorCallback = std::function<void(const LuaError&)>;
-    using DrawCallback = std::function<void(const DrawingObject&)>;
-    using DrawRemoveCallback = std::function<void(int)>;
 
     LuaEngine();
     ~LuaEngine();
@@ -113,8 +72,6 @@ public:
 
     void set_output_callback(OutputCallback cb) { output_cb_ = std::move(cb); }
     void set_error_callback(ErrorCallback cb) { error_cb_ = std::move(cb); }
-    void set_draw_callback(DrawCallback cb) { draw_cb_ = std::move(cb); }
-    void set_draw_remove_callback(DrawRemoveCallback cb) { draw_remove_cb_ = std::move(cb); }
 
     void register_function(const std::string& name, lua_CFunction func);
     void register_library(const std::string& name, const luaL_Reg* funcs);
@@ -128,11 +85,6 @@ public:
     lua_State* state() { return L_; }
     bool is_running() const { return running_.load(std::memory_order_acquire); }
     void stop() { running_.store(false, std::memory_order_release); }
-
-    DrawingObject* get_drawing(int id);
-    const std::unordered_map<int, DrawingObject>& get_all_drawings() const { return drawings_; }
-    void remove_drawing(int id);
-    void clear_drawings();
 
     int fire_signal(const std::string& name, int nargs = 0);
     Signal* get_signal(const std::string& name);
@@ -196,7 +148,10 @@ private:
     static int lua_drawing_newindex(lua_State* L);
     static int lua_drawing_remove(lua_State* L);
     static int lua_drawing_gc(lua_State* L);
+    static int lua_drawing_tostring(lua_State* L);
     static int lua_drawing_clear(lua_State* L);
+    static int lua_drawing_is_rendered(lua_State* L);
+    static int lua_drawing_get_screen_size(lua_State* L);
 
     static int lua_signal_new(lua_State* L);
     static int lua_signal_connect(lua_State* L);
@@ -210,12 +165,7 @@ private:
     std::atomic<bool> running_{false};
     OutputCallback output_cb_;
     ErrorCallback error_cb_;
-    DrawCallback draw_cb_;
-    DrawRemoveCallback draw_remove_cb_;
     mutable std::mutex mutex_;
-
-    std::unordered_map<int, DrawingObject> drawings_;
-    int next_drawing_id_ = 1;
 
     std::vector<ScheduledTask> tasks_;
     int next_task_id_ = 1;
