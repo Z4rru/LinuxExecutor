@@ -10,16 +10,15 @@ Console::Console() {
     container_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_add_css_class(container_, "console-view");
 
-    // Console header
     GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_widget_set_margin_start(header, 8);
     gtk_widget_set_margin_end(header, 8);
     gtk_widget_set_margin_top(header, 4);
     gtk_widget_set_margin_bottom(header, 4);
 
-    GtkWidget* label = gtk_label_new("Console");
-    gtk_widget_add_css_class(label, "console-title");
-    gtk_box_append(GTK_BOX(header), label);
+    header_label_ = gtk_label_new("Console");
+    gtk_widget_add_css_class(header_label_, "console-title");
+    gtk_box_append(GTK_BOX(header), header_label_);
 
     GtkWidget* spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_hexpand(spacer, TRUE);
@@ -34,7 +33,6 @@ Console::Console() {
 
     gtk_box_append(GTK_BOX(container_), header);
 
-    // Text view
     scroll_ = gtk_scrolled_window_new();
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
@@ -53,11 +51,11 @@ Console::Console() {
 
     buffer_ = gtk_text_view_get_buffer(text_view_);
 
-    gtk_text_buffer_create_tag(buffer_, "output",    "foreground", "#e6edf3", NULL);
-    gtk_text_buffer_create_tag(buffer_, "error",     "foreground", "#f85149", NULL);
-    gtk_text_buffer_create_tag(buffer_, "warn",      "foreground", "#d29922", NULL);
-    gtk_text_buffer_create_tag(buffer_, "info",      "foreground", "#58a6ff", NULL);
-    gtk_text_buffer_create_tag(buffer_, "system",    "foreground", "#8b949e",
+    gtk_text_buffer_create_tag(buffer_, "output", "foreground", "#e6edf3", NULL);
+    gtk_text_buffer_create_tag(buffer_, "error", "foreground", "#f85149", NULL);
+    gtk_text_buffer_create_tag(buffer_, "warn", "foreground", "#d29922", NULL);
+    gtk_text_buffer_create_tag(buffer_, "info", "foreground", "#58a6ff", NULL);
+    gtk_text_buffer_create_tag(buffer_, "system", "foreground", "#8b949e",
                                "style", PANGO_STYLE_ITALIC, NULL);
     gtk_text_buffer_create_tag(buffer_, "timestamp", "foreground", "#484f58",
                                "scale", 0.85, NULL);
@@ -65,29 +63,49 @@ Console::Console() {
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll_),
                                   GTK_WIDGET(text_view_));
     gtk_box_append(GTK_BOX(container_), scroll_);
+
+    setup_input_bar();
 }
 
-Console::~Console() {}
+Console::~Console() {
+    input_waiting_.store(false);
+    input_cv_.notify_all();
+}
 
-// ═══════════════════════════════════════════════════════════════
-// FIX #1: DEADLOCK
-//
-// BEFORE:
-//   print() locks mutex_
-//     → detects "\x1B[CLEAR]"
-//     → calls clear()
-//     → clear() tries to lock mutex_   ← DEADLOCK (std::mutex)
-//
-// AFTER:
-//   print() locks mutex_
-//     → detects "\x1B[CLEAR]"
-//     → calls clear_unlocked()         ← no second lock
-//   clear() is the PUBLIC entry point  ← locks once, calls _unlocked
-// ═══════════════════════════════════════════════════════════════
+void Console::setup_input_bar() {
+    input_bar_ = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_margin_start(input_bar_, 8);
+    gtk_widget_set_margin_end(input_bar_, 8);
+    gtk_widget_set_margin_top(input_bar_, 4);
+    gtk_widget_set_margin_bottom(input_bar_, 4);
+
+    input_prompt_label_ = gtk_label_new(">");
+    gtk_widget_add_css_class(input_prompt_label_, "console-prompt");
+    gtk_box_append(GTK_BOX(input_bar_), input_prompt_label_);
+
+    input_entry_ = gtk_entry_new();
+    gtk_widget_set_hexpand(input_entry_, TRUE);
+    gtk_widget_add_css_class(input_entry_, "console-input");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(input_entry_), "Enter input...");
+
+    g_signal_connect_swapped(input_entry_, "activate", G_CALLBACK(+[](gpointer data) {
+        auto* self = static_cast<Console*>(data);
+        const char* text = gtk_editable_get_text(GTK_EDITABLE(self->input_entry_));
+        if (text && text[0] != '\0') {
+            std::string input(text);
+            gtk_editable_set_text(GTK_EDITABLE(self->input_entry_), "");
+            self->submit_input(input);
+        }
+    }), this);
+    gtk_box_append(GTK_BOX(input_bar_), input_entry_);
+
+    gtk_widget_set_visible(input_bar_, FALSE);
+    gtk_box_append(GTK_BOX(container_), input_bar_);
+}
+
 void Console::print(const std::string& msg, Level level) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Handle rconsole.clear() signal without re-locking
     if (msg == "\x1B[CLEAR]") {
         clear_unlocked();
         return;
@@ -100,46 +118,140 @@ void Console::print(const std::string& msg, Level level) {
         entries_.pop_front();
     }
 
-    // ═══════════════════════════════════════════════════════
-    // FIX #1b: REMOVED the pointless g_idle_add that allocated
-    // an Entry, then immediately deleted it without using it.
-    //
-    // BEFORE:
-    //   auto* data = new Entry(entry);
-    //   g_idle_add([](gpointer ud) -> gboolean {
-    //       delete static_cast<Entry*>(ud);   // ← does nothing useful
-    //       return G_SOURCE_REMOVE;
-    //   }, data);
-    //
-    // The actual rendering was already done by append_entry()
-    // called directly below.  The idle callback was pure waste
-    // (and leaked if the main loop was blocked).
-    // ═══════════════════════════════════════════════════════
-
     append_entry(entry);
 }
 
-// PUBLIC clear — locks mutex, then delegates
 void Console::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     clear_unlocked();
 }
 
-// PRIVATE clear — called with mutex_ already held
 void Console::clear_unlocked() {
     entries_.clear();
     gtk_text_buffer_set_text(buffer_, "", 0);
+}
+
+void Console::create_console(const std::string& title) {
+    console_name_ = title;
+    gtk_label_set_text(GTK_LABEL(header_label_), title.c_str());
+    console_visible_.store(true, std::memory_order_release);
+    gtk_widget_set_visible(container_, TRUE);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    Entry entry{"Console created: " + title, Level::System, get_timestamp()};
+    entries_.push_back(entry);
+    append_entry(entry);
+}
+
+void Console::destroy_console() {
+    console_visible_.store(false, std::memory_order_release);
+
+    input_waiting_.store(false);
+    input_cv_.notify_all();
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    clear_unlocked();
+}
+
+bool Console::is_console_visible() const {
+    return console_visible_.load(std::memory_order_acquire);
+}
+
+void Console::set_console_name(const std::string& name) {
+    console_name_ = name;
+    gtk_label_set_text(GTK_LABEL(header_label_), name.c_str());
+}
+
+std::string Console::get_console_name() const {
+    return console_name_;
+}
+
+std::string Console::request_input(const std::string& prompt) {
+    if (!prompt.empty()) {
+        gtk_label_set_text(GTK_LABEL(input_prompt_label_), prompt.c_str());
+    } else {
+        gtk_label_set_text(GTK_LABEL(input_prompt_label_), ">");
+    }
+
+    gtk_widget_set_visible(input_bar_, TRUE);
+    gtk_widget_grab_focus(input_entry_);
+
+    input_waiting_.store(true, std::memory_order_release);
+
+    std::unique_lock<std::mutex> lock(input_mutex_);
+    input_cv_.wait(lock, [this] {
+        return !input_waiting_.load(std::memory_order_acquire);
+    });
+
+    gtk_widget_set_visible(input_bar_, FALSE);
+
+    return pending_input_;
+}
+
+void Console::submit_input(const std::string& text) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Entry entry{"> " + text, Level::Info, get_timestamp()};
+        entries_.push_back(entry);
+        append_entry(entry);
+    }
+
+    if (input_cb_) {
+        input_cb_(text);
+    }
+
+    if (input_waiting_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(input_mutex_);
+        pending_input_ = text;
+        input_waiting_.store(false, std::memory_order_release);
+        input_cv_.notify_one();
+    }
+}
+
+void Console::set_input_callback(InputCallback cb) {
+    input_cb_ = std::move(cb);
+}
+
+void Console::set_word_wrap(bool enabled) {
+    gtk_text_view_set_wrap_mode(text_view_,
+        enabled ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
+}
+
+void Console::set_font_size(int size) {
+    std::string css = "textview { font-size: " + std::to_string(size) + "pt; }";
+    GtkCssProvider* provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_string(provider, css.c_str());
+    gtk_style_context_add_provider(
+        gtk_widget_get_style_context(GTK_WIDGET(text_view_)),
+        GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(provider);
+}
+
+void Console::set_show_timestamps(bool show) {
+    show_timestamps_ = show;
+    rebuild_display();
+}
+
+void Console::rebuild_display() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    gtk_text_buffer_set_text(buffer_, "", 0);
+    for (const auto& entry : entries_) {
+        append_entry(entry);
+    }
 }
 
 void Console::append_entry(const Entry& entry) {
     GtkTextIter end;
     gtk_text_buffer_get_end_iter(buffer_, &end);
 
-    std::string ts = "[" + entry.timestamp + "] ";
-    gtk_text_buffer_insert_with_tags_by_name(
-        buffer_, &end, ts.c_str(), -1, "timestamp", NULL);
+    if (show_timestamps_) {
+        std::string ts = "[" + entry.timestamp + "] ";
+        gtk_text_buffer_insert_with_tags_by_name(
+            buffer_, &end, ts.c_str(), -1, "timestamp", NULL);
+        gtk_text_buffer_get_end_iter(buffer_, &end);
+    }
 
-    gtk_text_buffer_get_end_iter(buffer_, &end);
     std::string msg = entry.message + "\n";
     gtk_text_buffer_insert_with_tags_by_name(
         buffer_, &end, msg.c_str(), -1, level_tag(entry.level), NULL);
@@ -156,10 +268,10 @@ void Console::scroll_to_bottom() {
 }
 
 std::string Console::get_timestamp() {
-    auto now  = std::chrono::system_clock::now();
+    auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
-    auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now.time_since_epoch()) % 1000;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now.time_since_epoch()) % 1000;
 
     std::stringstream ss;
     ss << std::put_time(std::localtime(&time), "%H:%M:%S");
