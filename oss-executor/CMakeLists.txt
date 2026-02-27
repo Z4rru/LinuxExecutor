@@ -9,8 +9,6 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# ── Dependencies ──────────────────────────────────────────────
-
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
 pkg_check_modules(GLIB REQUIRED glib-2.0)
@@ -18,8 +16,6 @@ pkg_check_modules(LUAJIT REQUIRED IMPORTED_TARGET luajit)
 find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
-
-# ── Optional: spdlog / nlohmann_json with FetchContent fallback
 
 include(FetchContent)
 
@@ -44,9 +40,6 @@ if(NOT nlohmann_json_FOUND)
     FetchContent_MakeAvailable(json)
 endif()
 
-# ── Source Files ──────────────────────────────────────────────
-# NOTE: http.cpp is NOT listed — http.hpp is header-only
-
 set(SOURCES
     src/main.cpp
     src/core/executor.cpp
@@ -63,6 +56,7 @@ set(SOURCES
     src/ui/console.cpp
     src/ui/editor.cpp
     src/ui/file_dialog.cpp
+    src/ui/overlay.cpp
     src/ui/tabs.cpp
     src/ui/theme.cpp
     src/utils/config.cpp
