@@ -284,4 +284,31 @@ void Executor::auto_execute() {
         for (const auto& s : scripts) {
             LOG_INFO("Auto-executing: {}", s.filename().string());
             if (output_cb_)
-                
+                output_cb_("[autoexec] Running " + s.filename().string());
+            execute_file(s.string());
+        }
+
+        if (!scripts.empty())
+            LOG_INFO("Auto-executed {} scripts", scripts.size());
+    } catch (const std::filesystem::filesystem_error& e) {
+        LOG_ERROR("Auto-execute failed: {}", e.what());
+        if (error_cb_) error_cb_("Auto-execute error: " + std::string(e.what()));
+    }
+}
+
+std::vector<ExecutionResult> Executor::get_history() const {
+    std::lock_guard<std::mutex> lock(history_mutex_);
+    return execution_history_;
+}
+
+void Executor::clear_history() {
+    std::lock_guard<std::mutex> lock(history_mutex_);
+    execution_history_.clear();
+}
+
+void Executor::set_output_callback(OutputCallback cb) { output_cb_ = std::move(cb); }
+void Executor::set_error_callback(ErrorCallback cb) { error_cb_ = std::move(cb); }
+void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(cb); }
+void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
+
+} // namespace oss
