@@ -8,34 +8,6 @@
 
 namespace oss {
 
-// ═══════════════════════════════════════════════════════════════
-// FIX #6: PHANTOM EXEC — COMPREHENSIVE ROBLOX API MOCK
-//
-// The ESP script loaded via loadstring(game:HttpGet(...))() does:
-//
-//   local Players = game:GetService("Players")       ← needs GetService
-//   local Camera  = workspace.CurrentCamera           ← needs workspace global
-//   RunService.RenderStepped:Connect(function(dt)     ← needs event system
-//       for _, player in pairs(Players:GetPlayers())  ← needs GetPlayers
-//           ...
-//
-// BEFORE: game = { HttpGet = <cfunction> }
-//         → game:GetService("Players") errors: "attempt to call nil"
-//         → warn("Phantom exec:")
-//
-// AFTER:  Full proxy-based mock with:
-//         • game:GetService(name) returning service stubs
-//         • workspace global with CurrentCamera
-//         • Signal objects with :Connect(), :Wait()
-//         • Instance.new() returning proxy objects
-//         • Vector3, CFrame, Color3, UDim2 math types
-//         • typeof() checking __type metafield
-//
-// Scripts won't render ESP boxes (no real rendering backend),
-// but they won't CRASH either.  They execute cleanly and the
-// user sees "Script loaded" instead of "Phantom exec:".
-// ═══════════════════════════════════════════════════════════════
-
 // ── C-side helpers registered into Lua ──────────────────────────
 
 // typeof() — checks for __type in metatable, falls back to type()
@@ -43,23 +15,47 @@ static int lua_typeof(lua_State* L) {
     if (lua_getmetatable(L, 1)) {
         lua_getfield(L, -1, "__type");
         if (lua_isstring(L, -1)) {
-            return 1;   // return the __type string
+            return 1;
         }
-        lua_pop(L, 2);  // pop nil + metatable
+        lua_pop(L, 2);
     }
     lua_pushstring(L, luaL_typename(L, 1));
     return 1;
 }
 
-// game:HttpGet(url) — downloads URL body via libcurl
+// ═══════════════════════════════════════════════════════════════
+// ★ FIX: game:HttpGet(url) — SELF-PARAMETER CRASH
+//
+// BEFORE:
+//   const char* url = luaL_checkstring(L, 1);   ← THROWS when arg1 is table
+//   if (lua_istable(L, 1)) {                     ← never reached
+//       url = luaL_checkstring(L, 2);
+//
+// When Lua executes game:HttpGet(url), it desugars to
+// game.HttpGet(game, url), so the C function receives:
+//   stack[1] = game   (table)
+//   stack[2] = url    (string)
+//
+// luaL_checkstring(L, 1) immediately throws:
+//   "string expected, got table"
+//
+// AFTER:
+//   Check lua_type FIRST (non-throwing), then luaL_checkstring
+//   on the correct index.
+// ═══════════════════════════════════════════════════════════════
 static int lua_http_get(lua_State* L) {
-    const char* url = luaL_checkstring(L, 1);
+    // Determine which argument holds the URL
+    int url_index = 1;
 
-    // Accept both game:HttpGet(url) and game.HttpGet(url)
-    // If called as method, arg 1 is self (table), arg 2 is url
-    if (lua_istable(L, 1) || lua_isuserdata(L, 1)) {
-        url = luaL_checkstring(L, 2);
+    // Method call: game:HttpGet(url) → args are (self, url)
+    // self can be a table (mock game) or userdata (real instance)
+    int arg1_type = lua_type(L, 1);
+    if (arg1_type == LUA_TTABLE || arg1_type == LUA_TUSERDATA) {
+        url_index = 2;
     }
+
+    // NOW it's safe to checkstring — we know which arg is the URL
+    const char* url = luaL_checkstring(L, url_index);
 
     try {
         auto response = Http::instance().get(url);
@@ -82,13 +78,15 @@ static int lua_http_request(lua_State* L) {
 
     lua_getfield(L, 1, "Url");
     if (!lua_isstring(L, -1)) {
-        lua_getfield(L, 1, "url");  // try lowercase
+        lua_pop(L, 1);
+        lua_getfield(L, 1, "url");
     }
     const char* url = luaL_optstring(L, -1, "");
     lua_pop(L, 1);
 
     lua_getfield(L, 1, "Method");
     if (!lua_isstring(L, -1)) {
+        lua_pop(L, 1);
         lua_getfield(L, 1, "method");
     }
     std::string method = luaL_optstring(L, -1, "GET");
@@ -104,7 +102,6 @@ static int lua_http_request(lua_State* L) {
         resp = Http::instance().get(url);
     }
 
-    // Return {StatusCode=N, Body="...", Success=bool, Headers={}}
     lua_newtable(L);
     lua_pushinteger(L, resp.status_code);
     lua_setfield(L, -2, "StatusCode");
@@ -130,8 +127,6 @@ static int lua_identify_executor(lua_State* L) {
 }
 
 // ── The big Lua-side mock setup ─────────────────────────────────
-// This runs once during Environment::setup() and creates the full
-// Roblox API surface as Lua tables with metatables.
 
 static const char* ROBLOX_MOCK_LUA = R"LUA(
 -- ═════════════════════════════════════════════════════════════
@@ -171,7 +166,7 @@ end
 Signal.connect = Signal.Connect
 
 function Signal:Wait()
-    return 0   -- immediate return, no yield
+    return 0
 end
 
 function Signal:Fire(...)
@@ -192,7 +187,7 @@ function Vector3.new(x, y, z)
         X = x or 0, Y = y or 0, Z = z or 0,
         x = x or 0, y = y or 0, z = z or 0,
         Magnitude = math.sqrt((x or 0)^2 + (y or 0)^2 + (z or 0)^2),
-        Unit = nil,  -- set below
+        Unit = nil,
     }, Vector3)
 end
 Vector3.zero = Vector3.new(0, 0, 0)
@@ -282,7 +277,6 @@ function Color3.fromRGB(r, g, b)
     return Color3.new((r or 0)/255, (g or 0)/255, (b or 0)/255)
 end
 function Color3.fromHSV(h, s, v)
-    -- simplified HSV→RGB
     local c = v * s
     local x = c * (1 - math.abs((h * 6) % 2 - 1))
     local m = v - c
@@ -340,7 +334,6 @@ CFrame.__type  = "CFrame"
 
 function CFrame.new(x, y, z)
     if type(x) == "table" and x.X then
-        -- CFrame.new(Vector3)
         return setmetatable({
             Position   = x,
             X = x.X, Y = x.Y, Z = x.Z,
@@ -387,12 +380,6 @@ function CFrame.__tostring(cf)
 end
 
 -- ── Instance mock ────────────────────────────────────────────
--- Creates a table that looks like a Roblox Instance:
---   • .Name, .ClassName, .Parent
---   • :IsA(), :FindFirstChild(), :GetChildren(), :Destroy()
---   • Arbitrary property read/write via __index/__newindex
---   • Children stored internally
-
 local function make_instance(class_name, name, parent)
     local children = {}
     local properties = {}
@@ -404,13 +391,11 @@ local function make_instance(class_name, name, parent)
         __tostring = function() return name or class_name end,
     }
 
-    -- Property access
     mt.__index = function(self, key)
         if key == "Name"      then return name or class_name end
         if key == "ClassName" then return class_name end
         if key == "Parent"    then return parent end
 
-        -- Methods
         if key == "IsA" then
             return function(_, check)
                 return check == class_name or check == "Instance"
@@ -447,7 +432,7 @@ local function make_instance(class_name, name, parent)
             return function() return children end
         end
         if key == "GetDescendants" then
-            return function() return children end  -- simplified
+            return function() return children end
         end
         if key == "Clone" then
             return function()
@@ -455,23 +440,19 @@ local function make_instance(class_name, name, parent)
             end
         end
         if key == "Destroy" or key == "Remove" then
-            return function() end  -- no-op
+            return function() end
         end
         if key == "ClearAllChildren" then
             return function() children = {} end
         end
 
-        -- Events
         if key == "Changed" or key == "ChildAdded" or key == "ChildRemoved"
            or key == "AncestryChanged" or key == "Destroying" then
             if not events[key] then events[key] = Signal.new(key) end
             return events[key]
         end
 
-        -- Stored properties
         if properties[key] ~= nil then return properties[key] end
-
-        -- Unknown — return nil (not error)
         return nil
     end
 
@@ -493,7 +474,6 @@ local InstanceModule = {}
 function InstanceModule.new(class_name, parent)
     local inst, children, props = make_instance(class_name, class_name, parent)
 
-    -- Set defaults based on class
     if class_name == "ScreenGui" or class_name == "BillboardGui"
        or class_name == "SurfaceGui" then
         props.Enabled = true
@@ -508,7 +488,7 @@ function InstanceModule.new(class_name, parent)
         props.Text = ""
         props.TextColor3 = Color3.new(0, 0, 0)
         props.TextSize = 14
-        props.Font = 0  -- Enum.Font.Legacy
+        props.Font = 0
         props.ZIndex = 1
     elseif class_name == "Part" or class_name == "MeshPart"
            or class_name == "UnionOperation" then
@@ -521,7 +501,7 @@ function InstanceModule.new(class_name, parent)
         props.BrickColor = "Medium stone grey"
         props.Color = Color3.fromRGB(163, 162, 165)
     elseif class_name == "Folder" then
-        -- just a container
+        -- container
     elseif class_name == "UICorner" then
         props.CornerRadius = UDim.new(0, 8)
     elseif class_name == "UIStroke" then
@@ -534,7 +514,6 @@ function InstanceModule.new(class_name, parent)
 end
 
 -- ── Drawing library mock ─────────────────────────────────────
--- ESP scripts use Drawing.new("Line"), Drawing.new("Text"), etc.
 local DrawingMT = {}
 DrawingMT.__index = DrawingMT
 DrawingMT.__type  = "Drawing"
@@ -555,10 +534,8 @@ function Drawing.new(class_name)
         Transparency = 0,
         Thickness    = 1,
         ZIndex       = 0,
-        -- Line
         From         = Vector2.new(0, 0),
         To           = Vector2.new(0, 0),
-        -- Text
         Text         = "",
         Size         = 14,
         Center       = false,
@@ -567,19 +544,15 @@ function Drawing.new(class_name)
         Position     = Vector2.new(0, 0),
         TextBounds   = Vector2.new(0, 0),
         Font         = 0,
-        -- Circle
         Radius       = 50,
         NumSides     = 32,
         Filled       = false,
-        -- Square / Quad
         PointA       = Vector2.new(0, 0),
         PointB       = Vector2.new(0, 0),
         PointC       = Vector2.new(0, 0),
         PointD       = Vector2.new(0, 0),
-        -- Image
         Data         = "",
         Rounding     = 0,
-        -- Meta
         _class       = class_name or "Line",
     }
 
@@ -623,9 +596,7 @@ local function get_camera()
     props.CameraType      = EnumMock.CameraType.Custom
     props.CameraSubject   = nil
 
-    -- Camera:WorldToViewportPoint / WorldToScreenPoint
     rawset(cam, "WorldToViewportPoint", function(_, v3)
-        -- stub: return center of screen + depth + visible
         return Vector3.new(960, 540, (v3 and v3.Z or 10)), true
     end)
     rawset(cam, "WorldToScreenPoint", function(self, v3)
@@ -654,7 +625,6 @@ local function make_service(name)
         lp_props.TeamColor       = Color3.new(1, 1, 1)
         lp_props.Team            = nil
 
-        -- Character stub
         local char, char_children = make_instance("Model", "LocalPlayer")
         local hrp, _, hrp_props   = make_instance("Part", "HumanoidRootPart", char)
         hrp_props.Position = Vector3.new(0, 3, 0)
@@ -694,7 +664,6 @@ local function make_service(name)
             return { lp }
         end)
 
-        -- Events
         props.PlayerAdded   = Signal.new("PlayerAdded")
         props.PlayerRemoving = Signal.new("PlayerRemoving")
 
@@ -707,7 +676,6 @@ local function make_service(name)
         rawset(svc, "IsServer", function() return false end)
         rawset(svc, "IsStudio", function() return false end)
         rawset(svc, "BindToRenderStep", function(_, name_arg, priority, fn)
-            -- Store but don't fire
             if type(fn) == "function" then
                 props.RenderStepped:Connect(fn)
             end
@@ -719,7 +687,7 @@ local function make_service(name)
         props.Gravity        = 196.2
         props.DistributedGameTime = 0
         rawset(svc, "Raycast", function(_, origin, direction, params)
-            return nil  -- no hit
+            return nil
         end)
 
     elseif name == "UserInputService" then
@@ -739,7 +707,6 @@ local function make_service(name)
         rawset(svc, "IsMouseButtonPressed", function() return false end)
 
     elseif name == "CoreGui" or name == "StarterGui" then
-        -- container for ScreenGuis
         rawset(svc, "SetCoreGuiEnabled", function() end)
         rawset(svc, "GetCoreGuiEnabled", function() return true end)
 
@@ -756,12 +723,10 @@ local function make_service(name)
 
     elseif name == "HttpService" then
         rawset(svc, "JSONEncode", function(_, obj)
-            -- minimal: just tostring tables
             if type(obj) == "string" then return '"' .. obj .. '"' end
             return tostring(obj)
         end)
         rawset(svc, "JSONDecode", function(_, str)
-            -- can't do real JSON in pure Lua without a library
             return {}
         end)
         rawset(svc, "GenerateGUID", function(_, wrap)
@@ -786,16 +751,20 @@ local function make_service(name)
     return svc
 end
 
--- ── game object ──────────────────────────────────────────────
--- The actual `game` global that scripts interact with
-
+-- ═════════════════════════════════════════════════════════════
+-- ★ FIX: game:HttpGet now works because the C-side
+-- lua_http_get checks lua_type BEFORE luaL_checkstring.
+--
+-- The __index metamethod returns the C function, then Lua
+-- calls it as game.HttpGet(game, url) — the C function
+-- sees arg1=table, shifts to arg2 for the URL.
+-- ═════════════════════════════════════════════════════════════
 local game_mt = {
     __type = "DataModel",
     __tostring = function() return "Game" end,
 }
 
 game_mt.__index = function(self, key)
-    -- Methods
     if key == "GetService" then
         return function(_, service_name)
             return make_service(service_name)
@@ -807,17 +776,15 @@ game_mt.__index = function(self, key)
         end
     end
 
-    -- HttpGet/HttpPost — connected to real HTTP via C
     if key == "HttpGet" or key == "HttpGetAsync" then
-        return _G._oss_http_get   -- set from C side
+        return _G._oss_http_get
     end
     if key == "HttpPost" or key == "HttpPostAsync" then
         return function(_, url, body)
-            return ""  -- stub
+            return ""
         end
     end
 
-    -- Properties
     if key == "PlaceId"      then return 0 end
     if key == "PlaceVersion" then return 1 end
     if key == "GameId"       then return 0 end
@@ -825,14 +792,12 @@ game_mt.__index = function(self, key)
     if key == "CreatorId"    then return 0 end
     if key == "CreatorType"  then return "User" end
 
-    -- IsA
     if key == "IsA" then
         return function(_, class)
             return class == "DataModel" or class == "Instance"
         end
     end
 
-    -- FindFirstChild/WaitForChild — try as service
     if key == "FindFirstChild" or key == "WaitForChild" then
         return function(_, name)
             return make_service(name)
@@ -847,7 +812,6 @@ game_mt.__index = function(self, key)
         return function() end
     end
 
-    -- Service shorthand: game.Workspace, game.Players, etc.
     local ok, svc = pcall(make_service, key)
     if ok and svc then return svc end
 
@@ -856,14 +820,11 @@ end
 
 game = setmetatable({}, game_mt)
 
--- ── Global aliases ───────────────────────────────────────────
 workspace = make_service("Workspace")
 
--- Roblox globals
 Instance = InstanceModule
 Enum     = EnumMock
 
--- Overwrite type constructors
 _G.Vector3 = Vector3
 _G.Vector2 = Vector2
 _G.Color3  = Color3
@@ -872,9 +833,7 @@ _G.UDim2   = UDim2
 _G.CFrame  = CFrame
 _G.Drawing = Drawing
 
--- Roblox global functions
 wait = function(t)
-    -- Can't truly yield in this sandbox, just return elapsed
     return t or 0, t or 0
 end
 
@@ -894,7 +853,6 @@ time = function()
     return os.clock()
 end
 
--- task library
 task = {
     wait  = function(t) return t or 0 end,
     spawn = function(fn, ...) if type(fn) == "function" then pcall(fn, ...) end end,
@@ -905,11 +863,9 @@ task = {
     desynchronize = function() end,
 }
 
--- shared / _G
 shared = shared or {}
 _G     = _G    or {}
 
--- TweenInfo
 TweenInfo = {}
 function TweenInfo.new(time_val, style, direction, repeat_count, reverses, delay_time)
     return {
@@ -922,7 +878,6 @@ function TweenInfo.new(time_val, style, direction, repeat_count, reverses, delay
     }
 end
 
--- Ray
 Ray = {}
 function Ray.new(origin, direction)
     return {
@@ -932,7 +887,6 @@ function Ray.new(origin, direction)
     }
 end
 
--- RaycastParams
 RaycastParams = {}
 function RaycastParams.new()
     return {
@@ -941,7 +895,6 @@ function RaycastParams.new()
     }
 end
 
--- NumberSequence / ColorSequence
 NumberSequenceKeypoint = {}
 function NumberSequenceKeypoint.new(t, v, e)
     return { Time = t or 0, Value = v or 0, Envelope = e or 0 }
@@ -974,7 +927,6 @@ function ColorSequence.new(...)
     return { Keypoints = args[1] or {} }
 end
 
--- BrickColor
 BrickColor = {}
 function BrickColor.new(name_or_r, g, b)
     if type(name_or_r) == "string" then
@@ -983,7 +935,6 @@ function BrickColor.new(name_or_r, g, b)
     return { Name = "Custom", Color = Color3.fromRGB(name_or_r or 0, g or 0, b or 0) }
 end
 
--- string.split (Roblox extension)
 if not string.split then
     function string.split(str, sep)
         sep = sep or ","
@@ -998,7 +949,6 @@ if not string.split then
     end
 end
 
--- ── Executor-specific globals ────────────────────────────────
 syn = {
     request = _G._oss_http_request or function() return {} end,
     crypt = {
@@ -1040,31 +990,18 @@ fireproximityprompt = function() end
 setclipboard = function() end
 getclipboard = function() return "" end
 
--- File system stubs
-readfile    = function(path) return "" end
-writefile   = function(path, data) end
-appendfile  = function(path, data) end
-isfile      = function(path) return false end
-isfolder    = function(path) return false end
-listfiles   = function(path) return {} end
-makefolder  = function(path) end
-delfolder   = function(path) end
-delfile     = function(path) end
-
--- ── Done ─────────────────────────────────────────────────────
--- The ESP script can now call:
---   game:GetService("Players")           → returns Player service mock
---   workspace.CurrentCamera               → returns Camera mock
---   RunService.RenderStepped:Connect(fn)  → stores fn, doesn't fire
---   Drawing.new("Line")                   → returns Drawing mock
---
--- Scripts execute without error.  Visuals won't render (no GPU backend
--- in sandbox), but the loadstring chain completes successfully.
+readfile    = readfile    or function(path) return "" end
+writefile   = writefile   or function(path, data) end
+appendfile  = appendfile  or function(path, data) end
+isfile      = isfile      or function(path) return false end
+isfolder    = isfolder    or function(path) return false end
+listfiles   = listfiles   or function(path) return {} end
+makefolder  = makefolder  or function(path) end
+delfolder   = delfolder   or function(path) end
+delfile     = delfile     or function(path) end
 
 )LUA";
 
-// ═══════════════════════════════════════════════════════════════
-// Environment::setup — registers C functions + runs Lua mock
 // ═══════════════════════════════════════════════════════════════
 
 void Environment::setup(LuaEngine& engine) {
@@ -1076,25 +1013,20 @@ void Environment::setup(LuaEngine& engine) {
 
     // ── Register C functions that need real system access ────
 
-    // _oss_http_get — used by game:HttpGet() in the Lua mock
     lua_pushcfunction(L, lua_http_get);
     lua_setglobal(L, "_oss_http_get");
 
-    // _oss_http_request — used by syn.request / http.request
     lua_pushcfunction(L, lua_http_request);
     lua_setglobal(L, "_oss_http_request");
 
-    // typeof — checks __type in metatable
     lua_pushcfunction(L, lua_typeof);
     lua_setglobal(L, "typeof");
 
-    // identifyexecutor / getexecutorname
     lua_pushcfunction(L, lua_identify_executor);
     lua_setglobal(L, "identifyexecutor");
     lua_pushcfunction(L, lua_identify_executor);
     lua_setglobal(L, "getexecutorname");
 
-    // printidentity
     lua_pushcfunction(L, [](lua_State* L) -> int {
         lua_pushstring(L, "Current identity is 7");
         return 1;
@@ -1114,4 +1046,3 @@ void Environment::setup(LuaEngine& engine) {
 }
 
 } // namespace oss
-
