@@ -687,7 +687,7 @@ int LuaEngine::lua_drawing_new(lua_State* L) {
     if (type_name == "Line") obj.type = DrawingObject::Type::Line;
     else if (type_name == "Circle") obj.type = DrawingObject::Type::Circle;
     else if (type_name == "Square" || type_name == "Rectangle")
-        obj.type = DrawingObject::Type::Rectangle;
+        obj.type = DrawingObject::Type::Square;
     else if (type_name == "Triangle") obj.type = DrawingObject::Type::Triangle;
     else if (type_name == "Text") obj.type = DrawingObject::Type::Text;
     else if (type_name == "Quad") obj.type = DrawingObject::Type::Quad;
@@ -724,11 +724,11 @@ int LuaEngine::lua_drawing_index(lua_State* L) {
     if (k == "Visible") { lua_pushboolean(L, obj->visible); return 1; }
     if (k == "Color") {
         lua_newtable(L);
-        lua_pushnumber(L, ((obj->color >> 16) & 0xFF) / 255.0);
+        lua_pushnumber(L, obj->color_r);
         lua_setfield(L, -2, "R");
-        lua_pushnumber(L, ((obj->color >> 8) & 0xFF) / 255.0);
+        lua_pushnumber(L, obj->color_g);
         lua_setfield(L, -2, "G");
-        lua_pushnumber(L, (obj->color & 0xFF) / 255.0);
+        lua_pushnumber(L, obj->color_b);
         lua_setfield(L, -2, "B");
         return 1;
     }
@@ -736,11 +736,13 @@ int LuaEngine::lua_drawing_index(lua_State* L) {
     if (k == "Transparency") { lua_pushnumber(L, obj->transparency); return 1; }
     if (k == "Filled") { lua_pushboolean(L, obj->filled); return 1; }
     if (k == "Text") { lua_pushstring(L, obj->text.c_str()); return 1; }
-    if (k == "Size") { lua_pushnumber(L, obj->size); return 1; }
-    if (k == "Font") { lua_pushstring(L, obj->font.c_str()); return 1; }
-    if (k == "ZIndex") { lua_pushinteger(L, obj->zindex); return 1; }
+    if (k == "Size") { lua_pushnumber(L, obj->text_size); return 1; }
+    if (k == "Font") { lua_pushinteger(L, obj->font); return 1; }
+    if (k == "ZIndex") { lua_pushinteger(L, obj->z_index); return 1; }
     if (k == "Radius") { lua_pushnumber(L, obj->radius); return 1; }
     if (k == "NumSides") { lua_pushinteger(L, obj->num_sides); return 1; }
+    if (k == "Center") { lua_pushboolean(L, obj->center); return 1; }
+    if (k == "Outline") { lua_pushboolean(L, obj->outline); return 1; }
 
     auto push_vec2 = [L](float x, float y) {
         lua_newtable(L);
@@ -750,14 +752,13 @@ int LuaEngine::lua_drawing_index(lua_State* L) {
         lua_setfield(L, -2, "Y");
     };
 
-    if (k == "From") { push_vec2(obj->from.x, obj->from.y); return 1; }
-    if (k == "To") { push_vec2(obj->to.x, obj->to.y); return 1; }
-    if (k == "Position") { push_vec2(obj->position.x, obj->position.y); return 1; }
-    if (k == "Center") { push_vec2(obj->center.x, obj->center.y); return 1; }
-    if (k == "PointA") { push_vec2(obj->point_a.x, obj->point_a.y); return 1; }
-    if (k == "PointB") { push_vec2(obj->point_b.x, obj->point_b.y); return 1; }
-    if (k == "PointC") { push_vec2(obj->point_c.x, obj->point_c.y); return 1; }
-    if (k == "PointD") { push_vec2(obj->point_d.x, obj->point_d.y); return 1; }
+    if (k == "From") { push_vec2(obj->from_x, obj->from_y); return 1; }
+    if (k == "To") { push_vec2(obj->to_x, obj->to_y); return 1; }
+    if (k == "Position") { push_vec2(obj->pos_x, obj->pos_y); return 1; }
+    if (k == "PointA") { push_vec2(obj->pa_x, obj->pa_y); return 1; }
+    if (k == "PointB") { push_vec2(obj->pb_x, obj->pb_y); return 1; }
+    if (k == "PointC") { push_vec2(obj->pc_x, obj->pc_y); return 1; }
+    if (k == "PointD") { push_vec2(obj->pd_x, obj->pd_y); return 1; }
 
     lua_pushnil(L);
     return 1;
@@ -775,13 +776,13 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
 
     std::string k(key);
 
-    auto read_vec2 = [L](int idx, DrawingObject::Vec2& v) {
+    auto read_vec2 = [L](int idx, float& x, float& y) {
         if (lua_istable(L, idx)) {
             lua_getfield(L, idx, "X");
-            if (lua_isnumber(L, -1)) v.x = static_cast<float>(lua_tonumber(L, -1));
+            if (lua_isnumber(L, -1)) x = static_cast<float>(lua_tonumber(L, -1));
             lua_pop(L, 1);
             lua_getfield(L, idx, "Y");
-            if (lua_isnumber(L, -1)) v.y = static_cast<float>(lua_tonumber(L, -1));
+            if (lua_isnumber(L, -1)) y = static_cast<float>(lua_tonumber(L, -1));
             lua_pop(L, 1);
         }
     };
@@ -789,31 +790,35 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
     if (k == "Visible") obj->visible = lua_toboolean(L, 3);
     else if (k == "Color") {
         if (lua_istable(L, 3)) {
-            lua_getfield(L, 3, "R"); float r = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
-            lua_getfield(L, 3, "G"); float g = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
-            lua_getfield(L, 3, "B"); float b = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
-            obj->color = (static_cast<uint32_t>(r * 255) << 16) |
-                          (static_cast<uint32_t>(g * 255) << 8) |
-                           static_cast<uint32_t>(b * 255);
+            lua_getfield(L, 3, "R");
+            obj->color_r = static_cast<float>(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+            lua_getfield(L, 3, "G");
+            obj->color_g = static_cast<float>(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+            lua_getfield(L, 3, "B");
+            obj->color_b = static_cast<float>(lua_tonumber(L, -1));
+            lua_pop(L, 1);
         }
     }
     else if (k == "Thickness") obj->thickness = static_cast<float>(luaL_checknumber(L, 3));
     else if (k == "Transparency") obj->transparency = static_cast<float>(luaL_checknumber(L, 3));
     else if (k == "Filled") obj->filled = lua_toboolean(L, 3);
     else if (k == "Text") obj->text = luaL_checkstring(L, 3);
-    else if (k == "Size") obj->size = static_cast<float>(luaL_checknumber(L, 3));
-    else if (k == "Font") obj->font = luaL_checkstring(L, 3);
-    else if (k == "ZIndex") { obj->zindex = static_cast<int>(luaL_checkinteger(L, 3)); obj->zindex_changed = true; }
+    else if (k == "Size") obj->text_size = static_cast<float>(luaL_checknumber(L, 3));
+    else if (k == "Font") obj->font = static_cast<int>(luaL_checkinteger(L, 3));
+    else if (k == "ZIndex") obj->z_index = static_cast<int>(luaL_checkinteger(L, 3));
     else if (k == "Radius") obj->radius = static_cast<float>(luaL_checknumber(L, 3));
     else if (k == "NumSides") obj->num_sides = static_cast<int>(luaL_checkinteger(L, 3));
-    else if (k == "From") read_vec2(3, obj->from);
-    else if (k == "To") read_vec2(3, obj->to);
-    else if (k == "Position") read_vec2(3, obj->position);
-    else if (k == "Center") read_vec2(3, obj->center);
-    else if (k == "PointA") read_vec2(3, obj->point_a);
-    else if (k == "PointB") read_vec2(3, obj->point_b);
-    else if (k == "PointC") read_vec2(3, obj->point_c);
-    else if (k == "PointD") read_vec2(3, obj->point_d);
+    else if (k == "Center") obj->center = lua_toboolean(L, 3);
+    else if (k == "Outline") obj->outline = lua_toboolean(L, 3);
+    else if (k == "From") read_vec2(3, obj->from_x, obj->from_y);
+    else if (k == "To") read_vec2(3, obj->to_x, obj->to_y);
+    else if (k == "Position") read_vec2(3, obj->pos_x, obj->pos_y);
+    else if (k == "PointA") read_vec2(3, obj->pa_x, obj->pa_y);
+    else if (k == "PointB") read_vec2(3, obj->pb_x, obj->pb_y);
+    else if (k == "PointC") read_vec2(3, obj->pc_x, obj->pc_y);
+    else if (k == "PointD") read_vec2(3, obj->pd_x, obj->pd_y);
 
     if (eng->draw_cb_) eng->draw_cb_(*obj);
 
