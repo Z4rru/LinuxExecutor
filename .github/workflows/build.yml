@@ -26,7 +26,7 @@ jobs:
             build-essential cmake ninja-build git pkg-config \
             libgtk-4-dev libcurl4-openssl-dev libssl-dev \
             libgirepository1.0-dev luajit libluajit-5.1-dev \
-            libspdlog-dev nlohmann-json3-dev \
+            libspdlog-dev libfmt-dev nlohmann-json3-dev \
             fonts-jetbrains-mono
 
       - name: Configure
@@ -40,20 +40,15 @@ jobs:
 
       - name: Build
         working-directory: oss-executor/build
+        shell: bash
         run: |
+          set -o pipefail
           ninja -j$(nproc) 2>&1 | tee build.log
-          BUILD_EXIT=${PIPESTATUS[0]}
-          if [ $BUILD_EXIT -ne 0 ]; then
-            echo ""
-            echo "══════════════════════════════════════════"
-            echo "  BUILD FAILED — Last 80 lines of output:"
-            echo "══════════════════════════════════════════"
-            tail -80 build.log
-            exit 1
-          fi
+          echo "Build succeeded"
 
       - name: Package
         run: |
+          set -e
           mkdir -p package/oss-executor
 
           cp oss-executor/build/OSSExecutor package/oss-executor/
@@ -127,20 +122,18 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake ninja-build pkg-config \
             libgtk-4-dev libcurl4-openssl-dev libssl-dev \
-            luajit libluajit-5.1-dev \
-            libspdlog-dev nlohmann-json3-dev \
+            libgirepository1.0-dev luajit libluajit-5.1-dev \
+            libspdlog-dev libfmt-dev nlohmann-json3-dev \
             wget file patchelf imagemagick
 
       - name: Build
         working-directory: oss-executor
+        shell: bash
         run: |
+          set -o pipefail
           mkdir -p build && cd build
           cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
           ninja -j$(nproc) 2>&1 | tee build.log
-          BUILD_EXIT=${PIPESTATUS[0]}
-          if [ $BUILD_EXIT -ne 0 ]; then
-            echo "BUILD FAILED:"; tail -80 build.log; exit 1
-          fi
 
       - name: Prepare icon
         run: |
@@ -153,12 +146,12 @@ jobs:
             if file "$ICON_SRC" | grep -qi "PNG image"; then
               cp "$ICON_SRC" "$ICON_DST"
               ICON_OK=true
-              echo "✓ Using project logo.png"
+              echo "Using project logo.png"
             fi
           fi
 
           if [ "$ICON_OK" = false ]; then
-            echo "⚠ Generating fallback icon..."
+            echo "Generating fallback icon..."
             convert -size 256x256 xc:'#6e40c9' \
               -fill white -gravity center \
               -font Helvetica -pointsize 80 \
