@@ -6,6 +6,14 @@
 
 namespace oss {
 
+static void load_css_string(GtkCssProvider* provider, const std::string& css) {
+#if GTK_CHECK_VERSION(4, 12, 0)
+    gtk_css_provider_load_from_string(provider, css.c_str());
+#else
+    gtk_css_provider_load_from_data(provider, css.c_str(), -1);
+#endif
+}
+
 Console::Console() {
     container_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_add_css_class(container_, "console-view");
@@ -218,14 +226,15 @@ void Console::set_word_wrap(bool enabled) {
 }
 
 void Console::set_font_size(int size) {
-    std::string css = "textview { font-size: " + std::to_string(size) + "pt; }";
+    std::string css = ".console-font-override { font-size: " + std::to_string(size) + "pt; }";
     GtkCssProvider* provider = gtk_css_provider_new();
-    gtk_css_provider_load_from_string(provider, css.c_str());
-    gtk_style_context_add_provider(
-        gtk_widget_get_style_context(GTK_WIDGET(text_view_)),
+    load_css_string(provider, css);
+    gtk_style_context_add_provider_for_display(
+        gdk_display_get_default(),
         GTK_STYLE_PROVIDER(provider),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(provider);
+    gtk_widget_add_css_class(GTK_WIDGET(text_view_), "console-font-override");
 }
 
 void Console::set_show_timestamps(bool show) {
