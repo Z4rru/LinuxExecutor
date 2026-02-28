@@ -115,11 +115,11 @@ add_library(oss-payload SHARED src/core/payload.cpp)
 
 target_include_directories(oss-payload PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${Luau_SOURCE_DIR}/Compiler/include
+    ${Luau_SOURCE_DIR}/Compiler/include   # luacode.h  →  luau_compile()
     ${Luau_SOURCE_DIR}/Ast/include
-    ${Luau_SOURCE_DIR}/VM/include
-    ${Luau_SOURCE_DIR}/VM/src
+    ${Luau_SOURCE_DIR}/VM/include         # lua.h, lualib.h
     ${Luau_SOURCE_DIR}/Common/include
+    # REMOVED: ${Luau_SOURCE_DIR}/VM/src  ← internal headers, not needed & can break
 )
 
 target_link_libraries(oss-payload PRIVATE
@@ -127,9 +127,15 @@ target_link_libraries(oss-payload PRIVATE
     Threads::Threads ${CMAKE_DL_LIBS}
 )
 
+target_compile_options(oss-payload PRIVATE
+    -Wall -Wextra -Wno-unused-parameter
+)
+
 set_target_properties(oss-payload PROPERTIES
     OUTPUT_NAME "oss_payload"
     PREFIX      "lib"
+    # Ensure PIC even if global flag somehow missed this target
+    POSITION_INDEPENDENT_CODE ON
 )
 
 # ── Post-build resource copy ──
@@ -148,3 +154,4 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
