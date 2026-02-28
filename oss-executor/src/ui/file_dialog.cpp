@@ -1,14 +1,10 @@
 #include "file_dialog.hpp"
 #include "utils/logger.hpp"
-#include "utils/config.hpp" 
+#include "utils/config.hpp"
 
 namespace oss {
 
 #if GTK_CHECK_VERSION(4, 10, 0)
-
-// ── GTK 4.10+ : GtkFileDialog (async, portal-based) ──
-// NOTE: This does NOT require GVFS. The portal uses D-Bus directly.
-// Our GIO_MODULE_DIR="" fix does not affect file dialog functionality.
 
 static void on_open_finish(GObject* source, GAsyncResult* result, gpointer user_data) {
     auto* callback = static_cast<FileDialog::Callback*>(user_data);
@@ -23,7 +19,6 @@ static void on_open_finish(GObject* source, GAsyncResult* result, gpointer user_
         g_object_unref(file);
     }
     if (error) {
-        // Don't log "dismissed" errors — user just hit Cancel
         if (!g_error_matches(error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED)) {
             LOG_ERROR("File dialog error: {}", error->message);
         }
@@ -55,7 +50,6 @@ void FileDialog::open(GtkWindow* parent, Callback cb) {
     gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
     g_object_unref(filters);
 
-    // ── Set initial directory to workspace ──
     std::string workspace = Config::instance().home_dir() + "/workspace";
     GFile* initial_dir = g_file_new_for_path(workspace.c_str());
     gtk_file_dialog_set_initial_folder(dialog, initial_dir);
@@ -91,7 +85,6 @@ void FileDialog::save(GtkWindow* parent, const std::string& suggested_name, Call
     gtk_file_dialog_set_title(dialog, "Save Script");
     gtk_file_dialog_set_initial_name(dialog, suggested_name.c_str());
 
-    // ── Set initial directory to workspace ──
     std::string workspace = Config::instance().home_dir() + "/workspace";
     GFile* initial_dir = g_file_new_for_path(workspace.c_str());
     gtk_file_dialog_set_initial_folder(dialog, initial_dir);
@@ -102,8 +95,6 @@ void FileDialog::save(GtkWindow* parent, const std::string& suggested_name, Call
 }
 
 #else
-
-// ── GTK 4.0–4.9 : GtkFileChooserNative (portal-based) ──
 
 static void on_open_response(GtkNativeDialog* dialog, int response, gpointer user_data) {
     auto* callback = static_cast<FileDialog::Callback*>(user_data);
@@ -174,4 +165,3 @@ void FileDialog::save(GtkWindow* parent, const std::string& suggested_name, Call
 #endif
 
 } // namespace oss
-
