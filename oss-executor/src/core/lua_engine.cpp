@@ -168,12 +168,12 @@ static int lua_loadstring_impl(lua_State* L) {
     const char* source = luaL_checklstring(L, 1, &len);
     const char* chunkname = luaL_optstring(L, 2, "=loadstring");
 
-    Luau::CompileOptions options;
+    Luau::CompileOptions options{};
     options.optimizationLevel = 1;
     options.debugLevel        = 1;
     options.coverageLevel     = 0;
 
-    std::string bytecode = Luau::compile(std::string(source, len), options);
+    std::string bytecode = Luau::compile(source, options);
 
     if (bytecode.empty() || bytecode[0] == 0) {
         lua_pushnil(L);
@@ -244,7 +244,7 @@ void* LuaEngine::lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
 // ===========================================================================
 
 void LuaEngine::lua_interrupt(lua_State* L, int gc) {
-    (void)gc;
+    if (gc >= 0) return;           // lua_getfield is unsafe during GC
     auto* eng = get_engine(L);
     if (eng && !eng->is_running())
         luaL_error(L, "Script execution cancelled");
@@ -384,12 +384,12 @@ void LuaEngine::reset() { shutdown(); init(); }
 // ===========================================================================
 
 std::string LuaEngine::compile(const std::string& source) {
-    Luau::CompileOptions options;
+    Luau::CompileOptions options{};
     options.optimizationLevel = 1;
     options.debugLevel        = 1;
     options.coverageLevel     = 0;
 
-    std::string bytecode = Luau::compile(source, options);
+    std::string bytecode = Luau::compile(std::string(source, len), options);
 
     if (bytecode.empty()) {
         last_error_ = "Compilation produced empty bytecode";
@@ -494,13 +494,13 @@ bool LuaEngine::execute_bytecode_internal(const std::string& bytecode,
             double wait_seconds = lua_tonumber(thread, -1);
             lua_pop(thread, 1);
 
-            // Reference the thread so it stays alive
+                       // Reference the thread so it stays alive
             lua_pushthread(thread);
             lua_xmove(thread, L_, 1);
             int thread_ref = lua_ref(L_, -1);
 
-            // Pop original thread from main stack
-            lua_pop(L_, 1);
+            // Pop ref'd copy and original lua_newthread value from main stack
+            lua_pop(L_, 2);
 
             ScheduledTask task;
             task.type = ScheduledTask::Type::Delay;
@@ -512,12 +512,13 @@ bool LuaEngine::execute_bytecode_internal(const std::string& bytecode,
             task.func_ref   = LUA_NOREF;
             schedule_task(std::move(task));
         } else {
-            // Keep thread alive for next-tick resume
+                       // Keep thread alive for next-tick resume
             lua_pushthread(thread);
             lua_xmove(thread, L_, 1);
             int thread_ref = lua_ref(L_, -1);
 
-            lua_pop(L_, 1);
+            // Pop ref'd copy and original lua_newthread value from main stack
+            lua_pop(L_, 2);
 
             ScheduledTask task;
             task.type = ScheduledTask::Type::Defer;
@@ -654,6 +655,7 @@ void LuaEngine::execute_task(ScheduledTask& task,
         co = lua_newthread(L_);
         luaL_sandboxthread(co);
         int thread_ref = lua_ref(L_, -1);
+        lua_pop(L_, 1);
 
         if (task.thread_ref != LUA_NOREF)
             lua_unref(L_, task.thread_ref);
@@ -1417,6 +1419,7 @@ int LuaEngine::lua_task_spawn(lua_State* L) {
     lua_State* co = lua_newthread(eng->L_);
     luaL_sandboxthread(co);
     int thread_ref = lua_ref(eng->L_, -1);
+    lua_pop(eng->L_, 1);
 
     // Push function and args onto coroutine
     lua_pushvalue(L, 1);
@@ -1488,11 +1491,13 @@ int LuaEngine::lua_task_delay(lua_State* L) {
 
     lua_pushvalue(L, 2);
     task.func_ref = lua_ref(L, -1);
+    lua_pop(L, 1);
 
     int nargs = lua_gettop(L) - 2;
     for (int i = 0; i < nargs; ++i) {
         lua_pushvalue(L, i + 3);
         int aref = lua_ref(L, -1);
+        lua_pop(L, 1);
         task.arg_refs.push_back(aref);
     }
 
@@ -1512,11 +1517,13 @@ int LuaEngine::lua_task_defer(lua_State* L) {
 
     lua_pushvalue(L, 1);
     task.func_ref = lua_ref(L, -1);
+    lua_pop(L, 1);
 
     int nargs = lua_gettop(L) - 1;
     for (int i = 0; i < nargs; ++i) {
         lua_pushvalue(L, i + 2);
         int aref = lua_ref(L, -1);
+        lua_pop(L, 1);
         task.arg_refs.push_back(aref);
     }
 
@@ -1592,6 +1599,7 @@ int LuaEngine::lua_signal_connect(lua_State* L) {
 
     lua_pushvalue(L, 2);
     int ref = lua_ref(L, -1);
+    lua_pop(L, 1);
 
     Signal::Connection conn;
     conn.callback_ref = ref;
@@ -1843,6 +1851,7 @@ int LuaEngine::lua_spawn(lua_State* L) {
     lua_State* co = lua_newthread(eng->L_);
     luaL_sandboxthread(co);
     int thread_ref = lua_ref(eng->L_, -1);
+    lua_pop(eng->L_, 1);
 
     lua_pushvalue(L, 1);
     lua_xmove(L, co, 1);
@@ -2160,6 +2169,7 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
 
 
 
