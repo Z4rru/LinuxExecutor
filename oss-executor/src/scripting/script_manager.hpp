@@ -4,14 +4,14 @@
 #include <vector>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 
 namespace oss {
 
 struct SavedScript {
     std::string name;
     std::string path;
-    std::string content;
-    size_t size = 0;
+    size_t      size = 0;
     std::string modified_time;
 };
 
@@ -22,28 +22,31 @@ public:
         return inst;
     }
 
-    void set_directory(const std::string& dir) {
-        if (dir.empty()) return;
-        dir_ = dir;
-        try {
-            std::filesystem::create_directories(dir);
-        } catch (const std::filesystem::filesystem_error& /*e*/) {
-            // Directory creation failed — list/save will report errors
-        }
-    }
+    void set_directory(const std::string& dir);
 
     std::vector<SavedScript> list_scripts() const;
 
-    bool save_script(const std::string& name, const std::string& content);
+    bool        save_script(const std::string& name, const std::string& content);
     std::string load_script(const std::string& name) const;
-    bool delete_script(const std::string& name);
-    bool rename_script(const std::string& old_name, const std::string& new_name);
+    bool        delete_script(const std::string& name);
+    bool        rename_script(const std::string& old_name, const std::string& new_name);
 
-    std::string scripts_directory() const { return dir_; }
+    // ── real execution through LuaEngine ──
+    bool execute_script(const std::string& name) const;
+    bool execute_inline(const std::string& source) const;
+
+    std::string scripts_directory() const;
 
 private:
     ScriptManager() = default;
-    std::string dir_;
+    ScriptManager(const ScriptManager&)            = delete;
+    ScriptManager& operator=(const ScriptManager&) = delete;
+
+    // Returns empty path on invalid/malicious name
+    std::filesystem::path safe_script_path(const std::string& name) const;
+
+    mutable std::mutex mtx_;
+    std::string        dir_;
 };
 
 } // namespace oss
