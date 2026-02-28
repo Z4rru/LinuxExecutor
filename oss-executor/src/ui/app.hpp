@@ -13,6 +13,10 @@
 #include "scripting/script_manager.hpp"
 #include "core/executor.hpp"
 
+#ifndef APP_VERSION
+#define APP_VERSION "2.0.0"
+#endif
+
 namespace oss {
 
 class App {
@@ -29,6 +33,8 @@ private:
     void build_ui(GtkApplication* app);
     void apply_theme();
     void setup_keybinds();
+    void connect_executor();
+    void disconnect_executor();
 
     void on_execute();
     void on_clear();
@@ -67,6 +73,8 @@ private:
 
     bool console_visible_ = true;
     bool hub_visible_ = false;
+    bool injecting_ = false;  // guard against concurrent inject calls
+    guint tick_id_ = 0;       // tracked so we can g_source_remove in dtor
 };
 
 } // namespace oss
