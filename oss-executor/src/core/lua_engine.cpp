@@ -153,7 +153,7 @@ static int lua_loadstring_impl(lua_State* L) {
     options.debugLevel        = 1;
     options.coverageLevel     = 0;
 
-    std::string bytecode = Luau::compile(source, options);
+    std::string bytecode = Luau::compile(std::string(source, len), options);
 
     if (bytecode.empty() || bytecode[0] == 0) {
         lua_pushnil(L);
@@ -572,7 +572,6 @@ void LuaEngine::execute_task(ScheduledTask& task,
     if (!L_) return;
 
     lua_State* co = nullptr;
-    [[maybe_unused]] bool new_thread = false;
 
     if (task.thread_ref != LUA_NOREF) {
         lua_rawgeti(L_, LUA_REGISTRYINDEX, task.thread_ref);
@@ -593,7 +592,6 @@ void LuaEngine::execute_task(ScheduledTask& task,
 
         lua_rawgeti(L_, LUA_REGISTRYINDEX, task.func_ref);
         lua_xmove(L_, co, 1);
-        new_thread = true;
     }
 
     if (!co) {
@@ -608,6 +606,16 @@ void LuaEngine::execute_task(ScheduledTask& task,
     }
 
     int nargs = 0;
+
+    if (task.type == ScheduledTask::Type::Delay) {
+        auto scheduled_at = task.resume_at -
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(task.delay_seconds));
+        double elapsed = std::chrono::duration<double>(now - scheduled_at).count();
+        lua_pushnumber(co, elapsed);
+        ++nargs;
+    }
+
     for (int& ref : task.arg_refs) {
         if (ref != LUA_NOREF) {
             lua_rawgeti(L_, LUA_REGISTRYINDEX, ref);
@@ -618,15 +626,6 @@ void LuaEngine::execute_task(ScheduledTask& task,
         }
     }
     task.arg_refs.clear();
-
-    if (task.type == ScheduledTask::Type::Delay) {
-        auto scheduled_at = task.resume_at -
-            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double>(task.delay_seconds));
-        double elapsed = std::chrono::duration<double>(now - scheduled_at).count();
-        lua_pushnumber(co, elapsed);
-        ++nargs;
-    }
 
     int status = lua_resume(co, nullptr, nargs);
 
@@ -711,8 +710,14 @@ bool LuaEngine::update_drawing_object(int id,
     if (it == drawing_objects_.end()) return false;
     fn(it->second);
     DrawingObject copy = it->second;
+    if (copy.image_surface)
+        cairo_surface_reference(copy.image_surface);
     Overlay::instance().update_object(id,
-        [&copy](DrawingObject& o) { o = copy; });
+        [&copy](DrawingObject& o) {
+            if (o.image_surface)
+                cairo_surface_destroy(o.image_surface);
+            o = copy;
+        });
     return true;
 }
 
@@ -1572,7 +1577,12 @@ int LuaEngine::lua_print(lua_State* L) {
         if (lua_isstring(L, i))       output += lua_tostring(L, i);
         else if (lua_isnil(L, i))     output += "nil";
         else if (lua_isboolean(L, i)) output += lua_toboolean(L, i) ? "true" : "false";
-        else if (lua_isnumber(L, i))  output += std::to_string(lua_tonumber(L, i));
+        else if (lua_isnumber(L, i)) {
+            size_t slen = 0;
+            const char* s = lua_tolstring(L, i, &slen);
+            if (s) output.append(s, slen);
+            else   output += std::to_string(lua_tonumber(L, i));
+        }
         else {
             char buf[64];
             snprintf(buf, sizeof(buf), "%s: %p",
@@ -1648,6 +1658,12 @@ int LuaEngine::lua_http_post(lua_State* L) {
         lua_pushstring(L, resp.error.c_str());
         lua_setfield(L, -2, "Error");
     }
+    lua_newtable(L);
+    for (const auto& [k, v] : resp.headers) {
+        lua_pushstring(L, v.c_str());
+        lua_setfield(L, -2, k.c_str());
+    }
+    lua_setfield(L, -2, "Headers");
     return 1;
 }
 
@@ -1737,7 +1753,7 @@ int LuaEngine::lua_readfile(lua_State* L) {
         luaL_error(L, "Access denied: path traversal detected");
         return 0;
     }
-    std::ifstream f(full);
+    std::ifstream f(full, std::ios::binary);
     if (!f.is_open()) {
         luaL_error(L, "Cannot open file: %s", path);
         return 0;
@@ -1972,4 +1988,4 @@ int LuaEngine::lua_sha256(lua_State* L) {
     return 1;
 }
 
-}
+} // namespace oss
