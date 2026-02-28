@@ -1877,24 +1877,14 @@ local function _start_heartbeat()
 end
 _start_heartbeat()
 
-local _c_wait=wait
-local _c_spawn=spawn
-local _c_delay=delay
-
 wait=function(t)
     t=t or 0.03
-    -- Tick signals on every wait call
     if _G._oss_tick_signals then pcall(_G._oss_tick_signals) end
-    if _c_wait then return _c_wait(t) end
-    -- Busy-wait fallback with os.clock (not ideal but prevents instant return)
-    local start=os.clock()
-    while os.clock()-start<t do end
-    local elapsed=os.clock()-start
-    return elapsed,os.clock()
+    return t,os.clock()
 end
 
-spawn=_c_spawn or function(fn,...) if type(fn)=="function" then pcall(fn,...) end end
-delay=_c_delay or function(t,fn,...) if type(fn)=="function" then pcall(fn,...) end end
+spawn=function(fn,...) if type(fn)=="function" then pcall(fn,...) end end
+delay=function(dt,fn,...) if type(fn)=="function" then pcall(fn,...) end end
 tick=tick or function() return os.clock() end
 time=time or function() return os.clock() end
 elapsedTime=elapsedTime or function() return os.clock() end
@@ -2116,73 +2106,7 @@ void Environment::setup(LuaEngine& engine) {
         LOG_ERROR("Environment::setup called with null Lua state");
         return;
     }
-
-    lua_getfield(L, LUA_REGISTRYINDEX, "_oss_env_init");
-    if (lua_toboolean(L, -1)) {
-        lua_pop(L, 1);
-        return;
-    }
-    lua_pop(L, 1);
-
-    lua_pushcfunction(L, lua_http_get);
-    lua_setglobal(L, "_oss_http_get");
-    lua_pushcfunction(L, lua_http_get);
-    lua_setglobal(L, "HttpGet");
-    lua_pushcfunction(L, lua_http_request);
-    lua_setglobal(L, "_oss_http_request");
-    lua_pushcfunction(L, lua_typeof);
-    lua_setglobal(L, "typeof");
-    lua_pushcfunction(L, lua_identify_executor);
-    lua_setglobal(L, "identifyexecutor");
-    lua_pushcfunction(L, lua_identify_executor);
-    lua_setglobal(L, "getexecutorname");
-    lua_pushcfunction(L, lua_printidentity);
-    lua_setglobal(L, "printidentity");
-
-    // Drawing bridge
-    lua_pushcfunction(L, lua_drawing_new_bridge);
-    lua_setglobal(L, "_oss_drawing_new");
-    lua_pushcfunction(L, lua_drawing_set_bridge);
-    lua_setglobal(L, "_oss_drawing_set");
-    lua_pushcfunction(L, lua_drawing_remove_bridge);
-    lua_setglobal(L, "_oss_drawing_remove");
-
-    // GUI bridge
-    lua_pushcfunction(L, lua_gui_create);
-    lua_setglobal(L, "_oss_gui_create");
-    lua_pushcfunction(L, lua_gui_set);
-    lua_setglobal(L, "_oss_gui_set");
-    lua_pushcfunction(L, lua_gui_set_parent);
-    lua_setglobal(L, "_oss_gui_set_parent");
-    lua_pushcfunction(L, lua_gui_remove);
-    lua_setglobal(L, "_oss_gui_remove");
-    lua_pushcfunction(L, lua_gui_clear);
-    lua_setglobal(L, "_oss_gui_clear");
-    lua_pushcfunction(L, lua_gui_get_screen_size);
-    lua_setglobal(L, "_oss_gui_screen_size");
-
-    setup_debug_lib(engine);
-    setup_cache_lib(engine);
-    setup_metatable_lib(engine);
-    setup_input_lib(engine);
-    setup_instance_lib(engine);
-    setup_script_lib(engine);
-    setup_websocket_lib(engine);
-    setup_thread_lib(engine);
-    setup_closure_lib(engine);
-
-    int status = oss_dostring(L, ROBLOX_MOCK_LUA, "=roblox_mock");
-    if (status != 0) {
-        const char* err = lua_tostring(L, -1);
-        LOG_ERROR("Failed to init Roblox mock: {}", err ? err : "unknown error");
-        lua_pop(L, 1);
-        return;
-    }
-
-    lua_pushboolean(L, 1);
-    lua_setfield(L, LUA_REGISTRYINDEX, "_oss_env_init");
-
-    LOG_INFO("Roblox API mock environment initialized with GUI bridge");
+    setup(L);
 }
 
 void Environment::setup_debug_lib(LuaEngine& engine) {
@@ -2315,41 +2239,9 @@ void Environment::setup_closure_lib(LuaEngine& engine) {
     Closures::register_all(engine.state());
 }
 
-void Environment::setup_drawing_bridge(LuaEngine& engine) {
-    lua_State* L = engine.state();
-    lua_pushcfunction(L, lua_drawing_new_bridge);
-    lua_setglobal(L, "_oss_drawing_new");
-    lua_pushcfunction(L, lua_drawing_set_bridge);
-    lua_setglobal(L, "_oss_drawing_set");
-    lua_pushcfunction(L, lua_drawing_remove_bridge);
-    lua_setglobal(L, "_oss_drawing_remove");
-}
-
-void Environment::setup_gui_bridge(LuaEngine& engine) {
-    lua_State* L = engine.state();
-    lua_pushcfunction(L, lua_gui_create);
-    lua_setglobal(L, "_oss_gui_create");
-    lua_pushcfunction(L, lua_gui_set);
-    lua_setglobal(L, "_oss_gui_set");
-    lua_pushcfunction(L, lua_gui_set_parent);
-    lua_setglobal(L, "_oss_gui_set_parent");
-    lua_pushcfunction(L, lua_gui_remove);
-    lua_setglobal(L, "_oss_gui_remove");
-    lua_pushcfunction(L, lua_gui_clear);
-    lua_setglobal(L, "_oss_gui_clear");
-    lua_pushcfunction(L, lua_gui_get_screen_size);
-    lua_setglobal(L, "_oss_gui_screen_size");
-}
-
-void Environment::setup_roblox_mock(LuaEngine& engine) {
-    lua_State* L = engine.state();
-    int status = oss_dostring(L, ROBLOX_MOCK_LUA, "=roblox_mock");
-    if (status != 0) {
-        const char* err = lua_tostring(L, -1);
-        LOG_ERROR("Failed to init Roblox mock: {}", err ? err : "unknown error");
-        lua_pop(L, 1);
-    }
-}
+void Environment::setup_drawing_bridge(LuaEngine& engine) { setup(engine); }
+void Environment::setup_gui_bridge(LuaEngine& engine) { setup(engine); }
+void Environment::setup_roblox_mock(LuaEngine& engine) { setup(engine); }
 
 Environment& Environment::instance() {
     static Environment env;
@@ -2469,11 +2361,13 @@ void Environment::setup(lua_State* L) {
     lua_pushcfunction(L, lua_websocket_connect); lua_setfield(L, -2, "connect");
     lua_setglobal(L, "WebSocket");
 
-    // Closures
     Closures::register_all(L);
 
-    // Run Roblox mock
+    lua_pushboolean(L, 1);
+    lua_setfield(L, LUA_REGISTRYINDEX, "_oss_internal_exec");
     int status = oss_dostring(L, ROBLOX_MOCK_LUA, "=roblox_mock");
+    lua_pushnil(L);
+    lua_setfield(L, LUA_REGISTRYINDEX, "_oss_internal_exec");
     if (status != 0) {
         const char* err = lua_tostring(L, -1);
         LOG_ERROR("Failed to init Roblox mock: {}", err ? err : "unknown error");
@@ -2487,6 +2381,7 @@ void Environment::setup(lua_State* L) {
 }
 
 } // namespace oss
+
 
 
 
