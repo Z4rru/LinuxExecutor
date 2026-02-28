@@ -12,27 +12,25 @@
 
 namespace oss {
 
-// ── unified lifecycle states ────────────────────────────────────────────────
 enum class InjectionState {
-    Idle,           // nothing happening
-    Scanning,       // looking for the target process
-    Found,          // process located, not yet attached
-    Attaching,      // attaching to process memory
-    Injecting,      // writing payload / shared library
-    Initializing,   // payload loaded, waiting for init handshake
-    Ready,          // fully injected and operational
-    Executing,      // running a script right now
-    Detached,       // intentionally disconnected
-    Failed          // something went wrong (check error())
+    Idle,
+    Scanning,
+    Found,
+    Attaching,
+    Injecting,
+    Initializing,
+    Ready,
+    Executing,
+    Detached,
+    Failed
 };
 
 enum class InjectionMode {
     None,
-    LocalOnly,      // process found but no VM marker
-    Full            // process found + VM marker validated
+    LocalOnly,
+    Full
 };
 
-// ── process metadata ────────────────────────────────────────────────────────
 struct ProcessInfo {
     pid_t       pid        = 0;
     std::string name;
@@ -44,7 +42,6 @@ struct ProcessInfo {
     bool        via_flatpak = false;
 };
 
-// ── VM-scan diagnostics ─────────────────────────────────────────────────────
 struct VMScanResult {
     uintptr_t   marker_addr     = 0;
     uintptr_t   region_base     = 0;
@@ -55,25 +52,21 @@ struct VMScanResult {
     bool        validated       = false;
 };
 
-// ── main injection singleton ────────────────────────────────────────────────
 class Injection {
 public:
     static Injection& instance();
 
-    // ── process discovery ───────────────────────────────────────────────
     pid_t find_roblox_pid();
     bool  scan_for_roblox();
     void  start_auto_scan();
     void  stop_auto_scan();
 
-    // ── injection pipeline ──────────────────────────────────────────────
     bool attach();
     bool detach();
-    bool inject();                                          // full pipeline
+    bool inject();
     bool inject_library(pid_t pid, const std::string& lib_path);
     bool execute_script(const std::string& source);
 
-    // ── state queries ───────────────────────────────────────────────────
     InjectionState      state()        const { return state_;  }
     InjectionMode       mode()         const { return mode_;   }
     bool                vm_found()     const { return mode_ == InjectionMode::Full; }
@@ -84,7 +77,6 @@ public:
     const ProcessInfo&  process_info() const { return proc_info_; }
     const VMScanResult& vm_scan()      const { return vm_scan_;   }
 
-    // ── status callback ─────────────────────────────────────────────────
     using StatusCallback = std::function<void(InjectionState, const std::string&)>;
     void set_status_callback(StatusCallback cb);
 
@@ -94,12 +86,10 @@ private:
     Injection(const Injection&)            = delete;
     Injection& operator=(const Injection&) = delete;
 
-    // ── internal state helpers ──────────────────────────────────────────
     void set_state(InjectionState s, const std::string& msg);
     bool process_alive() const;
     bool write_to_process(uintptr_t addr, const void* data, size_t len);
 
-    // ── scanning strategies ─────────────────────────────────────────────
     bool scan_direct();
     bool scan_wine_cmdline();
     bool scan_wine_regions();
@@ -107,19 +97,16 @@ private:
     bool scan_brute();
     void adopt_target(pid_t pid, const std::string& via);
 
-    // ── VM location / validation ────────────────────────────────────────
     bool locate_luau_vm();
     bool cross_validate(uintptr_t rstart, size_t rsize);
     bool should_scan_region(const MemoryRegion& r) const;
 
-    // ── library / shellcode injection ───────────────────────────────────
     bool      inject_shellcode(pid_t pid, const std::string& lib_path);
     uintptr_t find_libc_function(pid_t pid, const std::string& func_name);
     uintptr_t find_remote_symbol(pid_t pid, const std::string& lib_name,
                                   const std::string& symbol);
     std::string find_payload_path();
 
-    // ── proc helpers ────────────────────────────────────────────────────
     ProcessInfo              gather_info(pid_t pid);
     static std::string       read_proc_cmdline(pid_t pid);
     static std::string       read_proc_comm(pid_t pid);
@@ -127,7 +114,6 @@ private:
     static bool              has_roblox_token(const std::string& s);
     static std::vector<pid_t> descendants(pid_t root);
 
-    // ── data members ────────────────────────────────────────────────────
     Memory              memory_{0};
     InjectionState      state_  = InjectionState::Idle;
     InjectionMode       mode_   = InjectionMode::None;
