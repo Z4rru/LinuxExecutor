@@ -20,7 +20,6 @@ check_glib_version() {
     glib_ver=$(pkg-config --modversion glib-2.0 2>/dev/null || echo "unknown")
     echo -e "${CYAN}[i] System GLib version: ${glib_ver}${NC}"
 
-    # Check if system GVFS needs symbols newer than installed GLib
     local gvfs_lib="/usr/lib/x86_64-linux-gnu/gio/modules/libgvfsdbus.so"
     if [ -f "$gvfs_lib" ] && command -v objdump &>/dev/null; then
         local gvfs_needs
@@ -78,31 +77,22 @@ setup_dirs() {
     echo -e "${GREEN}[✓] Directory structure ready${NC}"
 }
 
-# ══════════════════════════════════════════════════════════════
-# AppRun wrapper generator — used by CI and `make appimage`
-# Creates the FUSE/GIO isolation layer inside an AppDir.
-#
-# Usage:  create_appimage_wrapper /path/to/AppDir
-# ══════════════════════════════════════════════════════════════
 create_appimage_wrapper() {
     local appdir="$1"
     cat > "${appdir}/AppRun" << 'APPRUN_EOF'
 #!/usr/bin/env bash
 SELF_DIR="$(dirname "$(readlink -f "$0")")"
 
-# ── CRITICAL: Isolate from system GIO/GVFS ──
 export GIO_MODULE_DIR=""
 export GIO_USE_VFS="local"
 export GSK_RENDERER="${GSK_RENDERER:-gl}"
 export GTK_A11Y=none
 export NO_AT_BRIDGE=1
 
-# D-Bus timeout prevention
 if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
     export DBUS_SESSION_BUS_ADDRESS="disabled:"
 fi
 
-# Use bundled libraries
 if [ -d "${SELF_DIR}/usr/lib" ]; then
     export LD_LIBRARY_PATH="${SELF_DIR}/usr/lib:${LD_LIBRARY_PATH:-}"
 fi
@@ -111,10 +101,9 @@ export OSS_HOME="${HOME}/.oss-executor"
 exec "${SELF_DIR}/usr/bin/OSSExecutor" "$@"
 APPRUN_EOF
     chmod +x "${appdir}/AppRun"
-    echo -e "${GREEN}[✓] AppRun wrapper created with GIO/D-Bus isolation${NC}"
+    echo -e "${GREEN}[✓] AppRun wrapper created${NC}"
 }
 
-# ── Main ──
 check_glib_version
 
 if ! command -v cmake &>/dev/null || ! pkg-config --exists gtk4 2>/dev/null; then
