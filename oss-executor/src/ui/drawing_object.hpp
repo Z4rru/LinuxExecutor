@@ -8,6 +8,8 @@
 struct _cairo_surface;
 typedef struct _cairo_surface cairo_surface_t;
 
+namespace oss {
+
 struct DrawingObject {
     enum class Type {
         None = 0,
@@ -21,6 +23,7 @@ struct DrawingObject {
     };
 
     Type type = Type::None;
+    int   id  = 0;
 
     // ── common properties ───────────────────────────────────────
     bool  visible      = true;
@@ -51,7 +54,7 @@ struct DrawingObject {
     // ── text ────────────────────────────────────────────────────
     std::string text;
     float       text_size = 14.0f;
-    std::string font      = "monospace";
+    int         font      = 0;     // integer font selector (used in switch)
 
     // ── triangle vertices ───────────────────────────────────────
     float pa_x = 0.0f, pa_y = 0.0f;
@@ -70,3 +73,5 @@ struct DrawingObject {
     std::string      image_path;
     cairo_surface_t* image_surface = nullptr;
 };
+
+} // namespace oss
