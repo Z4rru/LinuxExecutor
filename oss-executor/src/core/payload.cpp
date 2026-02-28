@@ -1,6 +1,7 @@
 // src/core/payload.cpp
 // Injection payload shared library — loaded into target process via dlopen/ptrace
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,8 +24,9 @@ static int compile_and_run(lua_State* L, const char* source, size_t len)
 {
     size_t bytecodeSize = 0;
     char*  bytecode     = luau_compile(source, len, nullptr, &bytecodeSize);
-    if (!bytecode) {
-        fprintf(stderr, "[payload] luau_compile returned nullptr\n");
+    if (!bytecode || bytecodeSize == 0) {
+        fprintf(stderr, "[payload] luau_compile returned nullptr or empty\n");
+        free(bytecode);           // luau_compile may return error string
         return -1;
     }
 
@@ -51,15 +53,14 @@ static int compile_and_run(lua_State* L, const char* source, size_t len)
 // ── IPC listener thread ─────────────────────────────────────────────────────
 
 struct PayloadState {
-    lua_State* L;
-    bool       running;
+    lua_State*         L       = nullptr;
+    std::atomic<bool>  running{false};    // FIX: was plain bool — data race
 };
 
 static void* ipc_thread(void* arg)
 {
     auto* state = static_cast<PayloadState*>(arg);
 
-    // Create a Unix domain socket to receive scripts from the executor UI
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("[payload] socket");
@@ -92,15 +93,16 @@ static void* ipc_thread(void* arg)
         return nullptr;
     }
 
-    while (state->running) {
+    while (state->running.load(std::memory_order_relaxed)) {
         int client_fd = accept(server_fd, nullptr, nullptr);
         if (client_fd < 0) {
-            if (state->running) perror("[payload] accept");
+            if (state->running.load(std::memory_order_relaxed))
+                perror("[payload] accept");
             break;
         }
 
         // Read the full script
-        size_t total = 0;
+        size_t  total = 0;
         ssize_t n;
         while ((n = read(client_fd, buf + total,
                          RECV_BUF - total - 1)) > 0) {
@@ -123,7 +125,7 @@ static void* ipc_thread(void* arg)
     return nullptr;
 }
 
-// ── Entry point (called when .so is loaded) ─────────────────────────────────
+// ── Entry point (called when .so is dlopen'd) ───────────────────────────────
 
 static PayloadState g_state{};
 static pthread_t    g_thread{};
@@ -140,12 +142,13 @@ static void payload_init()
     }
     luaL_openlibs(L);
 
-    g_state.L       = L;
-    g_state.running = true;
+    g_state.L = L;
+    g_state.running.store(true, std::memory_order_release);
 
     if (pthread_create(&g_thread, nullptr, ipc_thread, &g_state) != 0) {
         perror("[payload] pthread_create");
         lua_close(L);
+        g_state.L = nullptr;
         return;
     }
     pthread_detach(g_thread);
@@ -157,7 +160,7 @@ __attribute__((destructor))
 static void payload_fini()
 {
     fprintf(stderr, "[payload] shutting down\n");
-    g_state.running = false;
+    g_state.running.store(false, std::memory_order_release);
 
     // Poke the socket so accept() unblocks
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -168,6 +171,9 @@ static void payload_fini()
         connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
         close(fd);
     }
+
+    // Brief yield so the IPC thread can exit accept() and clean up
+    usleep(50000);
 
     if (g_state.L) {
         lua_close(g_state.L);
