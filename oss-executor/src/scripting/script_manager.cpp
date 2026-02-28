@@ -221,7 +221,8 @@ bool ScriptManager::execute_script(const std::string& name) const {
     }
 
     LOG_INFO("Executing script: {}", name);
-    return LuaEngine::instance().queue_script(source, name);
+    LuaEngine::instance().queue_script(source, name);
+    return true;
 }
 
 bool ScriptManager::execute_inline(const std::string& source) const {
@@ -230,7 +231,8 @@ bool ScriptManager::execute_inline(const std::string& source) const {
         return false;
     }
 
-    return LuaEngine::instance().queue_script(source, "<inline>");
+    LuaEngine::instance().queue_script(source, "<inline>");
+    return true;
 }
 
 } // namespace oss
