@@ -6,8 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-
-namespace ui {
+#include <algorithm>
 
 struct Color {
     float r = 1.0f;
@@ -37,35 +36,36 @@ struct Vec2 {
     Vec2(float x, float y) : x(x), y(y) {}
 };
 
-enum class DrawingType {
-    None = 0,
-    Line,
-    Rectangle,
-    FilledRectangle,
-    Circle,
-    FilledCircle,
-    Triangle,
-    Text,
-    Image
-};
-
 struct DrawingObject {
-    DrawingType type    = DrawingType::None;
-    Vec2        pos     = {};          // primary position / top-left
-    Vec2        pos2    = {};          // end-point (lines) or size (rects)
-    float       radius  = 0.0f;       // circles
+    // Nested enum so lua_engine.hpp can use DrawingObject::Type
+    enum class Type {
+        None = 0,
+        Line,
+        Rectangle,
+        FilledRectangle,
+        Circle,
+        FilledCircle,
+        Triangle,
+        Text,
+        Image
+    };
+
+    Type        type      = Type::None;
+    Vec2        pos       = {};          // primary position / top-left
+    Vec2        pos2      = {};          // end-point (lines) or size (rects)
+    float       radius    = 0.0f;       // circles
     float       thickness = 1.0f;
-    Color       color   = {};
+    Color       color     = {};
     Color       outline_color = {0, 0, 0, 1};
-    bool        outlined = false;
-    std::string text;                  // for DrawingType::Text
-    std::string font    = "monospace";
+    bool        outlined  = false;
+    std::string text;                   // for Type::Text
+    std::string font      = "monospace";
     float       font_size = 14.0f;
-    int         z_order = 0;
-    bool        visible = true;
+    int         z_order   = 0;
+    bool        visible   = true;
 
     // Unique identifier assigned by the engine
-    uint64_t    id      = 0;
+    uint64_t    id        = 0;
 };
 
 /// Thread-safe container that the Lua engine pushes into and the
@@ -105,5 +105,3 @@ private:
     mutable std::mutex           mtx_;
     std::vector<DrawingObject>   objects_;
 };
-
-} // namespace ui
