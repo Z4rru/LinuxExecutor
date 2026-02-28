@@ -515,6 +515,7 @@ static int lua_gethui(lua_State* L) {
     lua_pushvalue(L, -2);
     lua_pushstring(L, "CoreGui");
     lua_call(L, 2, 1);
+    lua_remove(L, -2); // remove 'game' from beneath result
     return 1;
 }
 
@@ -1831,4 +1832,5 @@ void Environment::setup_roblox_mock(LuaEngine& engine) {
 }
 
 } // namespace oss
+
 
