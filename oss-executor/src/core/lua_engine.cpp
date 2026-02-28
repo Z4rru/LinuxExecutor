@@ -22,10 +22,6 @@
 
 namespace oss {
 
-// ---------------------------------------------------------------------------
-// Engine pointer retrieval
-// ---------------------------------------------------------------------------
-
 static thread_local LuaEngine* current_engine = nullptr;
 
 static LuaEngine* get_engine(lua_State* L) {
@@ -34,10 +30,6 @@ static LuaEngine* get_engine(lua_State* L) {
     lua_pop(L, 1);
     return eng ? eng : current_engine;
 }
-
-// ---------------------------------------------------------------------------
-// Drawing helpers (file-scope)
-// ---------------------------------------------------------------------------
 
 static const char* DRAWING_OBJ_MT = "DrawingObject";
 
@@ -124,10 +116,6 @@ static void push_color3(lua_State* L, double r, double g, double b) {
     lua_pushnumber(L, b); lua_setfield(L, -2, "B");
 }
 
-// ---------------------------------------------------------------------------
-// DrawingHandle validation helper
-// ---------------------------------------------------------------------------
-
 static DrawingHandle* check_drawing_handle(lua_State* L, int idx) {
     auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, idx, DRAWING_OBJ_MT));
     if (h->removed) {
@@ -136,10 +124,6 @@ static DrawingHandle* check_drawing_handle(lua_State* L, int idx) {
     }
     return h;
 }
-
-// ---------------------------------------------------------------------------
-// Signal helper structs
-// ---------------------------------------------------------------------------
 
 struct SignalUserdata {
     char name[128];
@@ -158,10 +142,6 @@ struct ConnUD {
     int  conn_id;
     bool disconnected;
 };
-
-// ---------------------------------------------------------------------------
-// loadstring implementation (Luau does not provide one natively)
-// ---------------------------------------------------------------------------
 
 static int lua_loadstring_impl(lua_State* L) {
     size_t len;
@@ -187,26 +167,18 @@ static int lua_loadstring_impl(lua_State* L) {
     int status = luau_load(L, chunkname, bytecode.data(), bytecode.size(), 0);
 
     if (status != 0) {
-        // luau_load pushed an error string
         lua_pushnil(L);
         lua_insert(L, -2);
         return 2;
     }
 
-    return 1; // compiled function on top of stack
+    return 1;
 }
 
-// ===========================================================================
-// Singleton
-// ===========================================================================
 LuaEngine& LuaEngine::instance() {
     static LuaEngine inst;
     return inst;
 }
-
-// ===========================================================================
-// Luau custom allocator with memory cap
-// ===========================================================================
 
 void* LuaEngine::lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
     auto* engine = static_cast<LuaEngine*>(ud);
@@ -220,7 +192,6 @@ void* LuaEngine::lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
         return nullptr;
     }
 
-    // Safe memory-limit check with underflow protection
     size_t projected = engine->total_allocated_;
     if (projected >= osize)
         projected = projected - osize + nsize;
@@ -239,20 +210,12 @@ void* LuaEngine::lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
     return result;
 }
 
-// ===========================================================================
-// Luau interrupt callback (instruction quota hook)
-// ===========================================================================
-
 void LuaEngine::lua_interrupt(lua_State* L, int gc) {
-    if (gc >= 0) return;           // lua_getfield is unsafe during GC
+    if (gc >= 0) return;
     auto* eng = get_engine(L);
     if (eng && !eng->is_running())
         luaL_error(L, "Script execution cancelled");
 }
-
-// ===========================================================================
-// Lifecycle
-// ===========================================================================
 
 LuaEngine::LuaEngine() = default;
 
@@ -264,7 +227,6 @@ bool LuaEngine::init() {
 
     LOG_INFO("LuaEngine: Initializing embedded Luau VM");
 
-       // Reset tracking BEFORE creating VM so allocator starts at zero
     next_task_id_    = 1;
     tasks_.clear();
     signals_.clear();
@@ -288,10 +250,8 @@ bool LuaEngine::init() {
     luaL_openlibs(L_);
 
     LOG_DEBUG("LuaEngine: Setting up callbacks and registry...");
-    // Install interrupt for cancellation support
     lua_callbacks(L_)->interrupt = lua_interrupt;
 
-    // Store engine pointer in registry for retrieval from C functions
     lua_pushlightuserdata(L_, this);
     lua_setfield(L_, LUA_REGISTRYINDEX, "__oss_engine");
 
@@ -325,7 +285,6 @@ void LuaEngine::shutdown_internal() {
     ready_.store(false, std::memory_order_release);
     running_ = false;
 
-    // Clean up tasks — release all Lua refs before closing state
     for (auto& task : tasks_) {
         if (L_) {
             if (task.thread_ref != LUA_NOREF)
@@ -338,7 +297,6 @@ void LuaEngine::shutdown_internal() {
     }
     tasks_.clear();
 
-    // Clean up signals
     if (L_) {
         for (auto& [name, sig] : signals_) {
             for (auto& conn : sig.connections) {
@@ -351,7 +309,6 @@ void LuaEngine::shutdown_internal() {
     }
     signals_.clear();
 
-        // Clean up drawing objects
     {
         std::lock_guard<std::mutex> dlock(drawing_mutex_);
         for (auto& [id, obj] : drawing_objects_) {
@@ -366,7 +323,6 @@ void LuaEngine::shutdown_internal() {
         Overlay::instance().clear_objects();
     } catch (...) {}
 
-    // Drain script queue
     {
         std::lock_guard<std::mutex> ql(queue_mutex_);
         while (!script_queue_.empty()) script_queue_.pop();
@@ -378,10 +334,6 @@ void LuaEngine::shutdown_internal() {
 }
 
 void LuaEngine::reset() { shutdown(); init(); }
-
-// ===========================================================================
-// Luau bytecode compiler
-// ===========================================================================
 
 std::string LuaEngine::compile(const std::string& source) {
     Luau::CompileOptions options{};
@@ -396,7 +348,6 @@ std::string LuaEngine::compile(const std::string& source) {
         return "";
     }
 
-    // Luau convention: bytecode[0] == 0 means compile error, message follows
     if (bytecode[0] == 0) {
         last_error_ = "Compile error: " + bytecode.substr(1);
         LOG_ERROR("LuaEngine: {}", last_error_);
@@ -405,10 +356,6 @@ std::string LuaEngine::compile(const std::string& source) {
 
     return bytecode;
 }
-
-// ===========================================================================
-// Execution
-// ===========================================================================
 
 bool LuaEngine::execute(const std::string& source,
                          const std::string& chunk_name) {
@@ -428,7 +375,6 @@ bool LuaEngine::execute_internal(const std::string& source,
     running_.store(true, std::memory_order_release);
     current_engine = this;
 
-    // Compile source to Luau bytecode
     std::string bytecode = compile(source);
     if (bytecode.empty()) {
         if (error_cb_) error_cb_({last_error_, -1, chunk_name});
@@ -468,7 +414,7 @@ bool LuaEngine::execute_bytecode_internal(const std::string& bytecode,
     if (load_result != 0) {
         last_error_ = lua_tostring(thread, -1);
         LOG_ERROR("LuaEngine: Load error: {}", last_error_);
-        lua_pop(L_, 1); // pop thread
+        lua_pop(L_, 1);
         if (error_cb_) error_cb_({last_error_, -1, chunk_name});
         if (exec_cb_)  exec_cb_(false, last_error_);
         return false;
@@ -483,23 +429,20 @@ bool LuaEngine::execute_bytecode_internal(const std::string& bytecode,
 
     if (exec_result == 0) {
         LOG_INFO("LuaEngine: '{}' completed in {:.1f}ms", chunk_name, ms);
-        lua_pop(L_, 1); // pop thread
+        lua_pop(L_, 1);
         if (exec_cb_) exec_cb_(true, "");
         return true;
     } else if (exec_result == LUA_YIELD) {
         LOG_DEBUG("LuaEngine: '{}' yielded after {:.1f}ms", chunk_name, ms);
 
-        // If the coroutine yielded a wait duration, schedule it
         if (lua_gettop(thread) > 0 && lua_isnumber(thread, -1)) {
             double wait_seconds = lua_tonumber(thread, -1);
             lua_pop(thread, 1);
 
-                       // Reference the thread so it stays alive
             lua_pushthread(thread);
             lua_xmove(thread, L_, 1);
             int thread_ref = lua_ref(L_, -1);
 
-            // Pop ref'd copy and original lua_newthread value from main stack
             lua_pop(L_, 2);
 
             ScheduledTask task;
@@ -512,12 +455,10 @@ bool LuaEngine::execute_bytecode_internal(const std::string& bytecode,
             task.func_ref   = LUA_NOREF;
             schedule_task(std::move(task));
         } else {
-                       // Keep thread alive for next-tick resume
             lua_pushthread(thread);
             lua_xmove(thread, L_, 1);
             int thread_ref = lua_ref(L_, -1);
 
-            // Pop ref'd copy and original lua_newthread value from main stack
             lua_pop(L_, 2);
 
             ScheduledTask task;
@@ -534,7 +475,7 @@ bool LuaEngine::execute_bytecode_internal(const std::string& bytecode,
         const char* err = lua_tostring(thread, -1);
         last_error_ = err ? err : "Unknown runtime error";
         LOG_ERROR("LuaEngine: Runtime error in '{}': {}", chunk_name, last_error_);
-        lua_pop(L_, 1); // pop thread
+        lua_pop(L_, 1);
         if (error_cb_) error_cb_({last_error_, -1, chunk_name});
         if (exec_cb_)  exec_cb_(false, last_error_);
         return false;
@@ -551,10 +492,6 @@ bool LuaEngine::execute_file(const std::string& path) {
                          std::istreambuf_iterator<char>());
     return execute(content, "@" + path);
 }
-
-// ===========================================================================
-// Script queue
-// ===========================================================================
 
 void LuaEngine::queue_script(const std::string& source,
                               const std::string& name) {
@@ -576,10 +513,6 @@ void LuaEngine::process_queue() {
     }
 }
 
-// ===========================================================================
-// Tick / task scheduler — coroutine-based
-// ===========================================================================
-
 void LuaEngine::tick() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!L_ || !running_) return;
@@ -591,7 +524,6 @@ void LuaEngine::tick() {
 void LuaEngine::process_tasks() {
     auto now = std::chrono::steady_clock::now();
 
-    // Remove cancelled tasks
     auto cancelled_end = std::stable_partition(
         tasks_.begin(), tasks_.end(),
         [](const ScheduledTask& t) { return !t.cancelled; });
@@ -600,7 +532,6 @@ void LuaEngine::process_tasks() {
         release_task_refs(*it);
     tasks_.erase(cancelled_end, tasks_.end());
 
-    // Partition ready vs remaining
     std::vector<ScheduledTask> ready;
     std::vector<ScheduledTask> remaining;
     remaining.reserve(tasks_.size());
@@ -643,7 +574,6 @@ void LuaEngine::execute_task(ScheduledTask& task,
     lua_State* co = nullptr;
     [[maybe_unused]] bool new_thread = false;
 
-    // Resume existing coroutine or create new one from func_ref
     if (task.thread_ref != LUA_NOREF) {
         lua_rawgeti(L_, LUA_REGISTRYINDEX, task.thread_ref);
         if (lua_isthread(L_, -1))
@@ -661,7 +591,6 @@ void LuaEngine::execute_task(ScheduledTask& task,
             lua_unref(L_, task.thread_ref);
         task.thread_ref = thread_ref;
 
-        // Push the function onto the coroutine
         lua_rawgeti(L_, LUA_REGISTRYINDEX, task.func_ref);
         lua_xmove(L_, co, 1);
         new_thread = true;
@@ -672,14 +601,12 @@ void LuaEngine::execute_task(ScheduledTask& task,
         return;
     }
 
-    // Don't resume dead coroutines
     int co_status = lua_status(co);
     if (co_status != 0 && co_status != LUA_YIELD) {
         release_task_refs(task);
         return;
     }
 
-    // Transfer argument refs to coroutine stack
     int nargs = 0;
     for (int& ref : task.arg_refs) {
         if (ref != LUA_NOREF) {
@@ -692,7 +619,6 @@ void LuaEngine::execute_task(ScheduledTask& task,
     }
     task.arg_refs.clear();
 
-    // For delay tasks, push elapsed time
     if (task.type == ScheduledTask::Type::Delay) {
         auto scheduled_at = task.resume_at -
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -736,7 +662,6 @@ void LuaEngine::execute_task(ScheduledTask& task,
             error_cb_({err ? err : "task error", -1, "task"});
         LOG_ERROR("[Task] {}", err ? err : "unknown error");
     }
-    // status == 0: coroutine finished normally
 
     release_task_refs(task);
 }
@@ -759,10 +684,6 @@ size_t LuaEngine::pending_task_count() const {
         if (!t.cancelled) ++c;
     return c;
 }
-
-// ===========================================================================
-// Drawing object store — local registry with sync to Overlay
-// ===========================================================================
 
 int LuaEngine::create_drawing_object(DrawingObject::Type type) {
     std::lock_guard<std::mutex> dlock(drawing_mutex_);
@@ -820,10 +741,6 @@ void LuaEngine::clear_all_drawing_objects() {
     Overlay::instance().clear_objects();
 }
 
-// ===========================================================================
-// Global registration helpers
-// ===========================================================================
-
 void LuaEngine::register_function(const std::string& name,
                                    lua_CFunction func) {
     if (!L_) return;
@@ -867,10 +784,6 @@ std::optional<std::string> LuaEngine::get_global_string(const std::string& n) {
     return std::nullopt;
 }
 
-// ===========================================================================
-// Signals — fire with argument duplication
-// ===========================================================================
-
 int LuaEngine::fire_signal(const std::string& name, int nargs) {
     if (!L_) return 0;
     auto it = signals_.find(name);
@@ -911,10 +824,6 @@ Signal& LuaEngine::get_or_create_signal(const std::string& n) {
     return s;
 }
 
-// ===========================================================================
-// Sandbox helpers
-// ===========================================================================
-
 bool LuaEngine::is_sandboxed(const std::string& full_path,
                               const std::string& base_dir) {
     std::error_code ec;
@@ -927,10 +836,6 @@ bool LuaEngine::is_sandboxed(const std::string& full_path,
     if (!bs.empty() && bs.back() != '/') bs += '/';
     return cs.find(bs) == 0 || cs == base_canonical.string();
 }
-
-// ===========================================================================
-// Environment / library setup
-// ===========================================================================
 
 void LuaEngine::setup_environment() {
     register_function("print", lua_print);
@@ -952,7 +857,6 @@ void LuaEngine::register_task_lib() {
 }
 
 void LuaEngine::register_drawing_lib() {
-    // Metatable for drawing userdata
     luaL_newmetatable(L_, DRAWING_OBJ_MT);
 
     lua_pushcfunction(L_, lua_drawing_index, "__index");
@@ -969,7 +873,6 @@ void LuaEngine::register_drawing_lib() {
 
     lua_pop(L_, 1);
 
-    // Drawing library table
     lua_newtable(L_);
 
     lua_pushcfunction(L_, lua_drawing_new, "Drawing.new");
@@ -1031,7 +934,6 @@ void LuaEngine::register_custom_libs() {
     };
     register_library("http", http_lib);
 
-    // Alias http.get as global http_get
     lua_getglobal(L_, "http");
     lua_getfield(L_, -1, "get");
     lua_setglobal(L_, "http_get");
@@ -1088,12 +990,6 @@ void LuaEngine::register_custom_libs() {
 }
 
 void LuaEngine::sandbox() {
-    // Manual sandboxing — restrict dangerous functions without freezing tables.
-    // luaL_sandbox() is intentionally NOT called because it makes every
-    // global table readonly, which prevents community scripts (ESP, aimbot,
-    // etc.) from working.  Without luaL_sandbox(), luaL_sandboxthread() on
-    // new threads is a harmless no-op, so all threads share L_'s writable
-    // globals directly — exactly what executor scripts expect.
     execute_internal(R"(
         local safe_os = {
             time = os.time, clock = os.clock,
@@ -1104,10 +1000,6 @@ void LuaEngine::sandbox() {
         dofile = nil
     )", "=sandbox");
 }
-
-// ===========================================================================
-//  Drawing API
-// ===========================================================================
 
 int LuaEngine::lua_drawing_new(lua_State* L) {
     const char* ts = luaL_checkstring(L, 1);
@@ -1407,10 +1299,6 @@ int LuaEngine::lua_drawing_get_screen_size(lua_State* L) {
     return 1;
 }
 
-// ===========================================================================
-//  Task library — coroutine-based scheduler (Luau)
-// ===========================================================================
-
 int LuaEngine::lua_task_spawn(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
     auto* eng = get_engine(L);
@@ -1421,7 +1309,6 @@ int LuaEngine::lua_task_spawn(lua_State* L) {
     int thread_ref = lua_ref(eng->L_, -1);
     lua_pop(eng->L_, 1);
 
-    // Push function and args onto coroutine
     lua_pushvalue(L, 1);
     lua_xmove(L, co, 1);
     int nargs = lua_gettop(L) - 1;
@@ -1460,14 +1347,12 @@ int LuaEngine::lua_task_spawn(lua_State* L) {
         LOG_ERROR("[task.spawn] {}", err ? err : "unknown error");
     }
 
-    // Push thread for return BEFORE releasing the reference
     lua_rawgeti(L, LUA_REGISTRYINDEX, thread_ref);
     if (!lua_isthread(L, -1)) {
         lua_pop(L, 1);
         lua_pushnil(L);
     }
 
-    // Release ref if coroutine completed or errored (yielded refs are owned by tasks)
     if (status != LUA_YIELD) {
         lua_unref(eng->L_, thread_ref);
     }
@@ -1536,9 +1421,7 @@ int LuaEngine::lua_task_wait(lua_State* L) {
     double s = luaL_optnumber(L, 1, 0.03);
     if (s < 0) s = 0;
 
-    // Check if we're on the main thread
     if (lua_pushthread(L)) {
-        // Main thread — can't yield, fallback to sleep
         lua_pop(L, 1);
         std::this_thread::sleep_for(
             std::chrono::milliseconds(static_cast<int>(s * 1000)));
@@ -1547,7 +1430,6 @@ int LuaEngine::lua_task_wait(lua_State* L) {
     }
     lua_pop(L, 1);
 
-    // Coroutine — yield with wait duration
     lua_pushnumber(L, s);
     return lua_yield(L, 1);
 }
@@ -1561,10 +1443,6 @@ int LuaEngine::lua_task_cancel(lua_State* L) {
 
 int LuaEngine::lua_task_desynchronize(lua_State*) { return 0; }
 int LuaEngine::lua_task_synchronize(lua_State*)   { return 0; }
-
-// ===========================================================================
-//  Signal library
-// ===========================================================================
 
 int LuaEngine::lua_signal_new(lua_State* L) {
     const char* name = luaL_optstring(L, 1, "");
@@ -1717,10 +1595,6 @@ int LuaEngine::lua_signal_gc(lua_State* L) {
     return 0;
 }
 
-// ===========================================================================
-//  Core Lua globals
-// ===========================================================================
-
 int LuaEngine::lua_print(lua_State* L) {
     int n = lua_gettop(L);
     std::string output;
@@ -1766,10 +1640,6 @@ int LuaEngine::lua_pcall_handler(lua_State* L) {
     lua_pushstring(L, msg);
     return 1;
 }
-
-// ===========================================================================
-//  HTTP
-// ===========================================================================
 
 int LuaEngine::lua_http_get(lua_State* L) {
     const char* url = luaL_checkstring(L, 1);
@@ -1820,10 +1690,6 @@ int LuaEngine::lua_http_post(lua_State* L) {
     }
     return 1;
 }
-
-// ===========================================================================
-//  wait / spawn (global versions)
-// ===========================================================================
 
 int LuaEngine::lua_wait(lua_State* L) {
     double s = luaL_optnumber(L, 1, 0.03);
@@ -1891,23 +1757,17 @@ int LuaEngine::lua_spawn(lua_State* L) {
         LOG_ERROR("[spawn] {}", err ? err : "unknown error");
     }
 
-    // Push thread for return BEFORE releasing the reference
     lua_rawgeti(L, LUA_REGISTRYINDEX, thread_ref);
     if (!lua_isthread(L, -1)) {
         lua_pop(L, 1);
         lua_pushnil(L);
     }
 
-    // Release ref if coroutine completed or errored (yielded refs are owned by tasks)
     if (status != LUA_YIELD) {
         lua_unref(eng->L_, thread_ref);
     }
     return 1;
 }
-
-// ===========================================================================
-//  Filesystem (sandboxed to workspace/)
-// ===========================================================================
 
 int LuaEngine::lua_readfile(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
@@ -2026,10 +1886,6 @@ int LuaEngine::lua_makefolder(lua_State* L) {
     return 0;
 }
 
-// ===========================================================================
-//  Clipboard
-// ===========================================================================
-
 int LuaEngine::lua_getclipboard(lua_State* L) {
     std::array<char, 4096> buf;
     std::string result;
@@ -2055,10 +1911,6 @@ int LuaEngine::lua_setclipboard(lua_State* L) {
     return 0;
 }
 
-// ===========================================================================
-//  Executor identity
-// ===========================================================================
-
 int LuaEngine::lua_identifyexecutor(lua_State* L) {
     lua_pushstring(L, "OSS Executor");
     lua_pushstring(L, "2.0.0");
@@ -2079,10 +1931,6 @@ int LuaEngine::lua_get_hwid(lua_State* L) {
     return 1;
 }
 
-// ===========================================================================
-//  Console
-// ===========================================================================
-
 int LuaEngine::lua_rconsole_print(lua_State* L) { return lua_print(L); }
 
 int LuaEngine::lua_rconsole_clear(lua_State* L) {
@@ -2090,10 +1938,6 @@ int LuaEngine::lua_rconsole_clear(lua_State* L) {
     if (eng && eng->output_cb_) eng->output_cb_("\x1B[CLEAR]");
     return 0;
 }
-
-// ===========================================================================
-//  Crypto helpers
-// ===========================================================================
 
 int LuaEngine::lua_base64_encode(lua_State* L) {
     size_t len;
@@ -2168,10 +2012,4 @@ int LuaEngine::lua_sha256(lua_State* L) {
     return 1;
 }
 
-} // namespace oss
-
-
-
-
-
-
+}
