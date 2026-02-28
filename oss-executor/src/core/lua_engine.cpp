@@ -268,11 +268,11 @@ void LuaEngine::shutdown_internal() {
     for (auto& task : tasks_) {
         if (L_) {
             if (task.thread_ref != LUA_NOREF)
-                luaL_unref(L_, LUA_REGISTRYINDEX, task.thread_ref);
+                lua_unref(L_, task.thread_ref);
             if (task.func_ref != LUA_NOREF)
-                luaL_unref(L_, LUA_REGISTRYINDEX, task.func_ref);
+                lua_unref(L_, task.func_ref);
             for (int r : task.arg_refs)
-                if (r != LUA_NOREF) luaL_unref(L_, LUA_REGISTRYINDEX, r);
+                if (r != LUA_NOREF) lua_unref(L_, r);
         }
     }
     tasks_.clear();
@@ -282,7 +282,7 @@ void LuaEngine::shutdown_internal() {
         for (auto& [name, sig] : signals_) {
             for (auto& conn : sig.connections) {
                 if (conn.callback_ref != LUA_NOREF) {
-                    luaL_unref(L_, LUA_REGISTRYINDEX, conn.callback_ref);
+                    lua_unref(L_, conn.callback_ref);
                     conn.callback_ref = LUA_NOREF;
                 }
             }
@@ -434,7 +434,8 @@ bool LuaEngine::execute_bytecode_internal(const std::string& bytecode,
             // Reference the thread so it stays alive
             lua_pushthread(thread);
             lua_xmove(thread, L_, 1);
-            int thread_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
+            int thread_ref = lua_ref(L_, -1);
+            lua_pop(L_, 1);
 
             // Pop original thread from main stack
             lua_pop(L_, 1);
@@ -452,7 +453,9 @@ bool LuaEngine::execute_bytecode_internal(const std::string& bytecode,
             // Keep thread alive for next-tick resume
             lua_pushthread(thread);
             lua_xmove(thread, L_, 1);
-            int thread_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
+            int thread_ref = lua_ref(L_, -1);
+            lua_pop(L_, 1);
+
             lua_pop(L_, 1);
 
             ScheduledTask task;
@@ -555,16 +558,16 @@ void LuaEngine::process_tasks() {
 void LuaEngine::release_task_refs(ScheduledTask& task) {
     if (!L_) return;
     if (task.thread_ref != LUA_NOREF) {
-        luaL_unref(L_, LUA_REGISTRYINDEX, task.thread_ref);
+        lua_unref(L_, task.thread_ref);
         task.thread_ref = LUA_NOREF;
     }
     if (task.func_ref != LUA_NOREF) {
-        luaL_unref(L_, LUA_REGISTRYINDEX, task.func_ref);
+        lua_unref(L_, task.func_ref);
         task.func_ref = LUA_NOREF;
     }
     for (int& r : task.arg_refs) {
         if (r != LUA_NOREF) {
-            luaL_unref(L_, LUA_REGISTRYINDEX, r);
+            lua_unref(L_, r);
             r = LUA_NOREF;
         }
     }
@@ -589,10 +592,11 @@ void LuaEngine::execute_task(ScheduledTask& task,
     if (!co && task.func_ref != LUA_NOREF) {
         co = lua_newthread(L_);
         luaL_sandboxthread(co);
-        int thread_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
+        int thread_ref = lua_ref(L_, -1);
+        lua_pop(L_, 1);
 
         if (task.thread_ref != LUA_NOREF)
-            luaL_unref(L_, LUA_REGISTRYINDEX, task.thread_ref);
+            lua_unref(L_, task.thread_ref);
         task.thread_ref = thread_ref;
 
         // Push the function onto the coroutine
@@ -619,7 +623,7 @@ void LuaEngine::execute_task(ScheduledTask& task,
         if (ref != LUA_NOREF) {
             lua_rawgeti(L_, LUA_REGISTRYINDEX, ref);
             lua_xmove(L_, co, 1);
-            luaL_unref(L_, LUA_REGISTRYINDEX, ref);
+            lua_unref(L_, ref);
             ref = LUA_NOREF;
             ++nargs;
         }
@@ -1040,7 +1044,7 @@ int LuaEngine::lua_drawing_new(lua_State* L) {
     auto type = parse_drawing_type(ts);
 
     auto* eng = get_engine(L);
-    if (!eng) return luaL_error(L, "engine not available");
+    if (!eng) { luaL_error(L, "engine not available"); return 0; }
 
     int id = eng->create_drawing_object(type);
 
@@ -1119,7 +1123,7 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
 
     const char* key = luaL_checkstring(L, 2);
     auto* eng = get_engine(L);
-    if (!eng) return luaL_error(L, "engine not available");
+    if (!eng) { luaL_error(L, "engine not available"); return 0; }
 
     if (strcmp(key, "Visible") == 0) {
         bool v = lua_toboolean(L, 3);
@@ -1340,11 +1344,12 @@ int LuaEngine::lua_drawing_get_screen_size(lua_State* L) {
 int LuaEngine::lua_task_spawn(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
     auto* eng = get_engine(L);
-    if (!eng) return luaL_error(L, "engine not available");
+    if (!eng) { luaL_error(L, "engine not available"); return 0; }
 
     lua_State* co = lua_newthread(eng->L_);
     luaL_sandboxthread(co);
-    int thread_ref = luaL_ref(eng->L_, LUA_REGISTRYINDEX);
+    int thread_ref = lua_ref(eng->L_, -1);
+    lua_pop(eng->L_, 1);
 
     // Push function and args onto coroutine
     lua_pushvalue(L, 1);
@@ -1383,9 +1388,9 @@ int LuaEngine::lua_task_spawn(lua_State* L) {
         if (eng->error_cb_)
             eng->error_cb_({err ? err : "task.spawn error", -1, "task.spawn"});
         LOG_ERROR("[task.spawn] {}", err ? err : "unknown error");
-        luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
+        lua_unref(eng->L_, thread_ref);
     } else {
-        luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
+        lua_unref(eng->L_, thread_ref);
     }
 
     // Return the thread
@@ -1401,7 +1406,7 @@ int LuaEngine::lua_task_delay(lua_State* L) {
     double seconds = luaL_checknumber(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
     auto* eng = get_engine(L);
-    if (!eng) return luaL_error(L, "engine not available");
+    if (!eng) { luaL_error(L, "engine not available"); return 0; }
 
     if (seconds < 0) seconds = 0;
 
@@ -1413,12 +1418,15 @@ int LuaEngine::lua_task_delay(lua_State* L) {
             std::chrono::duration<double>(seconds));
 
     lua_pushvalue(L, 2);
-    task.func_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    task.func_ref = lua_ref(L, -1);
+    lua_pop(L, 1);
 
     int nargs = lua_gettop(L) - 2;
     for (int i = 0; i < nargs; ++i) {
         lua_pushvalue(L, i + 3);
-        task.arg_refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX));
+        int aref = lua_ref(L, -1);
+        lua_pop(L, 1);
+        task.arg_refs.push_back(aref);
     }
 
     int id = eng->schedule_task(std::move(task));
@@ -1429,19 +1437,22 @@ int LuaEngine::lua_task_delay(lua_State* L) {
 int LuaEngine::lua_task_defer(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
     auto* eng = get_engine(L);
-    if (!eng) return luaL_error(L, "engine not available");
+    if (!eng) { luaL_error(L, "engine not available"); return 0; }
 
     ScheduledTask task;
     task.type      = ScheduledTask::Type::Defer;
     task.resume_at = std::chrono::steady_clock::now();
 
     lua_pushvalue(L, 1);
-    task.func_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    task.func_ref = lua_ref(L, -1);
+    lua_pop(L, 1);
 
     int nargs = lua_gettop(L) - 1;
     for (int i = 0; i < nargs; ++i) {
         lua_pushvalue(L, i + 2);
-        task.arg_refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX));
+        int aref = lua_ref(L, -1);
+        lua_pop(L, 1);
+        task.arg_refs.push_back(aref);
     }
 
     int id = eng->schedule_task(std::move(task));
@@ -1486,7 +1497,7 @@ int LuaEngine::lua_task_synchronize(lua_State*)   { return 0; }
 int LuaEngine::lua_signal_new(lua_State* L) {
     const char* name = luaL_optstring(L, 1, "");
     auto* eng = get_engine(L);
-    if (!eng) return luaL_error(L, "engine not available");
+    if (!eng) { luaL_error(L, "engine not available"); return 0; }
 
     std::string sig_name = name;
     if (sig_name.empty())
@@ -1509,13 +1520,14 @@ int LuaEngine::lua_signal_connect(lua_State* L) {
     luaL_checktype(L, 2, LUA_TFUNCTION);
 
     auto* eng = get_engine(L);
-    if (!eng) return luaL_error(L, "engine not available");
+    if (!eng) { luaL_error(L, "engine not available"); return 0; }
 
     Signal* sig = eng->get_signal(ud->name);
-    if (!sig) return luaL_error(L, "Signal '%s' not found", ud->name);
+    if (!sig) { luaL_error(L, "Signal '%s' not found", ud->name); return 0; }
 
     lua_pushvalue(L, 2);
-    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int ref = lua_ref(L, -1);
+    lua_pop(L, 1);
 
     Signal::Connection conn;
     conn.callback_ref = ref;
@@ -1580,7 +1592,7 @@ int LuaEngine::lua_signal_disconnect(lua_State* L) {
         if (it->id == cud->conn_id) {
             it->connected = false;
             if (it->callback_ref != LUA_NOREF) {
-                luaL_unref(L, LUA_REGISTRYINDEX, it->callback_ref);
+                lua_unref(L, it->callback_ref);
                 it->callback_ref = LUA_NOREF;
             }
             sig->connections.erase(it);
@@ -1602,7 +1614,7 @@ int LuaEngine::lua_signal_destroy(lua_State* L) {
     if (sig) {
         for (auto& c : sig->connections) {
             if (c.callback_ref != LUA_NOREF) {
-                luaL_unref(L, LUA_REGISTRYINDEX, c.callback_ref);
+                lua_unref(L, c.callback_ref);
                 c.callback_ref = LUA_NOREF;
             }
         }
@@ -1621,7 +1633,7 @@ int LuaEngine::lua_signal_gc(lua_State* L) {
             if (sig) {
                 for (auto& c : sig->connections) {
                     if (c.callback_ref != LUA_NOREF) {
-                        luaL_unref(L, LUA_REGISTRYINDEX, c.callback_ref);
+                        lua_unref(L, c.callback_ref);
                         c.callback_ref = LUA_NOREF;
                     }
                 }
@@ -1679,9 +1691,6 @@ int LuaEngine::lua_warn_handler(lua_State* L) {
 int LuaEngine::lua_pcall_handler(lua_State* L) {
     const char* msg = lua_tostring(L, -1);
     if (!msg) msg = "Unknown error";
-    // Note: luaL_traceback is not available in stock Luau, but the Luau VM
-    // provides stack traces in error messages by default.
-    // If a custom traceback helper is available, call it here.
     lua_pushstring(L, msg);
     return 1;
 }
@@ -1765,11 +1774,12 @@ int LuaEngine::lua_wait(lua_State* L) {
 int LuaEngine::lua_spawn(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
     auto* eng = get_engine(L);
-    if (!eng) return luaL_error(L, "engine not available");
+    if (!eng) { luaL_error(L, "engine not available"); return 0; }
 
     lua_State* co = lua_newthread(eng->L_);
     luaL_sandboxthread(co);
-    int thread_ref = luaL_ref(eng->L_, LUA_REGISTRYINDEX);
+    int thread_ref = lua_ref(eng->L_, -1);
+    lua_pop(eng->L_, 1);
 
     lua_pushvalue(L, 1);
     lua_xmove(L, co, 1);
@@ -1807,9 +1817,9 @@ int LuaEngine::lua_spawn(lua_State* L) {
         if (eng->error_cb_)
             eng->error_cb_({err ? err : "spawn error", -1, "spawn"});
         LOG_ERROR("[spawn] {}", err ? err : "unknown error");
-        luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
+        lua_unref(eng->L_, thread_ref);
     } else {
-        luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
+        lua_unref(eng->L_, thread_ref);
     }
 
     lua_rawgeti(L, LUA_REGISTRYINDEX, thread_ref);
@@ -1828,10 +1838,15 @@ int LuaEngine::lua_readfile(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full = base + path;
-    if (!is_sandboxed(full, base))
-        return luaL_error(L, "Access denied: path traversal detected");
+    if (!is_sandboxed(full, base)) {
+        luaL_error(L, "Access denied: path traversal detected");
+        return 0;
+    }
     std::ifstream f(full);
-    if (!f.is_open()) return luaL_error(L, "Cannot open file: %s", path);
+    if (!f.is_open()) {
+        luaL_error(L, "Cannot open file: %s", path);
+        return 0;
+    }
     std::string content((std::istreambuf_iterator<char>(f)),
                          std::istreambuf_iterator<char>());
     lua_pushlstring(L, content.c_str(), content.size());
@@ -1844,13 +1859,18 @@ int LuaEngine::lua_writefile(lua_State* L) {
     const char* content = luaL_checklstring(L, 2, &content_len);
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full = base + path;
-    if (!is_sandboxed(full, base))
-        return luaL_error(L, "Access denied: path traversal detected");
+    if (!is_sandboxed(full, base)) {
+        luaL_error(L, "Access denied: path traversal detected");
+        return 0;
+    }
     std::error_code ec;
     std::filesystem::create_directories(
         std::filesystem::path(full).parent_path(), ec);
     std::ofstream f(full, std::ios::binary);
-    if (!f.is_open()) return luaL_error(L, "Cannot write file: %s", path);
+    if (!f.is_open()) {
+        luaL_error(L, "Cannot write file: %s", path);
+        return 0;
+    }
     f.write(content, static_cast<std::streamsize>(content_len));
     return 0;
 }
@@ -1861,10 +1881,15 @@ int LuaEngine::lua_appendfile(lua_State* L) {
     const char* content = luaL_checklstring(L, 2, &content_len);
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full = base + path;
-    if (!is_sandboxed(full, base))
-        return luaL_error(L, "Access denied: path traversal detected");
+    if (!is_sandboxed(full, base)) {
+        luaL_error(L, "Access denied: path traversal detected");
+        return 0;
+    }
     std::ofstream f(full, std::ios::app | std::ios::binary);
-    if (!f.is_open()) return luaL_error(L, "Cannot append to file: %s", path);
+    if (!f.is_open()) {
+        luaL_error(L, "Cannot append to file: %s", path);
+        return 0;
+    }
     f.write(content, static_cast<std::streamsize>(content_len));
     return 0;
 }
@@ -1904,8 +1929,10 @@ int LuaEngine::lua_delfolder(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full = base + path;
-    if (!is_sandboxed(full, base))
-        return luaL_error(L, "Access denied: path traversal detected");
+    if (!is_sandboxed(full, base)) {
+        luaL_error(L, "Access denied: path traversal detected");
+        return 0;
+    }
     std::error_code ec;
     std::filesystem::remove_all(full, ec);
     return 0;
@@ -1915,8 +1942,10 @@ int LuaEngine::lua_makefolder(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full = base + path;
-    if (!is_sandboxed(full, base))
-        return luaL_error(L, "Access denied: path traversal detected");
+    if (!is_sandboxed(full, base)) {
+        luaL_error(L, "Access denied: path traversal detected");
+        return 0;
+    }
     std::error_code ec;
     std::filesystem::create_directories(full, ec);
     return 0;
