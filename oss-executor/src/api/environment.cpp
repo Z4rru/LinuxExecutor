@@ -8,8 +8,24 @@
 #include <cstring>
 #include <sstream>
 #include <map>
+#include "Luau/Compiler.h"
+
+// Luau compat: lua_pushcfunction requires 3 args; accept 2 or 3
+#undef lua_pushcfunction
+#define lua_pushcfunction(L, fn, ...) lua_pushcclosurek(L, fn, #fn, 0, NULL)
 
 namespace oss {
+
+// Luau compat: replaces luaL_dostring (compile + load + pcall)
+static int oss_dostring(lua_State* L, const char* code, const char* name) {
+    Luau::CompileOptions opts;
+    opts.optimizationLevel = 1;
+    std::string bc = Luau::compile(std::string(code), opts);
+    if (bc.empty()) { lua_pushstring(L, "compile error"); return 1; }
+    if (bc[0] == 0) { lua_pushstring(L, bc.c_str() + 1); return 1; }
+    if (luau_load(L, name, bc.data(), bc.size(), 0) != 0) return 1;
+    return lua_pcall(L, 0, 0, 0);
+}
 
 static int lua_typeof(lua_State* L) {
     if (lua_getmetatable(L, 1)) {
@@ -25,24 +41,25 @@ static int lua_http_get(lua_State* L) {
     int url_index = 1;
     int arg1_type = lua_type(L, 1);
     if (arg1_type == LUA_TTABLE || arg1_type == LUA_TUSERDATA) url_index = 2;
-    if (lua_gettop(L) < url_index) return luaL_error(L, "HttpGet: expected URL argument");
+    if (lua_gettop(L) < url_index) { luaL_error(L, "HttpGet: expected URL argument"); return 0; }
     const char* url = luaL_checkstring(L, url_index);
-    if (!url || strlen(url) == 0) return luaL_error(L, "HttpGet: URL cannot be empty");
+    if (!url || strlen(url) == 0) { luaL_error(L, "HttpGet: URL cannot be empty"); return 0; }
     std::string surl(url);
     if (surl.rfind("http://", 0) != 0 && surl.rfind("https://", 0) != 0)
-        return luaL_error(L, "HttpGet: URL must start with http:// or https://");
+        luaL_error(L, "HttpGet: URL must start with http:// or https://"); return 0;
     try {
         auto response = Http::instance().get(surl);
         if (response.success()) {
             lua_pushlstring(L, response.body.data(), response.body.size());
         } else {
-            return luaL_error(L, "HttpGet failed: HTTP %d for '%s'%s%s",
+            luaL_error(L, "HttpGet failed: HTTP %ld for '%s'%s%s",
                 response.status_code, surl.c_str(),
                 response.error.empty() ? "" : " - ",
                 response.error.empty() ? "" : response.error.c_str());
+            return 0;
         }
     } catch (const std::exception& e) {
-        return luaL_error(L, "HttpGet exception: %s", e.what());
+        luaL_error(L, "HttpGet exception: %s", e.what()); return 0;
     }
     return 1;
 }
@@ -356,22 +373,22 @@ static int lua_gui_get_screen_size(lua_State* L) {
 // ── Debug functions ──
 
 static int lua_debug_getinfo(lua_State* L) {
-    int level = 0;
     lua_Debug ar;
     memset(&ar, 0, sizeof(ar));
 
     if (lua_isnumber(L, 1)) {
-        level = static_cast<int>(lua_tointeger(L, 1));
-        if (!lua_getstack(L, level, &ar)) {
+        int level = static_cast<int>(lua_tointeger(L, 1));
+        if (!lua_getinfo(L, level, "slna", &ar)) {
             lua_pushnil(L);
             return 1;
         }
-        lua_getinfo(L, "nSlu", &ar);
     } else if (lua_isfunction(L, 1)) {
         lua_pushvalue(L, 1);
-        lua_getinfo(L, ">nSlu", &ar);
+        lua_getinfo(L, -1, "slna", &ar);
+        lua_pop(L, 1);
     } else {
-        return luaL_error(L, "debug.getinfo: expected number or function");
+        luaL_error(L, "debug.getinfo: expected number or function");
+        return 0;
     }
 
     lua_newtable(L);
@@ -379,7 +396,7 @@ static int lua_debug_getinfo(lua_State* L) {
     if (ar.source) {
         lua_pushstring(L, ar.source);
         lua_setfield(L, -2, "source");
-        lua_pushstring(L, ar.source);
+        lua_pushstring(L, ar.short_src);
         lua_setfield(L, -2, "short_src");
     }
     if (ar.name) {
@@ -394,16 +411,13 @@ static int lua_debug_getinfo(lua_State* L) {
     lua_setfield(L, -2, "currentline");
     lua_pushinteger(L, ar.linedefined);
     lua_setfield(L, -2, "linedefined");
-    lua_pushinteger(L, ar.lastlinedefined);
-    lua_setfield(L, -2, "lastlinedefined");
-    lua_pushinteger(L, ar.nups);
+    lua_pushinteger(L, ar.nupvals);
     lua_setfield(L, -2, "nups");
+    lua_pushinteger(L, ar.nparams);
+    lua_setfield(L, -2, "numparams");
+    lua_pushboolean(L, ar.isvararg);
+    lua_setfield(L, -2, "is_vararg");
 
-    const char* filter = lua_isstring(L, 2) ? lua_tostring(L, 2) : nullptr;
-    if (filter) {
-        lua_pushstring(L, filter);
-        lua_setfield(L, -2, "filter");
-    }
     return 1;
 }
 
@@ -498,14 +512,8 @@ static int lua_debug_getstack(lua_State* L) {
     int level = static_cast<int>(luaL_checkinteger(L, 1));
     int idx = static_cast<int>(luaL_optinteger(L, 2, 0));
 
-    lua_Debug ar;
-    if (!lua_getstack(L, level, &ar)) {
-        lua_pushnil(L);
-        return 1;
-    }
-
     if (idx > 0) {
-        const char* name = lua_getlocal(L, &ar, idx);
+        const char* name = lua_getlocal(L, level, idx);
         if (name) return 1;
         lua_pushnil(L);
         return 1;
@@ -514,7 +522,7 @@ static int lua_debug_getstack(lua_State* L) {
     lua_newtable(L);
     int i = 1;
     while (true) {
-        const char* name = lua_getlocal(L, &ar, i);
+        const char* name = lua_getlocal(L, level, i);
         if (!name) break;
         lua_setfield(L, -2, name);
         ++i;
@@ -527,11 +535,8 @@ static int lua_debug_setstack(lua_State* L) {
     int idx = static_cast<int>(luaL_checkinteger(L, 2));
     luaL_checkany(L, 3);
 
-    lua_Debug ar;
-    if (!lua_getstack(L, level, &ar)) return 0;
-
     lua_pushvalue(L, 3);
-    lua_setlocal(L, &ar, idx);
+    lua_setlocal(L, level, idx);
     return 0;
 }
 
@@ -560,8 +565,7 @@ static int lua_debug_getregistry(lua_State* L) {
 
 static int lua_debug_traceback(lua_State* L) {
     const char* msg = luaL_optstring(L, 1, "");
-    int level = static_cast<int>(luaL_optinteger(L, 2, 1));
-    luaL_traceback(L, L, msg, level);
+    lua_pushstring(L, msg);
     return 1;
 }
 
@@ -2165,7 +2169,7 @@ void Environment::setup(LuaEngine& engine) {
     setup_thread_lib(engine);
     setup_closure_lib(engine);
 
-    int status = luaL_dostring(L, ROBLOX_MOCK_LUA);
+    int status = oss_dostring(L, ROBLOX_MOCK_LUA, "=roblox_mock");
     if (status != 0) {
         const char* err = lua_tostring(L, -1);
         LOG_ERROR("Failed to init Roblox mock: {}", err ? err : "unknown error");
@@ -2337,7 +2341,7 @@ void Environment::setup_gui_bridge(LuaEngine& engine) {
 
 void Environment::setup_roblox_mock(LuaEngine& engine) {
     lua_State* L = engine.state();
-    int status = luaL_dostring(L, ROBLOX_MOCK_LUA);
+    int status = oss_dostring(L, ROBLOX_MOCK_LUA, "=roblox_mock");
     if (status != 0) {
         const char* err = lua_tostring(L, -1);
         LOG_ERROR("Failed to init Roblox mock: {}", err ? err : "unknown error");
@@ -2346,4 +2350,5 @@ void Environment::setup_roblox_mock(LuaEngine& engine) {
 }
 
 } // namespace oss
+
 
