@@ -62,6 +62,44 @@ static const std::string PATH_KEYWORDS[] = {
     ".exe", ".dll", "wine"
 };
 
+// ─── Self-targeting exclusion list ───────────────────────────────────
+static const std::string SELF_KEYWORDS[] = {
+    "OSS", "OSSExecutor", "oss-executor", "AppImage"
+};
+
+// Returns true if the given PID or process string is ourselves
+static bool is_self_process(pid_t pid) {
+    // Never target our own PID
+    if (pid == getpid()) return true;
+
+    // Never target our parent (in case launched from wrapper)
+    if (pid == getppid()) return true;
+
+    return false;
+}
+
+static bool is_self_process_name(const std::string& name) {
+    if (name.empty()) return false;
+    for (const auto& kw : SELF_KEYWORDS) {
+        if (name.find(kw) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// Combined validation: is this PID a valid Roblox target (not us)?
+static bool is_valid_target(pid_t pid, const std::string& comm,
+                            const std::string& cmdline,
+                            const std::string& exe_path) {
+    // Reject self
+    if (is_self_process(pid)) return false;
+    if (is_self_process_name(comm))     return false;
+    if (is_self_process_name(cmdline))  return false;
+    if (is_self_process_name(exe_path)) return false;
+
+    return true;  // passed all exclusions
+}
+// ─────────────────────────────────────────────────────────────────────
+
 std::string Injection::read_proc_cmdline(pid_t pid) {
     try {
         std::ifstream f("/proc/" + std::to_string(pid) + "/cmdline",
@@ -214,7 +252,18 @@ bool Injection::write_to_process(uintptr_t addr, const void* data, size_t len) {
     return f.good();
 }
 
+// ─── PATCHED: reject self-targeting before adopting ──────────────────
 void Injection::adopt_target(pid_t pid, const std::string& via) {
+    // Final guard: never adopt ourselves
+    std::string comm    = read_proc_comm(pid);
+    std::string cmdline = read_proc_cmdline(pid);
+    std::string exe     = read_proc_exe(pid);
+
+    if (!is_valid_target(pid, comm, cmdline, exe)) {
+        LOG_DEBUG("Rejected self-target PID {} ('{}') — skipping", pid, comm);
+        return;
+    }
+
     memory_.set_pid(pid);
     proc_info_ = gather_info(pid);
     set_status(InjectionStatus::Found,
@@ -223,13 +272,20 @@ void Injection::adopt_target(pid_t pid, const std::string& via) {
              pid, proc_info_.name, proc_info_.exe_path,
              proc_info_.via_wine, proc_info_.via_sober, proc_info_.via_flatpak);
 }
+// ─────────────────────────────────────────────────────────────────────
 
 bool Injection::scan_direct() {
     for (const auto& t : DIRECT_TARGETS) {
         auto pid = Memory::find_process(t);
         if (pid.has_value()) {
-            adopt_target(pid.value(), "direct '" + t + "'");
-            return true;
+            pid_t p = pid.value();
+            // Skip if it's ourselves
+            if (is_self_process(p)) continue;
+            std::string comm = read_proc_comm(p);
+            if (is_self_process_name(comm)) continue;
+
+            adopt_target(p, "direct '" + t + "'");
+            if (memory_.is_valid()) return true;
         }
     }
     return false;
@@ -238,25 +294,11 @@ bool Injection::scan_direct() {
 bool Injection::scan_wine_cmdline() {
     for (const auto& h : WINE_HOSTS) {
         for (auto pid : Memory::find_all_processes(h)) {
+            if (is_self_process(pid)) continue;
+
             if (has_roblox_token(read_proc_cmdline(pid))) {
                 adopt_target(pid, "via Wine cmdline");
-                proc_info_.via_wine = true;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool Injection::scan_wine_regions() {
-    for (const auto& h : WINE_HOSTS) {
-        for (auto pid : Memory::find_all_processes(h)) {
-            Memory mem(pid);
-            for (const auto& r : mem.get_regions()) {
-                std::string lp = r.path;
-                std::transform(lp.begin(), lp.end(), lp.begin(), ::tolower);
-                if (lp.find("roblox") != std::string::npos) {
-                    adopt_target(pid, "via Wine memory region");
+                if (memory_.is_valid()) {
                     proc_info_.via_wine = true;
                     return true;
                 }
@@ -266,33 +308,21 @@ bool Injection::scan_wine_regions() {
     return false;
 }
 
-bool Injection::scan_flatpak() {
-    for (auto bpid : Memory::find_all_processes("bwrap")) {
-        std::string bc = read_proc_cmdline(bpid);
-        std::string bl = bc;
-        std::transform(bl.begin(), bl.end(), bl.begin(), ::tolower);
-        if (bl.find("sober") == std::string::npos &&
-            bl.find("vinegar") == std::string::npos) continue;
+bool Injection::scan_wine_regions() {
+    for (const auto& h : WINE_HOSTS) {
+        for (auto pid : Memory::find_all_processes(h)) {
+            if (is_self_process(pid)) continue;
 
-        for (auto cpid : descendants(bpid)) {
-            if (has_roblox_token(read_proc_cmdline(cpid))) {
-                adopt_target(cpid, "via Sober/Flatpak cmdline");
-                proc_info_.via_sober = true;
-                proc_info_.via_flatpak = true;
-                return true;
-            }
-        }
-
-        for (auto cpid : descendants(bpid)) {
-            Memory mem(cpid);
+            Memory mem(pid);
             for (const auto& r : mem.get_regions()) {
                 std::string lp = r.path;
                 std::transform(lp.begin(), lp.end(), lp.begin(), ::tolower);
                 if (lp.find("roblox") != std::string::npos) {
-                    adopt_target(cpid, "via Sober/Flatpak memory");
-                    proc_info_.via_sober = true;
-                    proc_info_.via_flatpak = true;
-                    return true;
+                    adopt_target(pid, "via Wine memory region");
+                    if (memory_.is_valid()) {
+                        proc_info_.via_wine = true;
+                        return true;
+                    }
                 }
             }
         }
@@ -300,22 +330,83 @@ bool Injection::scan_flatpak() {
     return false;
 }
 
+bool Injection::scan_flatpak() {
+    for (auto bpid : Memory::find_all_processes("bwrap")) {
+        if (is_self_process(bpid)) continue;
+
+        std::string bc = read_proc_cmdline(bpid);
+        std::string bl = bc;
+        std::transform(bl.begin(), bl.end(), bl.begin(), ::tolower);
+        if (bl.find("sober") == std::string::npos &&
+            bl.find("vinegar") == std::string::npos) continue;
+
+        for (auto cpid : descendants(bpid)) {
+            if (is_self_process(cpid)) continue;
+
+            if (has_roblox_token(read_proc_cmdline(cpid))) {
+                adopt_target(cpid, "via Sober/Flatpak cmdline");
+                if (memory_.is_valid()) {
+                    proc_info_.via_sober = true;
+                    proc_info_.via_flatpak = true;
+                    return true;
+                }
+            }
+        }
+
+        for (auto cpid : descendants(bpid)) {
+            if (is_self_process(cpid)) continue;
+
+            Memory mem(cpid);
+            for (const auto& r : mem.get_regions()) {
+                std::string lp = r.path;
+                std::transform(lp.begin(), lp.end(), lp.begin(), ::tolower);
+                if (lp.find("roblox") != std::string::npos) {
+                    adopt_target(cpid, "via Sober/Flatpak memory");
+                    if (memory_.is_valid()) {
+                        proc_info_.via_sober = true;
+                        proc_info_.via_flatpak = true;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// ─── PATCHED: skip self PID & self process names ─────────────────────
 bool Injection::scan_brute() {
+    pid_t self_pid   = getpid();
+    pid_t parent_pid = getppid();
+
     try {
         for (const auto& entry : fs::directory_iterator("/proc")) {
             if (!entry.is_directory()) continue;
             std::string d = entry.path().filename().string();
             if (!std::all_of(d.begin(), d.end(), ::isdigit)) continue;
             pid_t pid = std::stoi(d);
-            if (pid <= 1) continue;
-            if (has_roblox_token(read_proc_cmdline(pid))) {
+
+            // Skip invalid, self, and parent
+            if (pid <= 1)          continue;
+            if (pid == self_pid)   continue;
+            if (pid == parent_pid) continue;
+
+            // Skip if process name looks like us
+            std::string comm = read_proc_comm(pid);
+            if (is_self_process_name(comm)) continue;
+
+            std::string cmdline = read_proc_cmdline(pid);
+            if (is_self_process_name(cmdline)) continue;
+
+            if (has_roblox_token(cmdline)) {
                 adopt_target(pid, "via brute scan");
-                return true;
+                if (memory_.is_valid()) return true;
             }
         }
     } catch (...) {}
     return false;
 }
+// ─────────────────────────────────────────────────────────────────────
 
 bool Injection::scan_for_roblox() {
     set_status(InjectionStatus::Scanning, "Scanning for Roblox...");
