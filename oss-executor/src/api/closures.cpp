@@ -5,6 +5,7 @@
 #include "../core/lua_engine.hpp"
 
 #include "Luau/Compiler.h"
+#include <spdlog/spdlog.h>
 
 #include <ctime>
 #include <cmath>
@@ -89,13 +90,17 @@ static void read_udim2(lua_State* L, int idx,
     xs = xo = ys = yo = 0;
     if (!lua_istable(L, idx)) return;
     lua_getfield(L, idx, "_xs");
-    if (lua_isnumber(L, -1)) xs = (float)lua_tonumber(L, -1); lua_pop(L, 1);
+    if (lua_isnumber(L, -1)) xs = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
     lua_getfield(L, idx, "_xo");
-    if (lua_isnumber(L, -1)) xo = (float)lua_tonumber(L, -1); lua_pop(L, 1);
+    if (lua_isnumber(L, -1)) xo = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
     lua_getfield(L, idx, "_ys");
-    if (lua_isnumber(L, -1)) ys = (float)lua_tonumber(L, -1); lua_pop(L, 1);
+    if (lua_isnumber(L, -1)) ys = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
     lua_getfield(L, idx, "_yo");
-    if (lua_isnumber(L, -1)) yo = (float)lua_tonumber(L, -1); lua_pop(L, 1);
+    if (lua_isnumber(L, -1)) yo = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
 }
 
 static void read_color3(lua_State* L, int idx,
@@ -103,11 +108,14 @@ static void read_color3(lua_State* L, int idx,
     r = g = b = 0;
     if (!lua_istable(L, idx)) return;
     lua_getfield(L, idx, "R");
-    if (lua_isnumber(L, -1)) r = (float)lua_tonumber(L, -1); lua_pop(L, 1);
+    if (lua_isnumber(L, -1)) r = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
     lua_getfield(L, idx, "G");
-    if (lua_isnumber(L, -1)) g = (float)lua_tonumber(L, -1); lua_pop(L, 1);
+    if (lua_isnumber(L, -1)) g = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
     lua_getfield(L, idx, "B");
-    if (lua_isnumber(L, -1)) b = (float)lua_tonumber(L, -1); lua_pop(L, 1);
+    if (lua_isnumber(L, -1)) b = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
 }
 
 static void push_instance(lua_State* L, int instance_id,
@@ -251,7 +259,7 @@ int Closures::l_print(lua_State* L) {
         if (s) output += std::string(s, len);
         lua_pop(L, 1);
     }
-    Logger::instance().info("[Script] {}", output);
+    spdlog::info("[Script] {}", output);
     return 0;
 }
 
@@ -265,7 +273,7 @@ int Closures::l_warn(lua_State* L) {
         if (s) output += std::string(s, len);
         lua_pop(L, 1);
     }
-    Logger::instance().warning("[Script] {}", output);
+    spdlog::warn("[Script] {}", output);
     return 0;
 }
 
@@ -301,8 +309,8 @@ int Closures::l_spawn(lua_State* L) {
     int status = lua_pcall(L, nargs - 1, 0, 0);
     if (status != 0) {
         const char* err = lua_tostring(L, -1);
-        Logger::instance().error("[Script] spawn error: {}",
-                                  err ? err : "unknown");
+        spdlog::error("[Script] spawn error: {}",
+                      err ? err : "unknown");
         lua_pop(L, 1);
     }
     return 0;
@@ -381,8 +389,8 @@ int Closures::l_instance_new(lua_State* L) {
     }
 
     push_instance(L, inst_id, class_name);
-    Logger::instance().debug("Instance.new('{}') -> id={}, overlay_id={}",
-                              class_name, inst_id, overlay_id);
+    spdlog::debug("Instance.new('{}') -> id={}, overlay_id={}",
+                  class_name, inst_id, overlay_id);
     return 1;
 }
 
@@ -809,7 +817,11 @@ int Closures::l_drawing_newindex(lua_State* L) {
 
     overlay.update_object(id, [&](DrawingObject& obj) {
         if      (prop == "Visible")      { obj.visible = lua_toboolean(L,3); }
-        else if (prop == "Color")        { read_color3(L,3,obj.color_r,obj.color_g,obj.color_b); }
+        else if (prop == "Color") {
+            float r, g, b;
+            read_color3(L, 3, r, g, b);
+            obj.color_r = r; obj.color_g = g; obj.color_b = b;
+        }
         else if (prop == "Transparency") { if (lua_isnumber(L,3)) obj.transparency=(float)lua_tonumber(L,3); }
         else if (prop == "Thickness")    { if (lua_isnumber(L,3)) obj.thickness=(float)lua_tonumber(L,3); }
         else if (prop == "From") {
@@ -844,7 +856,11 @@ int Closures::l_drawing_newindex(lua_State* L) {
         }
         else if (prop == "Center")       { obj.center  = lua_toboolean(L,3); }
         else if (prop == "Outline")      { obj.outline  = lua_toboolean(L,3); }
-        else if (prop == "OutlineColor") { read_color3(L,3,obj.outline_r,obj.outline_g,obj.outline_b); }
+        else if (prop == "OutlineColor") {
+            float r, g, b;
+            read_color3(L, 3, r, g, b);
+            obj.outline_r = r; obj.outline_g = g; obj.outline_b = b;
+        }
         else if (prop == "Font")         { if (lua_isnumber(L,3)) obj.font=(int)lua_tointeger(L,3); }
         else if (prop == "Radius")       { if (lua_isnumber(L,3)) obj.radius=(float)lua_tonumber(L,3); }
         else if (prop == "Filled")       { obj.filled = lua_toboolean(L,3); }
@@ -998,8 +1014,9 @@ int Closures::l_game_getservice(lua_State* L) {
 
 int Closures::l_game_httpget(lua_State* L) {
     const char* url = luaL_checkstring(L, 2);
-    std::string resp = Http::get(url);
-    lua_pushlstring(L, resp.data(), resp.size());
+    Http http;
+    auto resp = http.get(url);
+    lua_pushlstring(L, resp.body.data(), resp.body.size());
     return 1;
 }
 
@@ -1060,7 +1077,7 @@ int Closures::l_setclipboard(lua_State* L) {
         cmd += "wl-copy";
     else
         cmd += "xclip -selection clipboard";
-    std::system(cmd.c_str());
+    (void)std::system(cmd.c_str());
     return 0;
 }
 
@@ -1072,17 +1089,17 @@ int Closures::l_getnamecallmethod(lua_State* L) {
 }
 
 int Closures::l_fireclickdetector(lua_State* L) {
-    Logger::instance().debug("[Script] fireclickdetector called");
+    spdlog::debug("[Script] fireclickdetector called");
     return 0;
 }
 
 int Closures::l_firetouchinterest(lua_State* L) {
-    Logger::instance().debug("[Script] firetouchinterest called");
+    spdlog::debug("[Script] firetouchinterest called");
     return 0;
 }
 
 int Closures::l_fireproximityprompt(lua_State* L) {
-    Logger::instance().debug("[Script] fireproximityprompt called");
+    spdlog::debug("[Script] fireproximityprompt called");
     return 0;
 }
 
@@ -1135,13 +1152,15 @@ int Closures::l_http_request(lua_State* L) {
     }
     lua_pop(L, 1);
 
+    Http http;
     std::string response_body;
     int status_code = 0;
     bool success = false;
     std::string ms(method);
 
     if (ms == "GET") {
-        response_body = Http::get(url);
+        auto resp = http.get(url, headers);
+        response_body = resp.body;
         status_code = response_body.empty() ? 0 : 200;
         success = !response_body.empty();
     } else if (ms == "POST") {
@@ -1149,11 +1168,15 @@ int Closures::l_http_request(lua_State* L) {
         std::string ct = "application/json";
         auto it = headers.find("Content-Type");
         if (it != headers.end()) ct = it->second;
-        response_body = Http::post(url, bs, ct);
+        std::map<std::string,std::string> req_headers = headers;
+        req_headers["Content-Type"] = ct;
+        auto resp = http.post(url, bs, req_headers);
+        response_body = resp.body;
         status_code = response_body.empty() ? 0 : 200;
         success = !response_body.empty();
     } else {
-        response_body = Http::get(url);
+        auto resp = http.get(url, headers);
+        response_body = resp.body;
         status_code = 200; success = true;
     }
 
@@ -1434,9 +1457,6 @@ int Closures::compare_closures(lua_State* L) {
 int Closures::clone_function(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
 
-    // For both C and Lua closures, wrap in a trampoline that
-    // delegates to the original.  This preserves identity of
-    // upvalues without needing bytecode serialisation.
     lua_pushvalue(L, 1);  // upvalue – the function to clone
     lua_pushcclosure(L, [](lua_State* Ls) -> int {
         int nargs = lua_gettop(Ls);
@@ -1515,7 +1535,7 @@ int Closures::l_writefile(lua_State* L) {
     if (!f.is_open()) { luaL_error(L, "Cannot write file: %s", fn); return 0; }
     f.write(data, (std::streamsize)len);
     f.close();
-    Logger::instance().debug("[Script] writefile: {} ({} bytes)", fn, len);
+    spdlog::debug("[Script] writefile: {} ({} bytes)", fn, len);
     return 0;
 }
 
@@ -1555,7 +1575,7 @@ int Closures::l_listfiles(lua_State* L) {
             lua_rawseti(L, -2, idx++);
         }
     } catch (const std::exception& e) {
-        Logger::instance().warning("[Script] listfiles error: {}", e.what());
+        spdlog::warn("[Script] listfiles error: {}", e.what());
     }
     return 1;
 }
@@ -1585,7 +1605,7 @@ int Closures::l_appendfile(lua_State* L) {
 
 int Closures::l_setfpscap(lua_State* L) {
     int fps = (int)luaL_optinteger(L, 1, 60);
-    Logger::instance().debug("[Script] setfpscap({})", fps);
+    spdlog::debug("[Script] setfpscap({})", fps);
     (void)fps;
     return 0;
 }
@@ -1633,8 +1653,8 @@ int Closures::l_task_spawn(lua_State* L) {
     int status = lua_resume(thr, nullptr, nargs);
     if (status != 0 && status != LUA_YIELD) {
         const char* err = lua_tostring(thr, -1);
-        Logger::instance().error("[Script] task.spawn error: {}",
-                                  err ? err : "unknown");
+        spdlog::error("[Script] task.spawn error: {}",
+                      err ? err : "unknown");
     }
     return 1;  // return thread
 }
@@ -1662,8 +1682,8 @@ int Closures::l_task_delay(lua_State* L) {
     int status = lua_resume(thr, nullptr, 1);
     if (status != 0 && status != LUA_YIELD) {
         const char* err = lua_tostring(thr, -1);
-        Logger::instance().error("[Script] task.delay error: {}",
-                                  err ? err : "unknown");
+        spdlog::error("[Script] task.delay error: {}",
+                      err ? err : "unknown");
     }
     return 1;  // return thread
 }
