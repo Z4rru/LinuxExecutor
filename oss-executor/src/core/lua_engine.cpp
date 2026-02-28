@@ -385,7 +385,7 @@ void LuaEngine::execute_task(ScheduledTask& task, std::chrono::steady_clock::tim
     if (!L_) return;
 
     lua_State* co = nullptr;
-    bool new_thread = false;
+    [[maybe_unused]] bool new_thread = false;
 
     // Resume existing coroutine or create new one from func_ref
     if (task.thread_ref != LUA_NOREF) {
@@ -1364,7 +1364,7 @@ int LuaEngine::lua_signal_connect(lua_State* L) {
 
     auto* cud = static_cast<ConnUD*>(lua_newuserdata(L, sizeof(ConnUD)));
     memset(cud->sig_name, 0, sizeof(cud->sig_name));
-    strncpy(cud->sig_name, ud->name, sizeof(cud->sig_name) - 1);
+    snprintf(cud->sig_name, sizeof(cud->sig_name), "%s", ud->name);
     cud->conn_id = conn.id;
     cud->disconnected = false;
     luaL_getmetatable(L, "SignalConnection");
@@ -1906,3 +1906,4 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
