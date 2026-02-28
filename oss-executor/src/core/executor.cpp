@@ -22,8 +22,12 @@ Executor::~Executor() {
     shutdown();
 }
 
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+
 void Executor::init() {
-    if (initialized_.load(std::memory_order_acquire)) return;
+    // FIX 6: mutex prevents two threads from racing through init()
+    std::lock_guard<std::mutex> lock(init_mutex_);
+    if (initialized_.load(std::memory_order_relaxed)) return;
 
     LOG_INFO("Initializing OSS Executor...");
     if (status_cb_) status_cb_("Initializing...");
@@ -77,24 +81,41 @@ void Executor::init() {
 }
 
 void Executor::shutdown() {
-    if (!initialized_.load(std::memory_order_acquire)) return;
+    // FIX 6: same mutex as init — prevents init/shutdown overlap
+    std::lock_guard<std::mutex> lock(init_mutex_);
+    if (!initialized_.load(std::memory_order_relaxed)) return;
 
     LOG_INFO("Shutting down OSS Executor...");
+
+    // FIX 7: interrupt any running script BEFORE joining the queue thread,
+    //        otherwise stop_queue_processor() blocks forever on an infinite
+    //        script.
+    lua_.stop();
+
     stop_queue_processor();
+    clear_queue();                    // drain remaining queued scripts
     Injection::instance().stop_auto_scan();
     lua_.shutdown();
     initialized_.store(false, std::memory_order_release);
+    LOG_INFO("OSS Executor shut down");
 }
 
-ExecutionResult Executor::execute_internal(const std::string& script, const std::string& name) {
+// ── Core execution ───────────────────────────────────────────────────────────
+
+ExecutionResult Executor::execute_internal(const std::string& script,
+                                           const std::string& name) {
     ExecutionResult result;
     result.script_name = name;
-    result.success = false;
+    // result.success already false via default initializer (FIX 3)
 
     if (script.empty()) {
         result.error = "Empty script";
         return result;
     }
+
+    // FIX 5: serialise execution — the queue thread and UI thread must not
+    //        call lua_.execute() concurrently (Luau VM is single-threaded).
+    std::lock_guard<std::mutex> exec_lock(exec_mutex_);
 
     executing_.store(true, std::memory_order_release);
 
@@ -102,15 +123,16 @@ ExecutionResult Executor::execute_internal(const std::string& script, const std:
     result.success = lua_.execute(script, "=" + name);
     auto t1 = std::chrono::steady_clock::now();
 
-    result.execution_time_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    result.execution_time_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     executing_.store(false, std::memory_order_release);
 
     {
-        std::lock_guard<std::mutex> lock(history_mutex_);
+        std::lock_guard<std::mutex> hlk(history_mutex_);
         execution_history_.push_back(result);
         while (execution_history_.size() > max_history_)
-            execution_history_.erase(execution_history_.begin());
+            execution_history_.pop_front();       // FIX 2: O(1) vs O(n) erase
     }
 
     if (result_cb_) result_cb_(result);
@@ -122,7 +144,8 @@ void Executor::execute_script(const std::string& script) {
     execute_script(script, "user_script");
 }
 
-void Executor::execute_script(const std::string& script, const std::string& name) {
+void Executor::execute_script(const std::string& script,
+                              const std::string& name) {
     if (!initialized_.load(std::memory_order_acquire)) {
         if (error_cb_) error_cb_("Executor not initialized");
         return;
@@ -167,18 +190,23 @@ std::string Executor::read_file(const std::string& path) {
 }
 
 void Executor::cancel_execution() {
+    // lua_.stop() sets an interrupt flag — safe to call from any thread,
+    // does NOT need exec_mutex_ (which the running script holds).
     lua_.stop();
     executing_.store(false, std::memory_order_release);
     if (status_cb_) status_cb_("Cancelled");
     LOG_INFO("Execution cancelled by user");
 }
 
-void Executor::enqueue_script(const std::string& script, const std::string& name, int priority) {
+// ── Queue ────────────────────────────────────────────────────────────────────
+
+void Executor::enqueue_script(const std::string& script,
+                              const std::string& name, int priority) {
     QueuedScript qs;
-    qs.source = script;
-    qs.name = name;
-    qs.is_file = false;
-    qs.priority = priority;
+    qs.source    = script;
+    qs.name      = name;
+    qs.is_file   = false;
+    qs.priority  = priority;
     qs.queued_at = std::chrono::steady_clock::now();
 
     {
@@ -246,7 +274,7 @@ void Executor::process_queue() {
             if (!queue_running_.load(std::memory_order_acquire)) break;
             if (script_queue_.empty()) continue;
 
-            script = script_queue_.top();
+            script = std::move(const_cast<QueuedScript&>(script_queue_.top()));
             script_queue_.pop();
         }
 
@@ -266,10 +294,13 @@ void Executor::process_queue() {
     }
 }
 
+// ── Auto-execute ─────────────────────────────────────────────────────────────
+
 void Executor::auto_execute() {
     std::string dir = Config::instance().home_dir() + "/scripts/autoexec";
     try {
-        if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir))
+        if (!std::filesystem::exists(dir) ||
+            !std::filesystem::is_directory(dir))
             return;
 
         std::vector<std::filesystem::path> scripts;
@@ -292,13 +323,16 @@ void Executor::auto_execute() {
             LOG_INFO("Auto-executed {} scripts", scripts.size());
     } catch (const std::filesystem::filesystem_error& e) {
         LOG_ERROR("Auto-execute failed: {}", e.what());
-        if (error_cb_) error_cb_("Auto-execute error: " + std::string(e.what()));
+        if (error_cb_)
+            error_cb_("Auto-execute error: " + std::string(e.what()));
     }
 }
 
+// ── History ──────────────────────────────────────────────────────────────────
+
 std::vector<ExecutionResult> Executor::get_history() const {
     std::lock_guard<std::mutex> lock(history_mutex_);
-    return execution_history_;
+    return {execution_history_.begin(), execution_history_.end()};
 }
 
 void Executor::clear_history() {
@@ -306,8 +340,10 @@ void Executor::clear_history() {
     execution_history_.clear();
 }
 
+// ── Callbacks ────────────────────────────────────────────────────────────────
+
 void Executor::set_output_callback(OutputCallback cb) { output_cb_ = std::move(cb); }
-void Executor::set_error_callback(ErrorCallback cb) { error_cb_ = std::move(cb); }
+void Executor::set_error_callback(ErrorCallback  cb) { error_cb_  = std::move(cb); }
 void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(cb); }
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
