@@ -159,10 +159,46 @@ struct ConnUD {
     bool disconnected;
 };
 
+// ---------------------------------------------------------------------------
+// loadstring implementation (Luau does not provide one natively)
+// ---------------------------------------------------------------------------
+
+static int lua_loadstring_impl(lua_State* L) {
+    size_t len;
+    const char* source = luaL_checklstring(L, 1, &len);
+    const char* chunkname = luaL_optstring(L, 2, "=loadstring");
+
+    Luau::CompileOptions options;
+    options.optimizationLevel = 1;
+    options.debugLevel        = 1;
+    options.coverageLevel     = 0;
+
+    std::string bytecode = Luau::compile(std::string(source, len), options);
+
+    if (bytecode.empty() || bytecode[0] == 0) {
+        lua_pushnil(L);
+        if (bytecode.size() > 1)
+            lua_pushstring(L, bytecode.c_str() + 1);
+        else
+            lua_pushstring(L, "compilation failed");
+        return 2;
+    }
+
+    int status = luau_load(L, chunkname, bytecode.data(), bytecode.size(), 0);
+
+    if (status != 0) {
+        // luau_load pushed an error string
+        lua_pushnil(L);
+        lua_insert(L, -2);
+        return 2;
+    }
+
+    return 1; // compiled function on top of stack
+}
+
 // ===========================================================================
 // Singleton
 // ===========================================================================
-
 LuaEngine& LuaEngine::instance() {
     static LuaEngine inst;
     return inst;
@@ -993,6 +1029,7 @@ void LuaEngine::register_custom_libs() {
     register_function("identifyexecutor", lua_identifyexecutor);
     register_function("getexecutorname",  lua_getexecutorname);
     register_function("gethwid",          lua_get_hwid);
+    register_function("loadstring",       lua_loadstring_impl);
 
     static const luaL_Reg console_lib[] = {
         {"print", lua_rconsole_print},
@@ -1025,16 +1062,23 @@ void LuaEngine::register_custom_libs() {
         end
         request = request or syn.request
         http_request = http_request or syn.request
-        game = game or {HttpGet = function(_, url) return http.get(url).Body end}
+        game = game or {
+            HttpGet = function(_, url)
+                local ok, res = pcall(function() return http.get(url) end)
+                if ok and res then return res.Body or "" end
+                return ""
+            end
+        }
     )", "=env_setup");
 }
 
 void LuaEngine::sandbox() {
-    // Apply Luau sandbox first
-    luaL_sandbox(L_);
-    luaL_sandboxthread(L_);
-
-    // Additional restrictions via script
+    // Manual sandboxing — restrict dangerous functions without freezing tables.
+    // luaL_sandbox() is intentionally NOT called because it makes every
+    // global table readonly, which prevents community scripts (ESP, aimbot,
+    // etc.) from working.  Without luaL_sandbox(), luaL_sandboxthread() on
+    // new threads is a harmless no-op, so all threads share L_'s writable
+    // globals directly — exactly what executor scripts expect.
     execute_internal(R"(
         local safe_os = {
             time = os.time, clock = os.clock,
@@ -2103,5 +2147,6 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
 
 
