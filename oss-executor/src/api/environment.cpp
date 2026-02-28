@@ -313,12 +313,12 @@ static int lua_gui_set(lua_State* L) {
             elem.pad_top = p;
         }
         else if (k == "CanvasSize") {
-            float dummy_xs, dummy_xo, ys, yo;
+            float dummy_xs = 0, dummy_xo = 0, ys = 0, yo = 0;  // ← initialized
             read_udim2(3, dummy_xs, dummy_xo, ys, yo);
             elem.canvas_size_y = yo;
         }
         else if (k == "CanvasPosition") {
-            float sx, sy;
+            float sx = 0, sy = 0;  // ← initialized
             read_vec2(3, sx, sy);
             elem.scroll_position = sy;
         }
@@ -2346,3 +2346,4 @@ void Environment::setup_roblox_mock(LuaEngine& engine) {
 }
 
 } // namespace oss
+
