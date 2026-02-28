@@ -11,8 +11,6 @@
 
 namespace oss {
 
-// ────────────────────── lifecycle ──────────────────────
-
 App::App(int argc, char** argv) : argc_(argc), argv_(argv) {
 #if GLIB_CHECK_VERSION(2, 74, 0)
     gtk_app_ = gtk_application_new("com.oss.executor", G_APPLICATION_DEFAULT_FLAGS);
@@ -25,21 +23,15 @@ App::App(int argc, char** argv) : argc_(argc), argv_(argv) {
 }
 
 App::~App() {
-    // 1. Sever all executor→UI callbacks before any widget is gone
     disconnect_executor();
 
-    // 2. Remove periodic tick so on_tick can't fire into dead members
     if (tick_id_ > 0) {
         g_source_remove(tick_id_);
         tick_id_ = 0;
     }
 
-    // 3. Overlay is a singleton; shutdown is idempotent
     Overlay::instance().shutdown();
 
-    // 4. unique_ptr<Editor/Console/TabManager/ScriptHub> destroy automatically
-
-    // 5. Release GtkApplication ref
     if (gtk_app_) {
         g_object_unref(gtk_app_);
         gtk_app_ = nullptr;
@@ -50,12 +42,9 @@ int App::run() {
     return g_application_run(G_APPLICATION(gtk_app_), argc_, argv_);
 }
 
-// ────────────────────── executor wiring ──────────────────────
-
 void App::connect_executor() {
     auto& exec = Executor::instance();
 
-    // Output from Lua print() → console Output pane
     exec.set_output_callback([this](const std::string& msg) {
         if (!console_) return;
         g_idle_add([](gpointer data) -> gboolean {
@@ -66,7 +55,6 @@ void App::connect_executor() {
         }, new std::pair<Console*, std::string>(console_.get(), msg));
     });
 
-    // Lua runtime errors → console Error pane
     exec.set_error_callback([this](const std::string& msg) {
         if (!console_) return;
         g_idle_add([](gpointer data) -> gboolean {
@@ -77,7 +65,6 @@ void App::connect_executor() {
         }, new std::pair<Console*, std::string>(console_.get(), msg));
     });
 
-    // Executor status changes → bottom status bar
     exec.set_status_callback([this](const std::string& msg) {
         if (!status_label_) return;
         g_idle_add([](gpointer data) -> gboolean {
@@ -96,10 +83,7 @@ void App::disconnect_executor() {
     exec.set_status_callback(nullptr);
 }
 
-// ────────────────────── UI construction ──────────────────────
-
 void App::build_ui(GtkApplication* app) {
-    // --- subsystem init ---
     auto& config = Config::instance();
     std::string home = config.home_dir();
 
@@ -110,14 +94,13 @@ void App::build_ui(GtkApplication* app) {
     ThemeManager::instance().set_theme(config.get<std::string>("theme", "midnight"));
     ScriptManager::instance().set_directory(home + "/scripts");
 
-    // --- real executor init (Lua VM, memory scanner, hooks) ---
     Executor::instance().init();
 
     if (Executor::instance().is_initialized()) {
         lua_State* L = Executor::instance().lua().state();
         if (L) {
-            Environment::instance().setup(L);   // filesystem, http, drawing, etc.
-            Closures::register_all(L);      // roblox closure wrappers
+            Environment::instance().setup(L);
+            Closures::register_all(L);
             LOG_INFO("Lua API registered ({} globals)", lua_gettop(L));
         } else {
             LOG_ERROR("Lua state is null — skipping API registration");
@@ -128,23 +111,20 @@ void App::build_ui(GtkApplication* app) {
 
     Overlay::instance().init();
 
-    // --- window ---
     window_ = GTK_WINDOW(gtk_application_window_new(app));
     gtk_window_set_title(window_, "OSS Executor v" APP_VERSION);
     gtk_window_set_default_size(window_, 1400, 900);
 
-    // FIX: pass `this` so we can disconnect executor before widgets die
     g_signal_connect(window_, "close-request",
         G_CALLBACK(+[](GtkWindow*, gpointer data) -> gboolean {
             auto* self = static_cast<App*>(data);
             self->disconnect_executor();
             Overlay::instance().shutdown();
-            return FALSE;   // allow close to proceed
+            return FALSE;
         }), this);
 
     main_box_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-    // ═══════════════════ toolbar ═══════════════════
     toolbar_ = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_add_css_class(toolbar_, "header-bar");
     gtk_widget_set_margin_start(toolbar_, 8);
@@ -152,7 +132,6 @@ void App::build_ui(GtkApplication* app) {
     gtk_widget_set_margin_top(toolbar_, 6);
     gtk_widget_set_margin_bottom(toolbar_, 6);
 
-    // title
     GtkWidget* title_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     GtkWidget* title = gtk_label_new("◈ OSS");
     gtk_widget_add_css_class(title, "title");
@@ -166,7 +145,6 @@ void App::build_ui(GtkApplication* app) {
 
     gtk_box_append(GTK_BOX(toolbar_), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
 
-    // file buttons
     GtkWidget* open_btn = gtk_button_new_with_label("📂 Open");
     gtk_widget_add_css_class(open_btn, "btn-secondary");
     gtk_widget_set_tooltip_text(open_btn, "Open Script (Ctrl+O)");
@@ -183,12 +161,10 @@ void App::build_ui(GtkApplication* app) {
     }), this);
     gtk_box_append(GTK_BOX(toolbar_), save_btn);
 
-    // spacer
     GtkWidget* spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_hexpand(spacer, TRUE);
     gtk_box_append(GTK_BOX(toolbar_), spacer);
 
-    // action buttons
     GtkWidget* inject_btn = gtk_button_new_with_label("🔗 Inject");
     gtk_widget_add_css_class(inject_btn, "btn-secondary");
     gtk_widget_set_tooltip_text(inject_btn, "Inject into Roblox (F5)");
@@ -223,7 +199,6 @@ void App::build_ui(GtkApplication* app) {
 
     gtk_box_append(GTK_BOX(toolbar_), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
 
-    // toggle buttons
     GtkWidget* hub_toggle = gtk_toggle_button_new_with_label("📜 Hub");
     gtk_widget_add_css_class(hub_toggle, "btn-secondary");
     g_signal_connect_swapped(hub_toggle, "toggled", G_CALLBACK(+[](gpointer d) {
@@ -249,15 +224,12 @@ void App::build_ui(GtkApplication* app) {
 
     gtk_box_append(GTK_BOX(main_box_), toolbar_);
 
-    // ═══════════════════ tabs ═══════════════════
     tabs_ = std::make_unique<TabManager>();
     gtk_box_append(GTK_BOX(main_box_), tabs_->widget());
 
-    // ═══════════════════ paned layout ═══════════════════
     sidebar_paned_ = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_widget_set_vexpand(sidebar_paned_, TRUE);
 
-    // script hub (left, hidden by default)
     script_hub_ = std::make_unique<ScriptHub>();
     hub_revealer_ = gtk_revealer_new();
     gtk_revealer_set_transition_type(GTK_REVEALER(hub_revealer_),
@@ -267,7 +239,6 @@ void App::build_ui(GtkApplication* app) {
     gtk_revealer_set_child(GTK_REVEALER(hub_revealer_), script_hub_->widget());
     gtk_paned_set_start_child(GTK_PANED(sidebar_paned_), hub_revealer_);
 
-    // editor + console (right)
     paned_ = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
 
     editor_ = std::make_unique<Editor>();
@@ -288,7 +259,6 @@ void App::build_ui(GtkApplication* app) {
     gtk_paned_set_end_child(GTK_PANED(sidebar_paned_), paned_);
     gtk_box_append(GTK_BOX(main_box_), sidebar_paned_);
 
-    // ═══════════════════ status bar ═══════════════════
     status_bar_ = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_add_css_class(status_bar_, "status-bar");
     gtk_widget_set_margin_start(status_bar_, 12);
@@ -310,10 +280,8 @@ void App::build_ui(GtkApplication* app) {
 
     gtk_box_append(GTK_BOX(main_box_), status_bar_);
 
-    // ═══════════════════ wire executor → UI ═══════════════════
     connect_executor();
 
-    // ═══════════════════ wire tabs ↔ editor ═══════════════════
     int first_tab = tabs_->add_tab("Script 1",
         "-- OSS Executor v" APP_VERSION "\n"
         "-- Write your Lua script here\n\n"
@@ -325,7 +293,6 @@ void App::build_ui(GtkApplication* app) {
         if (tab && editor_) editor_->set_text(tab->content);
     });
 
-    // TabManager calls this to snapshot editor content before switching away
     tabs_->set_content_provider([this]() -> std::string {
         return editor_ ? editor_->get_text() : std::string{};
     });
@@ -341,7 +308,6 @@ void App::build_ui(GtkApplication* app) {
         console_->print("Script loaded from hub", Console::Level::System);
     });
 
-    // ═══════════════════ final setup ═══════════════════
     apply_theme();
     setup_keybinds();
 
@@ -362,8 +328,6 @@ void App::build_ui(GtkApplication* app) {
     Executor::instance().auto_execute();
     gtk_window_present(window_);
 
-    // Enable animation only after the first frame so the console
-    // doesn't slide in on startup
     g_idle_add([](gpointer data) -> gboolean {
         auto* rev = static_cast<GtkWidget*>(data);
         gtk_revealer_set_transition_type(GTK_REVEALER(rev),
@@ -375,8 +339,6 @@ void App::build_ui(GtkApplication* app) {
     LOG_INFO("UI initialized — executor %s",
              Executor::instance().is_initialized() ? "online" : "OFFLINE");
 }
-
-// ────────────────────── theme / keybinds ──────────────────────
 
 void App::apply_theme() {
     auto& theme = ThemeManager::instance().current();
@@ -415,8 +377,6 @@ void App::setup_keybinds() {
     gtk_widget_add_controller(GTK_WIDGET(window_), kc);
 }
 
-// ────────────────────── actions ──────────────────────
-
 void App::on_execute() {
     if (!Executor::instance().is_initialized()) {
         console_->print("✗ Executor is not initialized", Console::Level::Error);
@@ -446,8 +406,6 @@ void App::on_open_file() {
 
         int id = tabs_->add_tab(name, content);
         tabs_->set_active(id);
-        // set_active triggers the change_callback which loads content into editor,
-        // but we also store the file_path on the tab
         auto* tab = tabs_->get_tab(id);
         if (tab) tab->file_path = path;
 
@@ -459,11 +417,9 @@ void App::on_save_file() {
     auto* tab = tabs_->active_tab();
     if (!tab) return;
 
-    // snapshot current editor content into the tab
     tab->content = editor_->get_text();
 
     if (!tab->file_path.empty()) {
-        // direct save — path already known
         std::ofstream file(tab->file_path);
         if (file.is_open()) {
             file << tab->content;
@@ -475,8 +431,6 @@ void App::on_save_file() {
         return;
     }
 
-    // FIX: capture tab->id and content by value — not the raw pointer.
-    // The pointer can dangle if the tab is closed while the dialog is open.
     int tab_id            = tab->id;
     std::string suggested = tab->title + ".lua";
     std::string content   = tab->content;
@@ -490,7 +444,6 @@ void App::on_save_file() {
             }
             file << content;
 
-            // re-fetch the tab — it may have been removed
             auto* t = tabs_->get_tab(tab_id);
             if (t) {
                 t->file_path = path;
@@ -503,7 +456,6 @@ void App::on_save_file() {
 }
 
 void App::on_inject() {
-    // FIX: prevent overlapping injection threads
     if (injecting_) {
         console_->print("⚠ Injection already in progress", Console::Level::Warn);
         return;
@@ -516,7 +468,6 @@ void App::on_inject() {
     injecting_ = true;
     console_->print("🔗 Scanning for Roblox...", Console::Level::System);
 
-    // Data block passed to the thread → idle → main thread
     struct InjectCtx {
         Console* console;
         App*     app;
@@ -583,8 +534,6 @@ void App::on_toggle_overlay() {
     Overlay::instance().toggle();
 }
 
-// ────────────────────── periodic tick ──────────────────────
-
 void App::update_status_bar() {
     if (!editor_ || !position_label_) return;
     int line = editor_->get_cursor_line();
@@ -598,6 +547,4 @@ gboolean App::on_tick(gpointer data) {
     return G_SOURCE_CONTINUE;
 }
 
-} // namespace oss
-
-
+}
