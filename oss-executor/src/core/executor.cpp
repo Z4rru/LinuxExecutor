@@ -8,6 +8,13 @@
 #include <algorithm>
 #include <vector>
 #include <sstream>
+#include <cerrno>
+#include <cstring>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static constexpr const char* PAYLOAD_SOCK = "/tmp/oss_executor.sock";
 
 namespace oss {
 
@@ -22,10 +29,7 @@ Executor::~Executor() {
     shutdown();
 }
 
-// ── Lifecycle ────────────────────────────────────────────────────────────────
-
 void Executor::init() {
-    // FIX 6: mutex prevents two threads from racing through init()
     std::lock_guard<std::mutex> lock(init_mutex_);
     if (initialized_.load(std::memory_order_relaxed)) return;
 
@@ -81,46 +85,88 @@ void Executor::init() {
 }
 
 void Executor::shutdown() {
-    // FIX 6: same mutex as init — prevents init/shutdown overlap
     std::lock_guard<std::mutex> lock(init_mutex_);
     if (!initialized_.load(std::memory_order_relaxed)) return;
 
     LOG_INFO("Shutting down OSS Executor...");
 
-    // FIX 7: interrupt any running script BEFORE joining the queue thread,
-    //        otherwise stop_queue_processor() blocks forever on an infinite
-    //        script.
     lua_.stop();
-
     stop_queue_processor();
-    clear_queue();                    // drain remaining queued scripts
+    clear_queue();
     Injection::instance().stop_auto_scan();
     lua_.shutdown();
     initialized_.store(false, std::memory_order_release);
     LOG_INFO("OSS Executor shut down");
 }
 
-// ── Core execution ───────────────────────────────────────────────────────────
+bool Executor::send_to_payload(const std::string& source) {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        LOG_ERROR("payload socket(): {}", strerror(errno));
+        return false;
+    }
+
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, PAYLOAD_SOCK, sizeof(addr.sun_path) - 1);
+
+    struct timeval tv{};
+    tv.tv_sec = 2;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        LOG_ERROR("payload connect({}): {}", PAYLOAD_SOCK, strerror(errno));
+        ::close(fd);
+        return false;
+    }
+
+    const char* data = source.data();
+    size_t remaining = source.size();
+    while (remaining > 0) {
+        ssize_t n = ::write(fd, data, remaining);
+        if (n <= 0) {
+            LOG_ERROR("payload write(): {}", strerror(errno));
+            ::close(fd);
+            return false;
+        }
+        data += n;
+        remaining -= static_cast<size_t>(n);
+    }
+
+    ::shutdown(fd, SHUT_WR);
+    ::close(fd);
+    LOG_INFO("Sent {} bytes to payload via {}", source.size(), PAYLOAD_SOCK);
+    return true;
+}
 
 ExecutionResult Executor::execute_internal(const std::string& script,
                                            const std::string& name) {
     ExecutionResult result;
     result.script_name = name;
-    // result.success already false via default initializer (FIX 3)
 
     if (script.empty()) {
         result.error = "Empty script";
         return result;
     }
 
-    // FIX 5: serialise execution — the queue thread and UI thread must not
-    //        call lua_.execute() concurrently (Luau VM is single-threaded).
     std::lock_guard<std::mutex> exec_lock(exec_mutex_);
 
     executing_.store(true, std::memory_order_release);
 
     auto t0 = std::chrono::steady_clock::now();
-    result.success = lua_.execute(script, "=" + name);
+
+    bool attached = Injection::instance().is_attached();
+
+    if (attached) {
+        result.success = send_to_payload(script);
+        if (!result.success)
+            result.error = "IPC failed — payload socket unreachable";
+        else
+            LOG_INFO("Script '{}' dispatched to Roblox payload", name);
+    } else {
+        result.success = lua_.execute(script, "=" + name);
+    }
+
     auto t1 = std::chrono::steady_clock::now();
 
     result.execution_time_ms =
@@ -132,7 +178,7 @@ ExecutionResult Executor::execute_internal(const std::string& script,
         std::lock_guard<std::mutex> hlk(history_mutex_);
         execution_history_.push_back(result);
         while (execution_history_.size() > max_history_)
-            execution_history_.pop_front();       // FIX 2: O(1) vs O(n) erase
+            execution_history_.pop_front();
     }
 
     if (result_cb_) result_cb_(result);
@@ -155,14 +201,19 @@ void Executor::execute_script(const std::string& script,
         return;
     }
 
-    if (status_cb_) status_cb_("Executing...");
+    bool attached = Injection::instance().is_attached();
+
+    if (status_cb_)
+        status_cb_(attached ? "Sending to Roblox..." : "Executing locally...");
 
     auto result = execute_internal(script, name);
 
     if (result.success) {
-        if (status_cb_) status_cb_("Executed ✓");
+        if (status_cb_)
+            status_cb_(attached ? "Sent to Roblox \u2713" : "Executed \u2713");
     } else {
-        if (status_cb_) status_cb_("Execution failed ✗");
+        if (status_cb_) status_cb_("Execution failed \u2717");
+        if (error_cb_ && !result.error.empty()) error_cb_(result.error);
     }
 }
 
@@ -190,15 +241,16 @@ std::string Executor::read_file(const std::string& path) {
 }
 
 void Executor::cancel_execution() {
-    // lua_.stop() sets an interrupt flag — safe to call from any thread,
-    // does NOT need exec_mutex_ (which the running script holds).
+    if (Injection::instance().is_attached()) {
+        if (status_cb_) status_cb_("Cannot cancel remote execution");
+        LOG_WARN("Cancel requested but script is running inside Roblox");
+        return;
+    }
     lua_.stop();
     executing_.store(false, std::memory_order_release);
     if (status_cb_) status_cb_("Cancelled");
     LOG_INFO("Execution cancelled by user");
 }
-
-// ── Queue ────────────────────────────────────────────────────────────────────
 
 void Executor::enqueue_script(const std::string& script,
                               const std::string& name, int priority) {
@@ -294,8 +346,6 @@ void Executor::process_queue() {
     }
 }
 
-// ── Auto-execute ─────────────────────────────────────────────────────────────
-
 void Executor::auto_execute() {
     std::string dir = Config::instance().home_dir() + "/scripts/autoexec";
     try {
@@ -328,8 +378,6 @@ void Executor::auto_execute() {
     }
 }
 
-// ── History ──────────────────────────────────────────────────────────────────
-
 std::vector<ExecutionResult> Executor::get_history() const {
     std::lock_guard<std::mutex> lock(history_mutex_);
     return {execution_history_.begin(), execution_history_.end()};
@@ -339,8 +387,6 @@ void Executor::clear_history() {
     std::lock_guard<std::mutex> lock(history_mutex_);
     execution_history_.clear();
 }
-
-// ── Callbacks ────────────────────────────────────────────────────────────────
 
 void Executor::set_output_callback(OutputCallback cb) { output_cb_ = std::move(cb); }
 void Executor::set_error_callback(ErrorCallback  cb) { error_cb_  = std::move(cb); }
