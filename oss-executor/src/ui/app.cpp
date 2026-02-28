@@ -116,7 +116,7 @@ void App::build_ui(GtkApplication* app) {
     if (Executor::instance().is_initialized()) {
         lua_State* L = Executor::instance().lua().state();
         if (L) {
-            Environment::instance().setup(L);   // filesystem, http, drawing, etc.
+            Environment::register_all(L);   // filesystem, http, drawing, etc.
             Closures::register_all(L);      // roblox closure wrappers
             LOG_INFO("Lua API registered (%d globals)", lua_gettop(L));
         } else {
@@ -599,4 +599,3 @@ gboolean App::on_tick(gpointer data) {
 }
 
 } // namespace oss
-
