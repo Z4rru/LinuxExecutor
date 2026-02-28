@@ -1508,6 +1508,19 @@ int LuaEngine::lua_print(lua_State* L) {
 
 int LuaEngine::lua_warn_handler(lua_State* L) {
     const char* msg = luaL_checkstring(L, 1);
+
+    // ─── Suppress phantom execution warnings ────────────────────────
+    // Generated when scripts execute without a real Roblox process.
+    // Harmless in local/mock mode — downgrade to debug level.
+    if (msg) {
+        const char* phantom = strstr(msg, "Phantom exec");
+        if (phantom) {
+            LOG_DEBUG("[Lua] (mock mode) {}", msg);
+            return 0;  // Don't display in UI console
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────
+
     auto* eng = get_engine(L);
     if (eng && eng->output_cb_) eng->output_cb_(std::string("[WARN] ") + msg);
     LOG_WARN("[Lua] {}", msg);
@@ -1906,4 +1919,5 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
 
