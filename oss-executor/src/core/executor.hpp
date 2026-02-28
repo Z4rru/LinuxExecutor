@@ -6,8 +6,8 @@
 #include <string>
 #include <functional>
 #include <atomic>
-#include <chrono>              // FIX 1: was missing — QueuedScript uses steady_clock
-#include <deque>               // FIX 2: replaces vector for O(1) history trimming
+#include <chrono>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -24,12 +24,12 @@ struct QueuedScript {
     std::chrono::steady_clock::time_point queued_at{};
 
     bool operator<(const QueuedScript& other) const {
-        return priority < other.priority;   // max-heap: higher priority first
+        return priority < other.priority;
     }
 };
 
 struct ExecutionResult {
-    bool        success           = false;   // FIX 3: default-init all POD members
+    bool        success           = false;
     std::string output;
     std::string error;
     double      execution_time_ms = 0.0;
@@ -42,7 +42,7 @@ public:
 
     Executor(const Executor&)            = delete;
     Executor& operator=(const Executor&) = delete;
-    Executor(Executor&&)                 = delete;   // FIX 4: prevent move
+    Executor(Executor&&)                 = delete;
     Executor& operator=(Executor&&)      = delete;
 
     void init();
@@ -74,8 +74,6 @@ public:
 
     Injection& injection() { return Injection::instance(); }
 
-    // NOTE: callbacks must be set BEFORE init() or while no execution is
-    //       in progress.  They are read without a lock on the hot path.
     using OutputCallback = std::function<void(const std::string&)>;
     using ErrorCallback  = std::function<void(const std::string&)>;
     using StatusCallback = std::function<void(const std::string&)>;
@@ -95,6 +93,7 @@ private:
 
     ExecutionResult execute_internal(const std::string& script,
                                      const std::string& name);
+    bool        send_to_payload(const std::string& source);
     void        process_queue();
     std::string read_file(const std::string& path);
 
@@ -104,11 +103,7 @@ private:
     std::atomic<bool> executing_{false};
     std::atomic<bool> queue_running_{false};
 
-    // FIX 5: serialises all lua_.execute() calls so the queue thread
-    //        and the UI thread cannot run scripts concurrently.
     std::mutex exec_mutex_;
-
-    // FIX 6: protects the init/shutdown transition from races.
     std::mutex init_mutex_;
 
     std::priority_queue<QueuedScript> script_queue_;
@@ -117,7 +112,7 @@ private:
     std::thread                       queue_thread_;
 
     mutable std::mutex              history_mutex_;
-    std::deque<ExecutionResult>     execution_history_;   // FIX 2: was vector
+    std::deque<ExecutionResult>     execution_history_;
     size_t                          max_history_ = 100;
 
     OutputCallback output_cb_;
