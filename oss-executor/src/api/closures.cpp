@@ -652,7 +652,7 @@ int Closures::l_instance_clone(lua_State* L) {
 
     if (src.id > 0) {
         overlay.update_gui_element(new_ov, [&](GuiElement& dst) {
-            overlay.read_gui_element(src.overlay_id, [&](const GuiElement& s) {
+            overlay.update_gui_element(src.overlay_id, [&](GuiElement& s) {
                 dst = s;
             });
         });
@@ -1042,8 +1042,8 @@ int Closures::l_game_getservice(lua_State* L) {
             lua_getfield(Ls, 1, "ClassName");
             const char* cn = lua_tostring(Ls, -1);
             lua_pop(Ls, 1);
-            const char* check = luaL_checkstring(Ls, 2);
-            lua_pushboolean(Ls, cn && check && strcmp(cn, check) == 0);
+            const char* chk_name = luaL_checkstring(Ls, 2);
+            lua_pushboolean(Ls, cn && chk_name && strcmp(cn, chk_name) == 0);
             return 1;
         }, "IsA");
         lua_setfield(L, -2, "IsA");
@@ -1125,7 +1125,7 @@ int Closures::l_game_getservice(lua_State* L) {
         lua_setfield(L, -2, "Create");
     }
     else if (sn == "RunService") {
-        auto make_signal = [](lua_State* Ls, const char* name) {
+        auto make_signal = [](lua_State* Ls, const char* sig_name) {
             lua_newtable(Ls);
             lua_pushcfunction(Ls, [](lua_State* Ls2) -> int {
                 lua_newtable(Ls2);
@@ -1139,7 +1139,7 @@ int Closures::l_game_getservice(lua_State* L) {
                 return 0;
             }, "Wait");
             lua_setfield(Ls, -2, "Wait");
-            lua_setfield(Ls, -2, name);
+            lua_setfield(Ls, -2, sig_name);
         };
         make_signal(L, "RenderStepped");
         make_signal(L, "Heartbeat");
@@ -1179,9 +1179,9 @@ int Closures::l_game_getservice(lua_State* L) {
             std::string uuid;
             uuid.resize(36);
             static const char hex[] = "0123456789abcdef";
-            for (int i = 0; i < 36; i++) {
-                if (i == 8 || i == 13 || i == 18 || i == 23) uuid[i] = '-';
-                else uuid[i] = hex[rand() % 16];
+            for (int j = 0; j < 36; j++) {
+                if (j == 8 || j == 13 || j == 18 || j == 23) uuid[j] = '-';
+                else uuid[j] = hex[rand() % 16];
             }
             lua_pushstring(Ls, uuid.c_str());
             return 1;
@@ -1189,7 +1189,7 @@ int Closures::l_game_getservice(lua_State* L) {
         lua_setfield(L, -2, "GenerateGUID");
     }
     else if (sn == "StarterGui") {
-        lua_pushcfunction(L, [](lua_State* Ls) -> int {
+        lua_pushcfunction(L, [](lua_State*) -> int {
             return 0;
         }, "SetCoreGuiEnabled");
         lua_setfield(L, -2, "SetCoreGuiEnabled");
@@ -1235,7 +1235,6 @@ int Closures::l_game_getservice(lua_State* L) {
 
     lua_newtable(L);
     lua_pushcfunction(L, [](lua_State* Ls) -> int {
-        const char* k = luaL_checkstring(Ls, 2);
         lua_pushvalue(Ls, 2);
         lua_rawget(Ls, 1);
         if (!lua_isnil(Ls, -1)) return 1;
@@ -1324,7 +1323,7 @@ int Closures::l_setclipboard(lua_State* L) {
         cmd += "wl-copy";
     else
         cmd += "xclip -selection clipboard";
-    std::system(cmd.c_str());
+    (void)std::system(cmd.c_str());
     return 0;
 }
 
@@ -1405,7 +1404,7 @@ int Closures::l_http_request(lua_State* L) {
     if (ms == "GET") {
         auto resp = http.get(url, headers);
         response_body = resp.body;
-        status_code = resp.status_code > 0 ? resp.status_code : (response_body.empty() ? 0 : 200);
+        status_code = response_body.empty() ? 0 : 200;
         success = status_code >= 200 && status_code < 300;
     } else if (ms == "POST") {
         std::string bs = body ? body : "";
@@ -1416,12 +1415,12 @@ int Closures::l_http_request(lua_State* L) {
         req_headers["Content-Type"] = ct;
         auto resp = http.post(url, bs, req_headers);
         response_body = resp.body;
-        status_code = resp.status_code > 0 ? resp.status_code : (response_body.empty() ? 0 : 200);
+        status_code = response_body.empty() ? 0 : 200;
         success = status_code >= 200 && status_code < 300;
     } else {
         auto resp = http.get(url, headers);
         response_body = resp.body;
-        status_code = resp.status_code > 0 ? resp.status_code : 200;
+        status_code = 200;
         success = true;
     }
 
