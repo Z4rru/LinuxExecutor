@@ -1,6 +1,3 @@
-// src/core/payload.cpp
-// Injection payload shared library — loaded into target process via dlopen/ptrace
-
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -16,9 +13,7 @@
 #include "luacode.h"
 
 static constexpr const char* SOCKET_PATH = "/tmp/oss_executor.sock";
-static constexpr size_t      RECV_BUF    = 1 << 18;   // 256 KiB
-
-// ── helpers ──────────────────────────────────────────────────────────────────
+static constexpr size_t      RECV_BUF    = 1 << 18;
 
 static int compile_and_run(lua_State* L, const char* source, size_t len)
 {
@@ -26,7 +21,7 @@ static int compile_and_run(lua_State* L, const char* source, size_t len)
     char*  bytecode     = luau_compile(source, len, nullptr, &bytecodeSize);
     if (!bytecode || bytecodeSize == 0) {
         fprintf(stderr, "[payload] luau_compile returned nullptr or empty\n");
-        free(bytecode);           // luau_compile may return error string
+        free(bytecode);
         return -1;
     }
 
@@ -50,11 +45,9 @@ static int compile_and_run(lua_State* L, const char* source, size_t len)
     return 0;
 }
 
-// ── IPC listener thread ─────────────────────────────────────────────────────
-
 struct PayloadState {
     lua_State*         L       = nullptr;
-    std::atomic<bool>  running{false};    // FIX: was plain bool — data race
+    std::atomic<bool>  running{false};
 };
 
 static void* ipc_thread(void* arg)
@@ -101,7 +94,6 @@ static void* ipc_thread(void* arg)
             break;
         }
 
-        // Read the full script
         size_t  total = 0;
         ssize_t n;
         while ((n = read(client_fd, buf + total,
@@ -124,8 +116,6 @@ static void* ipc_thread(void* arg)
     unlink(SOCKET_PATH);
     return nullptr;
 }
-
-// ── Entry point (called when .so is dlopen'd) ───────────────────────────────
 
 static PayloadState g_state{};
 static pthread_t    g_thread{};
@@ -162,7 +152,6 @@ static void payload_fini()
     fprintf(stderr, "[payload] shutting down\n");
     g_state.running.store(false, std::memory_order_release);
 
-    // Poke the socket so accept() unblocks
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd >= 0) {
         struct sockaddr_un addr{};
@@ -172,7 +161,6 @@ static void payload_fini()
         close(fd);
     }
 
-    // Brief yield so the IPC thread can exit accept() and clean up
     usleep(50000);
 
     if (g_state.L) {
