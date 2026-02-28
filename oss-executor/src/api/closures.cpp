@@ -1014,7 +1014,7 @@ int Closures::l_game_getservice(lua_State* L) {
 
 int Closures::l_game_httpget(lua_State* L) {
     const char* url = luaL_checkstring(L, 2);
-    Http http;
+    auto& http = Http::instance();
     auto resp = http.get(url);
     lua_pushlstring(L, resp.body.data(), resp.body.size());
     return 1;
@@ -1077,7 +1077,8 @@ int Closures::l_setclipboard(lua_State* L) {
         cmd += "wl-copy";
     else
         cmd += "xclip -selection clipboard";
-    (void)std::system(cmd.c_str());
+    int ret = std::system(cmd.c_str());
+    (void)ret;
     return 0;
 }
 
@@ -1152,7 +1153,7 @@ int Closures::l_http_request(lua_State* L) {
     }
     lua_pop(L, 1);
 
-    Http http;
+    auto& http = Http::instance();
     std::string response_body;
     int status_code = 0;
     bool success = false;
@@ -1261,7 +1262,8 @@ int Closures::l_hookfunction(lua_State* L) {
 
     // Save a reference to the original before hooking
     lua_pushvalue(L, 1);
-    int orig_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int orig_ref = lua_ref(L, -1);
+    lua_pop(L, 1);
 
     // Record the mapping original → hook in the hook table
     get_hook_table(L);
@@ -1271,8 +1273,8 @@ int Closures::l_hookfunction(lua_State* L) {
     lua_pop(L, 1);
 
     // Return a callable that invokes the original
-    lua_rawgeti(L, LUA_REGISTRYINDEX, orig_ref);
-    luaL_unref(L, LUA_REGISTRYINDEX, orig_ref);
+    lua_getref(L, orig_ref);
+    lua_unref(L, orig_ref);
     return 1;
 }
 
@@ -1291,8 +1293,7 @@ int Closures::l_hookmetamethod(lua_State* L) {
     lua_getfield(L, -1, method);
     int old_ref = LUA_NOREF;
     if (!lua_isnil(L, -1)) {
-        lua_pushvalue(L, -1);
-        old_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        old_ref = lua_ref(L, -1);
     }
     lua_pop(L, 1);
 
@@ -1303,8 +1304,8 @@ int Closures::l_hookmetamethod(lua_State* L) {
 
     // return old (or stub)
     if (old_ref != LUA_NOREF) {
-        lua_rawgeti(L, LUA_REGISTRYINDEX, old_ref);
-        luaL_unref(L, LUA_REGISTRYINDEX, old_ref);
+        lua_getref(L, old_ref);
+        lua_unref(L, old_ref);
     } else {
         lua_pushcfunction(L, [](lua_State*) -> int { return 0; }, "hookmetamethod_stub");
     }
@@ -1699,3 +1700,4 @@ int Closures::l_task_cancel(lua_State* L) {
 }
 
 } // namespace oss
+
