@@ -3,6 +3,7 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <queue>
 #include <unordered_map>
 #include <mutex>
 #include <optional>
@@ -16,81 +17,87 @@ extern "C" {
 }
 
 #include "utils/logger.hpp"
-
-// Forward declaration — avoid pulling in full overlay/drawing headers
-// DrawingObject must be fully defined before LuaEngine is instantiated,
-// but we only need the forward decl for the header itself.
 #include "ui/drawing_object.hpp"
 
 namespace oss {
 
-// ---------------------------------------------------------------------------
-// Supporting types
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════════
+//  Supporting types
+// ═══════════════════════════════════════════════════════════════════════════
 
 struct LuaError {
     std::string message;
-    int line = -1;
+    int         line = -1;
     std::string source;
 };
 
 struct ScheduledTask {
     enum class Type { Delay, Spawn, Defer };
-    Type type = Type::Defer;
-    int thread_ref = LUA_NOREF;
-    int func_ref   = LUA_NOREF;
+    Type   type          = Type::Defer;
+    int    thread_ref    = LUA_NOREF;
+    int    func_ref      = LUA_NOREF;
     double delay_seconds = 0.0;
     std::chrono::steady_clock::time_point resume_at;
     std::vector<int> arg_refs;
-    bool cancelled = false;
-    int id = 0;
+    bool   cancelled     = false;
+    int    id            = 0;
 };
 
 struct Signal {
     struct Connection {
-        int callback_ref = LUA_NOREF;
-        int id = 0;
-        bool connected = true;
+        int  callback_ref = LUA_NOREF;
+        int  id           = 0;
+        bool connected    = true;
     };
 
-    std::string name;
+    std::string             name;
     std::vector<Connection> connections;
-    int next_id = 1;
+    int                     next_id = 1;
 };
 
-// ---------------------------------------------------------------------------
-// LuaEngine
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════════
+//  LuaEngine — singleton, embeds LuaJIT / Luau
+// ═══════════════════════════════════════════════════════════════════════════
 
 class LuaEngine {
 public:
+    // ── callback types ──────────────────────────────────────────────────
     using OutputCallback = std::function<void(const std::string&)>;
     using ErrorCallback  = std::function<void(const LuaError&)>;
+    using ExecCallback   = std::function<void(bool success, const std::string& error)>;
 
-    LuaEngine();
-    ~LuaEngine();
+    // ── singleton ───────────────────────────────────────────────────────
+    static LuaEngine& instance();
 
-    LuaEngine(const LuaEngine&) = delete;
-    LuaEngine& operator=(const LuaEngine&) = delete;
-
-    // --- Lifecycle ---
+    // ── lifecycle ───────────────────────────────────────────────────────
     bool init();
     void shutdown();
     void reset();
 
-    // --- Execution ---
+    // ── execution ───────────────────────────────────────────────────────
     bool execute(const std::string& script,
                  const std::string& chunk_name = "=input");
     bool execute_file(const std::string& path);
+    bool execute_bytecode(const std::string& bytecode,
+                          const std::string& chunk_name = "=bytecode");
 
-    // --- Per-frame tick (drives task scheduler) ---
+    // ── compilation ─────────────────────────────────────────────────────
+    std::string compile(const std::string& source);
+
+    // ── thread-safe script queue ────────────────────────────────────────
+    void queue_script(const std::string& source,
+                      const std::string& name = "");
+    void process_queue();
+
+    // ── per-frame tick (drives task scheduler + queue) ───────────────────
     void tick();
 
-    // --- Callbacks ---
+    // ── callbacks ───────────────────────────────────────────────────────
     void set_output_callback(OutputCallback cb) { output_cb_ = std::move(cb); }
     void set_error_callback(ErrorCallback cb)   { error_cb_  = std::move(cb); }
+    void set_exec_callback(ExecCallback cb)     { exec_cb_   = std::move(cb); }
 
-    // --- Global registration ---
+    // ── global registration ─────────────────────────────────────────────
     void register_function(const std::string& name, lua_CFunction func);
     void register_library(const std::string& name, const luaL_Reg* funcs);
 
@@ -100,63 +107,74 @@ public:
 
     std::optional<std::string> get_global_string(const std::string& name);
 
-    // --- State access ---
-    lua_State* state() { return L_; }
+    // ── state access ────────────────────────────────────────────────────
+    lua_State* state() const { return L_; }
+    bool is_ready()   const { return ready_.load(std::memory_order_acquire); }
     bool is_running() const { return running_.load(std::memory_order_acquire); }
     void stop()             { running_.store(false, std::memory_order_release); }
 
-    // --- Signal system ---
+    const std::string& last_error() const { return last_error_; }
+
+    // ── signal system ───────────────────────────────────────────────────
     int     fire_signal(const std::string& name, int nargs = 0);
     Signal* get_signal(const std::string& name);
     Signal& get_or_create_signal(const std::string& name);
 
-    // --- Task scheduler ---
+    // ── task scheduler ──────────────────────────────────────────────────
     int    schedule_task(ScheduledTask task);
     void   cancel_task(int task_id);
     size_t pending_task_count() const;
 
-    // --- Drawing object store ---
+    // ── drawing object store ────────────────────────────────────────────
     int  create_drawing_object(DrawingObject::Type type);
     bool get_drawing_object(int id, DrawingObject& out);
-    bool update_drawing_object(int id, const std::function<void(DrawingObject&)>& fn);
+    bool update_drawing_object(int id,
+                               const std::function<void(DrawingObject&)>& fn);
     bool remove_drawing_object(int id);
     void clear_all_drawing_objects();
 
-    // Signals map needs friend access from signal static functions
-    // (lua_signal_destroy, lua_signal_gc access signals_ directly)
+    // ── public data (accessed by static Lua C functions) ────────────────
     std::unordered_map<std::string, Signal> signals_;
-
-    // Callbacks need friend access from static Lua C functions
     OutputCallback output_cb_;
     ErrorCallback  error_cb_;
 
 private:
-    // --- Internal execution ---
+    LuaEngine() = default;
+    ~LuaEngine() { shutdown(); }
+    LuaEngine(const LuaEngine&)            = delete;
+    LuaEngine& operator=(const LuaEngine&) = delete;
+
+    // ── internal execution ──────────────────────────────────────────────
     bool execute_internal(const std::string& script,
                           const std::string& chunk_name);
     void shutdown_internal();
 
-    // --- Task scheduler internals ---
+    // ── task scheduler internals ────────────────────────────────────────
     void process_tasks();
     void release_task_refs(ScheduledTask& task);
     void execute_task(ScheduledTask& task,
                       std::chrono::steady_clock::time_point now);
 
-    // --- Sandbox ---
+    // ── sandbox ─────────────────────────────────────────────────────────
     static bool is_sandboxed(const std::string& full_path,
                              const std::string& base_dir);
 
-    // --- Library/environment registration ---
+    // ── library / environment registration ──────────────────────────────
     void setup_environment();
+    void setup_libraries();
     void register_custom_libs();
     void register_task_lib();
     void register_drawing_lib();
     void register_signal_lib();
     void sandbox();
 
-    // -----------------------------------------------------------------------
-    // Static Lua C functions
-    // -----------------------------------------------------------------------
+    // ── custom allocator / interrupt ────────────────────────────────────
+    static void* lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize);
+    static void  lua_interrupt(lua_State* L, int gc);
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Static Lua C functions
+    // ═══════════════════════════════════════════════════════════════════
 
     // Core
     static int lua_print(lua_State* L);
@@ -167,7 +185,7 @@ private:
     static int lua_http_get(lua_State* L);
     static int lua_http_post(lua_State* L);
 
-    // Global wait/spawn
+    // Global wait / spawn
     static int lua_wait(lua_State* L);
     static int lua_spawn(lua_State* L);
 
@@ -227,25 +245,44 @@ private:
     static int lua_signal_destroy(lua_State* L);
     static int lua_signal_gc(lua_State* L);
 
-    // -----------------------------------------------------------------------
-    // Member data
-    // -----------------------------------------------------------------------
+    // ═══════════════════════════════════════════════════════════════════
+    //  Member data
+    // ═══════════════════════════════════════════════════════════════════
 
-    lua_State* L_ = nullptr;
-    std::atomic<bool> running_{false};
+    lua_State*        L_ = nullptr;
+    std::atomic<bool> ready_{false};    // VM initialised successfully
+    std::atomic<bool> running_{false};  // actively inside execute()
     mutable std::mutex mutex_;
 
-    // Task scheduler state
+    // Error reporting
+    std::string last_error_;
+
+    // Task scheduler
     std::vector<ScheduledTask> tasks_;
     int next_task_id_ = 1;
 
-    // Drawing object store (engine-authoritative, synced to Overlay)
+    // Drawing object store
     std::mutex drawing_mutex_;
     std::unordered_map<int, DrawingObject> drawing_objects_;
     int next_drawing_id_ = 1;
 
     // Signal ID counter
     int next_signal_id_ = 1;
+
+    // Thread-safe script queue
+    struct QueuedScript {
+        std::string source;
+        std::string name;
+    };
+    std::queue<QueuedScript> script_queue_;
+    std::mutex               queue_mutex_;
+
+    // Exec-completion callback
+    ExecCallback exec_cb_;
+
+    // Custom allocator bookkeeping
+    size_t total_allocated_ = 0;
+    static constexpr size_t MAX_MEMORY = 256 * 1024 * 1024; // 256 MB
 };
 
 } // namespace oss
