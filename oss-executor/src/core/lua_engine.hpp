@@ -1,3 +1,5 @@
+#pragma once
+
 #include <string>
 #include <functional>
 #include <vector>
@@ -92,6 +94,9 @@ public:
 
     const std::string& last_error() const { return last_error_; }
 
+    size_t memory_usage() const { return total_allocated_; }
+    static constexpr size_t memory_limit() { return MAX_MEMORY; }
+
     int     fire_signal(const std::string& name, int nargs = 0);
     Signal* get_signal(const std::string& name);
     Signal& get_or_create_signal(const std::string& name);
@@ -106,6 +111,10 @@ public:
                                const std::function<void(DrawingObject&)>& fn);
     bool remove_drawing_object(int id);
     void clear_all_drawing_objects();
+    size_t drawing_object_count() const {
+        std::lock_guard<std::mutex> dlock(drawing_mutex_);
+        return drawing_objects_.size();
+    }
 
     std::unordered_map<std::string, Signal> signals_;
     OutputCallback output_cb_;
@@ -135,7 +144,6 @@ private:
                              const std::string& base_dir);
 
     void setup_environment();
-    void setup_libraries();
     void register_custom_libs();
     void register_task_lib();
     void register_drawing_lib();
@@ -182,8 +190,6 @@ private:
     static int lua_task_defer(lua_State* L);
     static int lua_task_wait(lua_State* L);
     static int lua_task_cancel(lua_State* L);
-    static int lua_task_desynchronize(lua_State* L);
-    static int lua_task_synchronize(lua_State* L);
 
     static int lua_drawing_new(lua_State* L);
     static int lua_drawing_index(lua_State* L);
@@ -213,7 +219,7 @@ private:
     std::vector<ScheduledTask> tasks_;
     int next_task_id_ = 1;
 
-    std::mutex drawing_mutex_;
+    mutable std::mutex drawing_mutex_;
     std::unordered_map<int, DrawingObject> drawing_objects_;
     int next_drawing_id_ = 1;
 
