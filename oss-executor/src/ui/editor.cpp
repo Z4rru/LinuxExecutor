@@ -7,7 +7,6 @@ Editor::Editor() {
     container_ = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_add_css_class(container_, "editor-container");
     
-    // Line numbers
     line_numbers_ = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(line_numbers_), FALSE);
     gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(line_numbers_), FALSE);
@@ -18,14 +17,12 @@ Editor::Editor() {
     gtk_widget_add_css_class(line_numbers_, "line-numbers");
     gtk_box_append(GTK_BOX(container_), line_numbers_);
     
-    // Scrolled window for editor
     scroll_ = gtk_scrolled_window_new();
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_hexpand(scroll_, TRUE);
     gtk_widget_set_vexpand(scroll_, TRUE);
     
-    // Text view
     text_view_ = GTK_TEXT_VIEW(gtk_text_view_new());
     buffer_ = gtk_text_view_get_buffer(text_view_);
     
@@ -37,18 +34,15 @@ Editor::Editor() {
     gtk_text_view_set_wrap_mode(text_view_, GTK_WRAP_NONE);
     gtk_widget_add_css_class(GTK_WIDGET(text_view_), "editor-view");
     
-    // Enable undo
     gtk_text_buffer_set_enable_undo(buffer_, TRUE);
     
     setup_highlighting();
     
-    // Connect signals
     changed_handler_id_ = g_signal_connect_swapped(buffer_, "changed", 
         G_CALLBACK(+[](gpointer data) {
             static_cast<Editor*>(data)->on_text_changed();
         }), this);
     
-    // Auto-indent on Enter
     g_signal_connect(buffer_, "insert-text",
         G_CALLBACK(+[](GtkTextBuffer* buf, GtkTextIter* loc, 
                        const char* text, int len, gpointer data) {
@@ -59,7 +53,6 @@ Editor::Editor() {
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll_), GTK_WIDGET(text_view_));
     gtk_box_append(GTK_BOX(container_), scroll_);
     
-    // Set default font
     auto& config = Config::instance();
     set_font(config.get<std::string>("editor.font_family", "JetBrains Mono"),
              config.get<int>("editor.font_size", 14));
@@ -68,7 +61,6 @@ Editor::Editor() {
 Editor::~Editor() {}
 
 void Editor::setup_highlighting() {
-    // Create syntax highlighting tags
     gtk_text_buffer_create_tag(buffer_, "keyword",
         "foreground", "#ff7b72", "weight", PANGO_WEIGHT_BOLD, NULL);
     gtk_text_buffer_create_tag(buffer_, "string",
@@ -86,7 +78,6 @@ void Editor::setup_highlighting() {
     gtk_text_buffer_create_tag(buffer_, "operator",
         "foreground", "#ff7b72", NULL);
     
-    // Lua keyword rules
     rules_ = {
         {"\\b(and|break|do|else|elseif|end|for|function|if|in|local|not|or|repeat|return|then|until|while)\\b", "keyword"},
         {"\\b(true|false|nil)\\b", "boolean"},
@@ -105,14 +96,12 @@ void Editor::apply_highlighting() {
     GtkTextIter start, end;
     gtk_text_buffer_get_bounds(buffer_, &start, &end);
     
-    // Remove all existing tags
     gtk_text_buffer_remove_all_tags(buffer_, &start, &end);
     
     char* text = gtk_text_buffer_get_text(buffer_, &start, &end, FALSE);
     std::string source(text);
     g_free(text);
     
-    // Apply regex-based highlighting
     for (const auto& rule : rules_) {
         try {
             std::regex re(rule.pattern);
@@ -131,7 +120,6 @@ void Editor::apply_highlighting() {
         } catch (...) {}
     }
     
-    // String highlighting (handles multi-char properly)
     {
         size_t pos = 0;
         while (pos < source.size()) {
@@ -140,17 +128,16 @@ void Editor::apply_highlighting() {
                 size_t start_pos = pos;
                 pos++;
                 while (pos < source.size() && source[pos] != quote) {
-                    if (source[pos] == '\\') pos++; // Skip escaped char
+                    if (source[pos] == '\\') pos++;
                     pos++;
                 }
-                if (pos < source.size()) pos++; // Skip closing quote
+                if (pos < source.size()) pos++;
                 
                 GtkTextIter s, e;
                 gtk_text_buffer_get_iter_at_offset(buffer_, &s, static_cast<int>(start_pos));
                 gtk_text_buffer_get_iter_at_offset(buffer_, &e, static_cast<int>(pos));
                 gtk_text_buffer_apply_tag_by_name(buffer_, "string", &s, &e);
             }
-            // Multi-line strings [[...]]
             else if (pos + 1 < source.size() && source[pos] == '[' && source[pos+1] == '[') {
                 size_t start_pos = pos;
                 pos += 2;
@@ -170,14 +157,12 @@ void Editor::apply_highlighting() {
         }
     }
     
-    // Comment highlighting (must be after strings to override)
     {
         size_t pos = 0;
         while (pos < source.size()) {
             if (pos + 1 < source.size() && source[pos] == '-' && source[pos+1] == '-') {
                 size_t start_pos = pos;
                 
-                // Multi-line comment --[[...]]
                 if (pos + 3 < source.size() && source[pos+2] == '[' && source[pos+3] == '[') {
                     pos += 4;
                     while (pos + 1 < source.size() && !(source[pos] == ']' && source[pos+1] == ']')) {
@@ -185,7 +170,6 @@ void Editor::apply_highlighting() {
                     }
                     if (pos + 1 < source.size()) pos += 2;
                 } else {
-                    // Single line comment
                     while (pos < source.size() && source[pos] != '\n') pos++;
                 }
                 
@@ -199,7 +183,6 @@ void Editor::apply_highlighting() {
         }
     }
     
-    // Function calls: word followed by (
     {
         std::regex func_re("\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*\\(");
         auto it = std::sregex_iterator(source.begin(), source.end(), func_re);
@@ -209,7 +192,6 @@ void Editor::apply_highlighting() {
             auto match = *it;
             std::string name = match[1].str();
             
-            // Skip keywords and builtins
             static const std::vector<std::string> skip = {
                 "if", "for", "while", "function", "return", "and", "or", "not",
                 "repeat", "until", "do", "end", "then", "else", "elseif", "in",
@@ -235,7 +217,6 @@ void Editor::apply_highlighting() {
 }
 
 void Editor::on_text_changed() {
-    // Update line numbers
     int lines = get_line_count();
     std::string line_text;
     for (int i = 1; i <= lines; i++) {
@@ -245,7 +226,6 @@ void Editor::on_text_changed() {
     GtkTextBuffer* ln_buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(line_numbers_));
     gtk_text_buffer_set_text(ln_buf, line_text.c_str(), -1);
     
-    // Debounced highlighting (apply after a short delay)
     g_timeout_add(50, [](gpointer data) -> gboolean {
         static_cast<Editor*>(data)->apply_highlighting();
         return G_SOURCE_REMOVE;
@@ -257,7 +237,6 @@ void Editor::on_text_changed() {
 void Editor::handle_auto_indent(GtkTextBuffer* buffer, GtkTextIter* location, const char* text) {
     if (std::string(text) != "\n") return;
     
-    // Get previous line's indentation
     GtkTextIter line_start = *location;
     gtk_text_iter_set_line_offset(&line_start, 0);
     
@@ -265,14 +244,12 @@ void Editor::handle_auto_indent(GtkTextBuffer* buffer, GtkTextIter* location, co
     std::string line(line_text);
     g_free(line_text);
     
-    // Calculate indent
     std::string indent;
     for (char c : line) {
         if (c == ' ' || c == '\t') indent += c;
         else break;
     }
     
-    // Check if we should increase indent
     std::string trimmed = line;
     while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t'))
         trimmed.pop_back();
@@ -289,10 +266,8 @@ void Editor::handle_auto_indent(GtkTextBuffer* buffer, GtkTextIter* location, co
         }
     }
     
-    // Insert indent after the newline
     if (!indent.empty()) {
         g_signal_handler_block(buffer, changed_handler_id_);
-        // We'll insert the indent on the next idle to avoid recursion
         auto* indent_data = new std::pair<GtkTextBuffer*, std::string>(buffer, indent);
         g_idle_add([](gpointer data) -> gboolean {
             auto* d = static_cast<std::pair<GtkTextBuffer*, std::string>*>(data);
@@ -375,4 +350,4 @@ int Editor::get_cursor_column() const {
     return gtk_text_iter_get_line_offset(&iter) + 1;
 }
 
-} // namespace oss
+}
