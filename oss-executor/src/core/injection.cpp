@@ -24,14 +24,12 @@ namespace fs = std::filesystem;
 
 namespace oss {
 
-// ─── compile-time knobs ──────────────────────────────────────────────────────
 static constexpr size_t REGION_SCAN_CAP = 0x4000000;
 static constexpr size_t REGION_MIN      = 0x1000;
 static constexpr size_t REGION_MAX      = 0x80000000ULL;
 static constexpr int    AUTOSCAN_TICKS  = 30;
 static constexpr int    TICK_MS         = 100;
 
-// ─── name tables ─────────────────────────────────────────────────────────────
 static const std::string DIRECT_TARGETS[] = {
     "RobloxPlayer", "RobloxPlayerBeta", "RobloxPlayerBeta.exe",
     "RobloxPlayerLauncher", "Roblox",
@@ -65,7 +63,6 @@ static const std::string PATH_KEYWORDS[] = {
     ".exe",   ".dll",   "wine"
 };
 
-// ─── self-targeting exclusion ────────────────────────────────────────────────
 static const std::string SELF_KEYWORDS[] = {
     "OSS", "OSSExecutor", "oss-executor", "AppImage"
 };
@@ -91,15 +88,11 @@ static bool is_valid_target(pid_t pid, const std::string& comm,
     return true;
 }
 
-// ─── singleton ───────────────────────────────────────────────────────────────
 Injection& Injection::instance() {
     static Injection inst;
     return inst;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  /proc helpers
-// ═════════════════════════════════════════════════════════════════════════════
 std::string Injection::read_proc_cmdline(pid_t pid) {
     try {
         std::ifstream f("/proc/" + std::to_string(pid) + "/cmdline",
@@ -210,9 +203,6 @@ ProcessInfo Injection::gather_info(pid_t pid) {
     return info;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  Internal state helpers
-// ═════════════════════════════════════════════════════════════════════════════
 bool Injection::process_alive() const {
     pid_t p = memory_.get_pid();
     return p > 0 && kill(p, 0) == 0;
@@ -244,6 +234,12 @@ void Injection::set_state(InjectionState s, const std::string& msg) {
 bool Injection::write_to_process(uintptr_t addr, const void* data, size_t len) {
     pid_t pid = memory_.get_pid();
     if (pid <= 0) return false;
+
+    struct iovec local_iov  = { const_cast<void*>(data), len };
+    struct iovec remote_iov = { reinterpret_cast<void*>(addr), len };
+    ssize_t written = process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
+    if (written == static_cast<ssize_t>(len)) return true;
+
     std::string path = "/proc/" + std::to_string(pid) + "/mem";
     std::ofstream f(path, std::ios::binary | std::ios::in | std::ios::out);
     if (!f.is_open()) return false;
@@ -253,9 +249,23 @@ bool Injection::write_to_process(uintptr_t addr, const void* data, size_t len) {
     return f.good();
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  Target adoption (with self-targeting guard)
-// ═════════════════════════════════════════════════════════════════════════════
+bool Injection::read_from_process(uintptr_t addr, void* buf, size_t len) {
+    pid_t pid = memory_.get_pid();
+    if (pid <= 0) return false;
+
+    struct iovec local_iov  = { buf, len };
+    struct iovec remote_iov = { reinterpret_cast<void*>(addr), len };
+    ssize_t nread = process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
+    if (nread == static_cast<ssize_t>(len)) return true;
+
+    std::ifstream f("/proc/" + std::to_string(pid) + "/mem", std::ios::binary);
+    if (!f.is_open()) return false;
+    f.seekg(static_cast<std::streamoff>(addr));
+    if (!f.good()) return false;
+    f.read(static_cast<char*>(buf), static_cast<std::streamsize>(len));
+    return f.gcount() == static_cast<std::streamsize>(len);
+}
+
 void Injection::adopt_target(pid_t pid, const std::string& via) {
     std::string comm    = read_proc_comm(pid);
     std::string cmdline = read_proc_cmdline(pid);
@@ -275,9 +285,6 @@ void Injection::adopt_target(pid_t pid, const std::string& via) {
              proc_info_.via_wine, proc_info_.via_sober, proc_info_.via_flatpak);
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  Scanning strategies
-// ═════════════════════════════════════════════════════════════════════════════
 bool Injection::scan_direct() {
     for (const auto& t : DIRECT_TARGETS) {
         auto pid = Memory::find_process(t);
@@ -392,9 +399,6 @@ bool Injection::scan_brute() {
     return false;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  Public: process discovery
-// ═════════════════════════════════════════════════════════════════════════════
 bool Injection::scan_for_roblox() {
     set_state(InjectionState::Scanning, "Scanning for Roblox...");
     if (scan_direct())       return true;
@@ -414,9 +418,6 @@ pid_t Injection::find_roblox_pid() {
     return -1;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  VM scanning & validation
-// ═════════════════════════════════════════════════════════════════════════════
 bool Injection::should_scan_region(const MemoryRegion& r) const {
     if (!r.readable()) return false;
     if (r.size() < REGION_MIN || r.size() > REGION_MAX) return false;
@@ -431,11 +432,15 @@ bool Injection::should_scan_region(const MemoryRegion& r) const {
 
 bool Injection::cross_validate(uintptr_t rstart, size_t rsize) {
     size_t check = std::min(rsize, static_cast<size_t>(0x200000));
+    int hits = 0;
     for (const auto& sec : SECONDARY_MARKERS) {
         std::vector<uint8_t> pat(sec.begin(), sec.end());
         std::string mask(pat.size(), 'x');
         auto hit = memory_.pattern_scan(pat, mask, rstart, check);
-        if (hit.has_value()) return true;
+        if (hit.has_value()) {
+            hits++;
+            if (hits >= 2) return true;
+        }
     }
     return false;
 }
@@ -449,10 +454,15 @@ bool Injection::locate_luau_vm() {
     std::string best_marker;
     std::string best_path;
     uintptr_t   best_base = 0;
+    int         best_hits = 0;
 
     for (const auto& region : regions) {
         if (!should_scan_region(region)) continue;
         vm_scan_.regions_scanned++;
+
+        int region_hits = 0;
+        uintptr_t first_hit = 0;
+        std::string first_marker;
 
         for (const auto& marker : PRIMARY_MARKERS) {
             std::vector<uint8_t> pattern(marker.begin(), marker.end());
@@ -464,63 +474,73 @@ bool Injection::locate_luau_vm() {
                                                region.start, scan_len);
             if (!result.has_value()) continue;
 
-            if (cross_validate(region.start, region.size())) {
-                vm_scan_.marker_addr = result.value();
+            region_hits++;
+            if (first_hit == 0) {
+                first_hit    = result.value();
+                first_marker = marker;
+            }
+
+            if (region_hits >= 3 && cross_validate(region.start, region.size())) {
+                vm_scan_.marker_addr = first_hit;
                 vm_scan_.region_base = region.start;
-                vm_scan_.marker_name = marker;
+                vm_scan_.marker_name = first_marker;
                 vm_scan_.region_path = region.path.empty() ? "[anon]" : region.path;
                 vm_scan_.validated   = true;
-                vm_marker_addr_      = result.value();
+                vm_marker_addr_      = first_hit;
                 LOG_INFO("Luau VM confirmed: '{}' at 0x{:X} in '{}' "
-                         "({} regions, {:.1f}MB scanned)",
-                         marker, vm_scan_.marker_addr, vm_scan_.region_path,
-                         vm_scan_.regions_scanned,
+                         "({} primary hits, {} regions, {:.1f}MB scanned)",
+                         first_marker, vm_scan_.marker_addr, vm_scan_.region_path,
+                         region_hits, vm_scan_.regions_scanned,
                          vm_scan_.bytes_scanned / (1024.0 * 1024.0));
                 return true;
             }
+        }
 
-            if (best_addr == 0) {
-                best_addr   = result.value();
-                best_marker = marker;
-                best_path   = region.path.empty() ? "[anon]" : region.path;
-                best_base   = region.start;
-            }
+        if (region_hits > best_hits) {
+            best_hits   = region_hits;
+            best_addr   = first_hit;
+            best_marker = first_marker;
+            best_path   = region.path.empty() ? "[anon]" : region.path;
+            best_base   = region.start;
         }
     }
 
-    if (best_addr != 0) {
+    if (best_addr != 0 && best_hits >= 2) {
         vm_scan_.marker_addr = best_addr;
         vm_scan_.region_base = best_base;
         vm_scan_.marker_name = best_marker;
         vm_scan_.region_path = best_path;
         vm_scan_.validated   = false;
         vm_marker_addr_      = best_addr;
-        LOG_WARN("Luau VM probable (unvalidated): '{}' at 0x{:X} in '{}'",
-                 best_marker, best_addr, best_path);
+        LOG_WARN("Luau VM probable (unvalidated): '{}' at 0x{:X} in '{}' ({} hits)",
+                 best_marker, best_addr, best_path, best_hits);
         return true;
     }
     return false;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  Payload path discovery
-// ═════════════════════════════════════════════════════════════════════════════
 std::string Injection::find_payload_path() {
-    std::vector<std::string> search_paths = {
-        "./liboss_payload.so",
-        "./build/liboss_payload.so",
-        "../lib/liboss_payload.so",
-        "/usr/lib/oss-executor/liboss_payload.so",
-        "/usr/local/lib/oss-executor/liboss_payload.so",
-    };
+    std::vector<std::string> search_paths;
 
     char self_path[512];
     ssize_t len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
     if (len > 0) {
         self_path[len] = '\0';
         fs::path exe_dir = fs::path(self_path).parent_path();
-        search_paths.insert(search_paths.begin(),
-                            (exe_dir / "liboss_payload.so").string());
+        search_paths.push_back((exe_dir / "liboss_payload.so").string());
+        search_paths.push_back((exe_dir / "lib" / "liboss_payload.so").string());
+    }
+
+    search_paths.push_back("./liboss_payload.so");
+    search_paths.push_back("./build/liboss_payload.so");
+    search_paths.push_back("../lib/liboss_payload.so");
+    search_paths.push_back("/usr/lib/oss-executor/liboss_payload.so");
+    search_paths.push_back("/usr/local/lib/oss-executor/liboss_payload.so");
+
+    const char* home = getenv("HOME");
+    if (home) {
+        search_paths.push_back(std::string(home) + "/.oss-executor/liboss_payload.so");
+        search_paths.push_back(std::string(home) + "/.local/lib/oss-executor/liboss_payload.so");
     }
 
     for (const auto& path : search_paths)
@@ -529,9 +549,6 @@ std::string Injection::find_payload_path() {
     return "";
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  Remote symbol resolution (for ptrace injection)
-// ═════════════════════════════════════════════════════════════════════════════
 uintptr_t Injection::find_libc_function(pid_t pid, const std::string& func_name) {
     return find_remote_symbol(pid, "c", func_name);
 }
@@ -579,11 +596,14 @@ uintptr_t Injection::find_remote_symbol(pid_t pid, const std::string& lib_name,
     return 0;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  Ptrace-based library injection
-// ═════════════════════════════════════════════════════════════════════════════
 bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     LOG_INFO("Injecting {} into PID {}", lib_path, pid);
+
+    if (!fs::exists(lib_path)) {
+        error_ = "Payload library does not exist: " + lib_path;
+        LOG_ERROR("inject_library: {}", error_);
+        return false;
+    }
 
     uintptr_t remote_dlopen = find_remote_symbol(pid, "c", "__libc_dlopen_mode");
     if (remote_dlopen == 0)
@@ -599,29 +619,40 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
 }
 
 bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
+    errno = 0;
     if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) != 0) {
         error_ = "ptrace attach failed: " + std::string(strerror(errno));
+        if (errno == EPERM) {
+            error_ += " — run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope";
+        }
         LOG_ERROR("inject_shellcode: {}", error_);
         return false;
     }
 
     int status;
-    waitpid(pid, &status, 0);
-
-    // ── save original registers ──────────────────────────────────────────
-    struct user_regs_struct orig_regs;
-    if (ptrace(PTRACE_GETREGS, pid, nullptr, &orig_regs) != 0) {
+    if (waitpid(pid, &status, 0) == -1) {
         ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
-        error_ = "Could not read registers";
+        error_ = "waitpid failed after attach";
         return false;
     }
 
-    // ── allocate page in target via mmap syscall ─────────────────────────
-    size_t path_len   = lib_path.size() + 1;
+    if (!WIFSTOPPED(status)) {
+        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+        error_ = "Process did not stop after ptrace attach";
+        return false;
+    }
+
+    struct user_regs_struct orig_regs;
+    if (ptrace(PTRACE_GETREGS, pid, nullptr, &orig_regs) != 0) {
+        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+        error_ = "Could not read registers: " + std::string(strerror(errno));
+        return false;
+    }
+
     size_t alloc_size = 4096;
 
     struct user_regs_struct mmap_regs = orig_regs;
-    mmap_regs.rax = 9;   // __NR_mmap
+    mmap_regs.rax = 9;
     mmap_regs.rdi = 0;
     mmap_regs.rsi = alloc_size;
     mmap_regs.rdx = PROT_READ | PROT_WRITE | PROT_EXEC;
@@ -630,14 +661,14 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
     mmap_regs.r9  = 0;
 
     uintptr_t rip = orig_regs.rip;
-    long orig_bytes[2];
-    orig_bytes[0] = ptrace(PTRACE_PEEKTEXT, pid,
-                           reinterpret_cast<void*>(rip), nullptr);
-    orig_bytes[1] = ptrace(PTRACE_PEEKTEXT, pid,
-                           reinterpret_cast<void*>(rip + 8), nullptr);
+    long orig_code[2];
+    orig_code[0] = ptrace(PTRACE_PEEKTEXT, pid,
+                          reinterpret_cast<void*>(rip), nullptr);
+    orig_code[1] = ptrace(PTRACE_PEEKTEXT, pid,
+                          reinterpret_cast<void*>(rip + 8), nullptr);
 
     uint8_t syscall_trap[] = { 0x0F, 0x05, 0xCC };
-    long insn = orig_bytes[0];
+    long insn = orig_code[0];
     memcpy(&insn, syscall_trap, 3);
     ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
            reinterpret_cast<void*>(insn));
@@ -652,32 +683,38 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
 
     auto restore_and_detach = [&]() {
         ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
-               reinterpret_cast<void*>(orig_bytes[0]));
+               reinterpret_cast<void*>(orig_code[0]));
         ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip + 8),
-               reinterpret_cast<void*>(orig_bytes[1]));
+               reinterpret_cast<void*>(orig_code[1]));
         ptrace(PTRACE_SETREGS, pid, nullptr, &orig_regs);
         ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
     };
 
-    if (mem_addr == 0 || mem_addr == static_cast<uintptr_t>(-1)) {
+    if (mem_addr == 0 || mem_addr > 0x7FFFFFFFFFFF ||
+        mem_addr == static_cast<uintptr_t>(-1)) {
         restore_and_detach();
-        error_ = "Remote mmap failed";
+        error_ = "Remote mmap failed (returned 0x" +
+                 ([&]{ std::ostringstream o; o << std::hex << mem_addr; return o.str(); })() + ")";
+        LOG_ERROR("{}", error_);
         return false;
     }
     LOG_DEBUG("Allocated 0x{:x} in target", mem_addr);
 
-    // ── write library path into allocated page ───────────────────────────
+    size_t path_len    = lib_path.size() + 1;
     size_t path_offset = 256;
     for (size_t i = 0; i < path_len; i += sizeof(long)) {
         long word = 0;
-        memcpy(&word, lib_path.c_str() + i,
-               std::min(sizeof(long), path_len - i));
-        ptrace(PTRACE_POKETEXT, pid,
-               reinterpret_cast<void*>(mem_addr + path_offset + i),
-               reinterpret_cast<void*>(word));
+        size_t chunk = std::min(sizeof(long), path_len - i);
+        memcpy(&word, lib_path.c_str() + i, chunk);
+        if (ptrace(PTRACE_POKETEXT, pid,
+                   reinterpret_cast<void*>(mem_addr + path_offset + i),
+                   reinterpret_cast<void*>(word)) != 0) {
+            restore_and_detach();
+            error_ = "Failed to write library path to target";
+            return false;
+        }
     }
 
-    // ── resolve dlopen in target ─────────────────────────────────────────
     uintptr_t dlopen_addr = find_remote_symbol(pid, "c", "__libc_dlopen_mode");
     if (dlopen_addr == 0)
         dlopen_addr = find_remote_symbol(pid, "dl", "dlopen");
@@ -686,29 +723,24 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
         error_ = "Cannot find dlopen in target";
         return false;
     }
+    LOG_DEBUG("dlopen resolved at 0x{:x} in target", dlopen_addr);
 
-    // ── build shellcode: dlopen(path, RTLD_NOW|__RTLD_DLOPEN) ────────────
     uint8_t shellcode[64] = {};
     int sc_off = 0;
 
-    // mov rdi, path_addr
     shellcode[sc_off++] = 0x48; shellcode[sc_off++] = 0xBF;
     uintptr_t path_addr = mem_addr + path_offset;
     memcpy(shellcode + sc_off, &path_addr, 8); sc_off += 8;
 
-    // mov rsi, RTLD_NOW | __RTLD_DLOPEN
     shellcode[sc_off++] = 0x48; shellcode[sc_off++] = 0xBE;
-    uint64_t rtld_now = 0x80000002;
-    memcpy(shellcode + sc_off, &rtld_now, 8); sc_off += 8;
+    uint64_t rtld_flags = 0x80000002;
+    memcpy(shellcode + sc_off, &rtld_flags, 8); sc_off += 8;
 
-    // mov rax, dlopen_addr
     shellcode[sc_off++] = 0x48; shellcode[sc_off++] = 0xB8;
     memcpy(shellcode + sc_off, &dlopen_addr, 8); sc_off += 8;
 
-    // call rax
     shellcode[sc_off++] = 0xFF; shellcode[sc_off++] = 0xD0;
 
-    // int3
     shellcode[sc_off++] = 0xCC;
 
     for (int i = 0; i < sc_off; i += sizeof(long)) {
@@ -721,32 +753,52 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
                reinterpret_cast<void*>(word));
     }
 
-    // ── execute shellcode ────────────────────────────────────────────────
     struct user_regs_struct sc_regs = orig_regs;
     sc_regs.rip = mem_addr;
     sc_regs.rsp = (sc_regs.rsp & ~0xFULL) - 8;
 
     ptrace(PTRACE_SETREGS, pid, nullptr, &sc_regs);
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-    waitpid(pid, &status, 0);
+
+    int wait_result = waitpid(pid, &status, 0);
+    if (wait_result == -1) {
+        restore_and_detach();
+        error_ = "waitpid failed during shellcode execution";
+        return false;
+    }
 
     ptrace(PTRACE_GETREGS, pid, nullptr, &result_regs);
     uintptr_t dlopen_result = result_regs.rax;
     LOG_INFO("dlopen returned 0x{:x}", dlopen_result);
 
-    restore_and_detach();
+    struct user_regs_struct munmap_regs = orig_regs;
+    munmap_regs.rax = 11;
+    munmap_regs.rdi = mem_addr;
+    munmap_regs.rsi = alloc_size;
+
+    ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
+           reinterpret_cast<void*>(insn));
+    ptrace(PTRACE_SETREGS, pid, nullptr, &munmap_regs);
+    ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+    waitpid(pid, &status, 0);
+
+    ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
+           reinterpret_cast<void*>(orig_code[0]));
+    ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip + 8),
+           reinterpret_cast<void*>(orig_code[1]));
+    ptrace(PTRACE_SETREGS, pid, nullptr, &orig_regs);
+    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
 
     if (dlopen_result == 0) {
-        error_ = "dlopen returned NULL — library load failed";
+        error_ = "dlopen returned NULL — library load failed in target";
         LOG_ERROR("{}", error_);
         return false;
     }
+
+    payload_loaded_ = true;
     return true;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  Public: attach / detach / inject / execute
-// ═════════════════════════════════════════════════════════════════════════════
 bool Injection::attach() {
     if (memory_.is_valid() && process_alive()) {
         auto regions = memory_.get_regions();
@@ -761,10 +813,8 @@ bool Injection::attach() {
     auto regions = memory_.get_regions();
     if (regions.empty()) {
         set_state(InjectionState::Failed,
-                  "Cannot read process memory — check ptrace_scope");
-        LOG_ERROR("0 readable regions for PID {}. "
-                  "Run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope",
-                  memory_.get_pid());
+                  "Cannot read process memory — run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope");
+        LOG_ERROR("0 readable regions for PID {}", memory_.get_pid());
         return false;
     }
 
@@ -786,10 +836,11 @@ bool Injection::attach() {
 bool Injection::detach() {
     set_state(InjectionState::Detached, "Detached");
     memory_.set_pid(0);
-    mode_           = InjectionMode::None;
-    vm_marker_addr_ = 0;
-    vm_scan_        = {};
-    proc_info_      = {};
+    mode_            = InjectionMode::None;
+    vm_marker_addr_  = 0;
+    vm_scan_         = {};
+    proc_info_       = {};
+    payload_loaded_  = false;
     return true;
 }
 
@@ -802,7 +853,6 @@ bool Injection::inject() {
         return false;
     }
 
-    // ── attempt ptrace-based library injection first ─────────────────────
     std::string payload = find_payload_path();
     if (!payload.empty()) {
         set_state(InjectionState::Injecting,
@@ -811,19 +861,34 @@ bool Injection::inject() {
 
         if (inject_library(memory_.get_pid(), payload)) {
             set_state(InjectionState::Initializing,
-                      "Payload loaded — waiting for init handshake...");
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                      "Payload loaded — waiting for init...");
+
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(5);
+            bool handshake = false;
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (verify_payload_alive()) {
+                    handshake = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            if (handshake) {
+                LOG_INFO("Payload handshake confirmed");
+            } else {
+                LOG_WARN("Payload handshake timeout — library may still be initializing");
+            }
         } else {
-            LOG_WARN("Library injection failed, continuing with VM-scan mode");
+            LOG_WARN("Library injection failed ({}), continuing with VM-scan mode", error_);
         }
     } else {
-        LOG_WARN("Payload library not found, using embedded VM mode");
+        LOG_WARN("Payload library not found, using memory-scan mode");
     }
 
-    // ── locate Luau VM markers ───────────────────────────────────────────
     bool found = locate_luau_vm();
 
-    if (found) {
+    if (found && payload_loaded_) {
         mode_ = InjectionMode::Full;
         std::ostringstream hex;
         hex << "0x" << std::hex << vm_scan_.marker_addr;
@@ -834,6 +899,10 @@ bool Injection::inject() {
                  vm_scan_.marker_name, vm_scan_.marker_addr,
                  vm_scan_.validated,
                  vm_scan_.region_path, vm_scan_.region_base);
+    } else if (found) {
+        mode_ = InjectionMode::Full;
+        set_state(InjectionState::Ready,
+                  "Attached — VM located but no payload injected");
     } else {
         mode_ = InjectionMode::LocalOnly;
         set_state(InjectionState::Ready,
@@ -844,6 +913,17 @@ bool Injection::inject() {
                  memory_.get_pid());
     }
     return true;
+}
+
+bool Injection::verify_payload_alive() {
+    if (!payload_loaded_ || !process_alive()) return false;
+
+    auto regions = memory_.get_regions();
+    for (const auto& r : regions) {
+        if (r.path.find("liboss_payload") != std::string::npos)
+            return true;
+    }
+    return false;
 }
 
 bool Injection::execute_script(const std::string& source) {
@@ -859,16 +939,20 @@ bool Injection::execute_script(const std::string& source) {
         return false;
     }
 
+    if (source.empty()) return true;
+
     set_state(InjectionState::Executing,
               "Executing (" + std::to_string(source.size()) + " bytes)...");
 
-    if (mode_ == InjectionMode::Full && vm_marker_addr_ != 0) {
+    if (mode_ == InjectionMode::Full && payload_loaded_) {
         auto regions = memory_.get_regions();
         uintptr_t write_addr = 0;
+        size_t required = 8 + source.size();
+
         for (const auto& r : regions) {
             if (!r.writable() || !r.readable()) continue;
             if (!r.path.empty() && r.path[0] == '/') continue;
-            if (r.size() >= source.size() + 64) {
+            if (r.size() >= required + 64) {
                 write_addr = r.start;
                 break;
             }
@@ -876,27 +960,29 @@ bool Injection::execute_script(const std::string& source) {
 
         if (write_addr != 0) {
             std::vector<uint8_t> payload;
-            uint32_t len = static_cast<uint32_t>(source.size());
-            payload.resize(4 + source.size());
-            std::memcpy(payload.data(), &len, 4);
-            std::memcpy(payload.data() + 4, source.data(), source.size());
+            uint32_t magic = 0x4F535345;
+            uint32_t len   = static_cast<uint32_t>(source.size());
+            payload.resize(8 + source.size());
+            std::memcpy(payload.data(), &magic, 4);
+            std::memcpy(payload.data() + 4, &len, 4);
+            std::memcpy(payload.data() + 8, source.data(), source.size());
 
             if (write_to_process(write_addr, payload.data(), payload.size())) {
-                set_state(InjectionState::Ready, "Script dispatched");
-                LOG_INFO("Wrote {} bytes to 0x{:X}", payload.size(), write_addr);
+                set_state(InjectionState::Ready, "Script dispatched to payload");
+                LOG_INFO("Wrote {} bytes (magic=0x{:X}) to 0x{:X}",
+                         payload.size(), magic, write_addr);
                 return true;
             }
-            LOG_WARN("Memory write failed at 0x{:X}, falling back", write_addr);
+            LOG_WARN("Memory write failed at 0x{:X}", write_addr);
+        } else {
+            LOG_WARN("No suitable writable region found for script dispatch");
         }
     }
 
     set_state(InjectionState::Ready, "Script queued for local execution");
-    return true;
+    return false;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  Auto-scan thread
-// ═════════════════════════════════════════════════════════════════════════════
 void Injection::start_auto_scan() {
     bool expected = false;
     if (!scanning_.compare_exchange_strong(expected, true)) return;
@@ -906,10 +992,11 @@ void Injection::start_auto_scan() {
         while (scanning_.load()) {
             if (memory_.is_valid() && !process_alive()) {
                 LOG_WARN("Target process exited, resetting");
-                mode_           = InjectionMode::None;
-                vm_marker_addr_ = 0;
-                vm_scan_        = {};
-                proc_info_      = {};
+                mode_            = InjectionMode::None;
+                vm_marker_addr_  = 0;
+                vm_scan_         = {};
+                proc_info_       = {};
+                payload_loaded_  = false;
                 memory_.set_pid(0);
                 set_state(InjectionState::Idle, "Process exited — rescanning...");
             }
@@ -928,4 +1015,4 @@ void Injection::stop_auto_scan() {
     if (scan_thread_.joinable()) scan_thread_.join();
 }
 
-} // namespace oss
+}
