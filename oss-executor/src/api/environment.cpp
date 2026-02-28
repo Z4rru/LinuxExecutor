@@ -45,9 +45,10 @@ static int lua_http_get(lua_State* L) {
     const char* url = luaL_checkstring(L, url_index);
     if (!url || strlen(url) == 0) { luaL_error(L, "HttpGet: URL cannot be empty"); return 0; }
     std::string surl(url);
-    if (surl.rfind("http://", 0) != 0 && surl.rfind("https://", 0) != 0)
-        luaL_error(L, "HttpGet: URL must start with http:// or https://"); 
+    if (surl.rfind("http://", 0) != 0 && surl.rfind("https://", 0) != 0) {
+        luaL_error(L, "HttpGet: URL must start with http:// or https://");
         return 0;
+    }
     try {
         auto response = Http::instance().get(surl);
         if (response.success()) {
@@ -2486,6 +2487,7 @@ void Environment::setup(lua_State* L) {
 }
 
 } // namespace oss
+
 
 
 
