@@ -1,5 +1,5 @@
 #include "script_manager.hpp"
-#include "lua_engine.hpp"       // real engine — no mock
+#include "core/lua_engine.hpp"   // real engine — resolved via -I<src>
 #include "utils/logger.hpp"
 
 #include <algorithm>
