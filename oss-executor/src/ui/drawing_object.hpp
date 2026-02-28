@@ -2,106 +2,71 @@
 #pragma once
 
 #include <string>
-#include <vector>
 #include <cstdint>
-#include <memory>
-#include <mutex>
-#include <algorithm>
 
-struct Color {
-    float r = 1.0f;
-    float g = 1.0f;
-    float b = 1.0f;
-    float a = 1.0f;
-
-    Color() = default;
-    Color(float r, float g, float b, float a = 1.0f)
-        : r(r), g(g), b(b), a(a) {}
-
-    static Color fromHex(uint32_t hex, float alpha = 1.0f) {
-        return Color(
-            ((hex >> 16) & 0xFF) / 255.0f,
-            ((hex >> 8)  & 0xFF) / 255.0f,
-            ( hex        & 0xFF) / 255.0f,
-            alpha
-        );
-    }
-};
-
-struct Vec2 {
-    float x = 0.0f;
-    float y = 0.0f;
-
-    Vec2() = default;
-    Vec2(float x, float y) : x(x), y(y) {}
-};
+// Forward-declare so we don't pull in all of cairo.h
+struct _cairo_surface;
+typedef struct _cairo_surface cairo_surface_t;
 
 struct DrawingObject {
-    // Nested enum so lua_engine.hpp can use DrawingObject::Type
     enum class Type {
         None = 0,
         Line,
-        Rectangle,
-        FilledRectangle,
-        Circle,
-        FilledCircle,
-        Triangle,
         Text,
-        Image
+        Image,
+        Circle,
+        Square,
+        Triangle,
+        Quad
     };
 
-    Type        type      = Type::None;
-    Vec2        pos       = {};          // primary position / top-left
-    Vec2        pos2      = {};          // end-point (lines) or size (rects)
-    float       radius    = 0.0f;       // circles
-    float       thickness = 1.0f;
-    Color       color     = {};
-    Color       outline_color = {0, 0, 0, 1};
-    bool        outlined  = false;
-    std::string text;                   // for Type::Text
+    Type type = Type::None;
+
+    // ── common properties ───────────────────────────────────────
+    bool  visible      = true;
+    int   z_index      = 0;
+    float transparency = 0.0f;
+    float thickness    = 1.0f;
+    float rounding     = 0.0f;
+    bool  filled       = false;
+    bool  outline      = false;
+    bool  center       = false;     // text center-alignment
+
+    // ── generic position / size ─────────────────────────────────
+    float pos_x  = 0.0f, pos_y  = 0.0f;
+    float size_x = 0.0f, size_y = 0.0f;
+
+    // ── line end-points ─────────────────────────────────────────
+    float from_x = 0.0f, from_y = 0.0f;
+    float to_x   = 0.0f, to_y   = 0.0f;
+
+    // ── circle ──────────────────────────────────────────────────
+    float radius    = 0.0f;
+    int   num_sides = 0;
+
+    // ── colour (RGB, 0-1) ───────────────────────────────────────
+    float color_r   = 1.0f, color_g   = 1.0f, color_b   = 1.0f;
+    float outline_r = 0.0f, outline_g = 0.0f, outline_b = 0.0f;
+
+    // ── text ────────────────────────────────────────────────────
+    std::string text;
+    float       text_size = 14.0f;
     std::string font      = "monospace";
-    float       font_size = 14.0f;
-    int         z_order   = 0;
-    bool        visible   = true;
 
-    // Unique identifier assigned by the engine
-    uint64_t    id        = 0;
-};
+    // ── triangle vertices ───────────────────────────────────────
+    float pa_x = 0.0f, pa_y = 0.0f;
+    float pb_x = 0.0f, pb_y = 0.0f;
+    float pc_x = 0.0f, pc_y = 0.0f;
 
-/// Thread-safe container that the Lua engine pushes into and the
-/// overlay/renderer drains each frame.
-class DrawingObjectList {
-public:
-    void add(const DrawingObject& obj) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        objects_.push_back(obj);
-    }
+    // ── quad vertices ───────────────────────────────────────────
+    float qa_x = 0.0f, qa_y = 0.0f;
+    float qb_x = 0.0f, qb_y = 0.0f;
+    float qc_x = 0.0f, qc_y = 0.0f;
+    float qd_x = 0.0f, qd_y = 0.0f;
 
-    void remove(uint64_t id) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        objects_.erase(
-            std::remove_if(objects_.begin(), objects_.end(),
-                [id](const DrawingObject& o){ return o.id == id; }),
-            objects_.end());
-    }
-
-    void clear() {
-        std::lock_guard<std::mutex> lk(mtx_);
-        objects_.clear();
-    }
-
-    /// Snapshot for the renderer – returns a copy so the lock is brief.
-    std::vector<DrawingObject> snapshot() const {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return objects_;
-    }
-
-    size_t size() const {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return objects_.size();
-    }
-
-private:
-    mutable std::mutex           mtx_;
-    std::vector<DrawingObject>   objects_;
+    // ── image ───────────────────────────────────────────────────
+    float            image_w       = 0.0f;
+    float            image_h       = 0.0f;
+    std::string      image_path;
+    cairo_surface_t* image_surface = nullptr;
 };
