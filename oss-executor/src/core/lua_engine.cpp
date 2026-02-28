@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstring>
 #include <array>
+#include <algorithm>
 
 namespace oss {
 
@@ -33,9 +34,13 @@ static LuaEngine* get_engine(lua_State* L) {
 
 static const char* DRAWING_OBJ_MT = "DrawingObject";
 
-struct DrawingHandle { int id; };
+struct DrawingHandle {
+    int id;
+    bool removed; // Track removal state to prevent use-after-free
+};
 
 static DrawingObject::Type parse_drawing_type(const char* s) {
+    if (!s) return DrawingObject::Type::Line;
     if (strcmp(s, "Line") == 0)      return DrawingObject::Type::Line;
     if (strcmp(s, "Text") == 0)      return DrawingObject::Type::Text;
     if (strcmp(s, "Circle") == 0)    return DrawingObject::Type::Circle;
@@ -48,45 +53,61 @@ static DrawingObject::Type parse_drawing_type(const char* s) {
 }
 
 // Reads {X=,Y=} or {[1],[2]} into x,y
-static void read_vec2(lua_State* L, int idx, double& x, double& y) {
-    if (!lua_istable(L, idx)) return;
-    lua_getfield(L, idx, "X");
+static bool read_vec2(lua_State* L, int idx, double& x, double& y) {
+    if (!lua_istable(L, idx)) return false;
+
+    int abs_idx = (idx > 0) ? idx : lua_gettop(L) + idx + 1;
+
+    lua_getfield(L, abs_idx, "X");
     if (lua_isnumber(L, -1)) {
-        x = lua_tonumber(L, -1); lua_pop(L, 1);
-        lua_getfield(L, idx, "Y");
+        x = lua_tonumber(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, abs_idx, "Y");
         if (lua_isnumber(L, -1)) y = lua_tonumber(L, -1);
         lua_pop(L, 1);
-        return;
+        return true;
     }
     lua_pop(L, 1);
-    lua_rawgeti(L, idx, 1); if (lua_isnumber(L, -1)) x = lua_tonumber(L, -1); lua_pop(L, 1);
-    lua_rawgeti(L, idx, 2); if (lua_isnumber(L, -1)) y = lua_tonumber(L, -1); lua_pop(L, 1);
+
+    lua_rawgeti(L, abs_idx, 1);
+    if (lua_isnumber(L, -1)) x = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_rawgeti(L, abs_idx, 2);
+    if (lua_isnumber(L, -1)) y = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    return true;
 }
 
 // Reads {R=,G=,B=} or {[1],[2],[3]} into r,g,b
-static void read_color(lua_State* L, int idx, double& r, double& g, double& b) {
-    if (!lua_istable(L, idx)) return;
-    lua_getfield(L, idx, "R");
+static bool read_color(lua_State* L, int idx, double& r, double& g, double& b) {
+    if (!lua_istable(L, idx)) return false;
+
+    int abs_idx = (idx > 0) ? idx : lua_gettop(L) + idx + 1;
+
+    lua_getfield(L, abs_idx, "R");
     if (lua_isnumber(L, -1)) {
-        r = lua_tonumber(L, -1); lua_pop(L, 1);
-        lua_getfield(L, idx, "G");
+        r = lua_tonumber(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, abs_idx, "G");
         if (lua_isnumber(L, -1)) g = lua_tonumber(L, -1);
         lua_pop(L, 1);
-        lua_getfield(L, idx, "B");
+        lua_getfield(L, abs_idx, "B");
         if (lua_isnumber(L, -1)) b = lua_tonumber(L, -1);
         lua_pop(L, 1);
-        return;
+        return true;
     }
     lua_pop(L, 1);
-    lua_rawgeti(L, idx, 1);
+
+    lua_rawgeti(L, abs_idx, 1);
     if (lua_isnumber(L, -1)) r = lua_tonumber(L, -1);
     lua_pop(L, 1);
-    lua_rawgeti(L, idx, 2);
+    lua_rawgeti(L, abs_idx, 2);
     if (lua_isnumber(L, -1)) g = lua_tonumber(L, -1);
     lua_pop(L, 1);
-    lua_rawgeti(L, idx, 3);
+    lua_rawgeti(L, abs_idx, 3);
     if (lua_isnumber(L, -1)) b = lua_tonumber(L, -1);
     lua_pop(L, 1);
+    return true;
 }
 
 static void push_vec2(lua_State* L, double x, double y) {
@@ -100,6 +121,19 @@ static void push_color3(lua_State* L, double r, double g, double b) {
     lua_pushnumber(L, r); lua_setfield(L, -2, "R");
     lua_pushnumber(L, g); lua_setfield(L, -2, "G");
     lua_pushnumber(L, b); lua_setfield(L, -2, "B");
+}
+
+// ---------------------------------------------------------------------------
+// DrawingHandle validation helper
+// ---------------------------------------------------------------------------
+
+static DrawingHandle* check_drawing_handle(lua_State* L, int idx) {
+    auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, idx, DRAWING_OBJ_MT));
+    if (h->removed) {
+        luaL_error(L, "Drawing object has been removed");
+        return nullptr; // unreachable after luaL_error
+    }
+    return h;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +156,13 @@ bool LuaEngine::init() {
     lua_pushlightuserdata(L_, this);
     lua_setfield(L_, LUA_REGISTRYINDEX, "__oss_engine");
 
+    // Reset task scheduler state
+    next_task_id_ = 1;
+    tasks_.clear();
+    signals_.clear();
+    drawing_objects_.clear();
+    next_drawing_id_ = 1;
+
     setup_environment();
     register_custom_libs();
     register_task_lib();
@@ -143,6 +184,7 @@ void LuaEngine::shutdown() {
 void LuaEngine::shutdown_internal() {
     running_ = false;
 
+    // Clean up tasks — release all Lua refs before closing state
     for (auto& task : tasks_) {
         if (L_) {
             if (task.thread_ref != LUA_NOREF)
@@ -154,7 +196,34 @@ void LuaEngine::shutdown_internal() {
         }
     }
     tasks_.clear();
+
+    // Clean up signals — release callback refs
+    if (L_) {
+        for (auto& [name, sig] : signals_) {
+            for (auto& conn : sig.connections) {
+                if (conn.callback_ref != LUA_NOREF) {
+                    luaL_unref(L_, LUA_REGISTRYINDEX, conn.callback_ref);
+                    conn.callback_ref = LUA_NOREF;
+                }
+            }
+        }
+    }
     signals_.clear();
+
+    // Clean up drawing object store
+    {
+        std::lock_guard<std::mutex> dlock(drawing_mutex_);
+        for (auto& [id, obj] : drawing_objects_) {
+            if (obj.image_surface) {
+                cairo_surface_destroy(obj.image_surface);
+                obj.image_surface = nullptr;
+            }
+        }
+        drawing_objects_.clear();
+    }
+
+    // Also tell the overlay to drop everything
+    Overlay::instance().clear_objects();
 
     if (L_) { lua_close(L_); L_ = nullptr; }
 }
@@ -199,7 +268,8 @@ bool LuaEngine::execute_internal(const std::string& script,
         if (c1 != std::string::npos) {
             auto c2 = err.find(':', c1 + 1);
             if (c2 != std::string::npos)
-                try { error.line = std::stoi(err.substr(c1+1, c2-c1-1)); } catch (...) {}
+                try { error.line = std::stoi(err.substr(c1 + 1, c2 - c1 - 1)); }
+                catch (...) {}
         }
         if (error_cb_) error_cb_(error);
         LOG_ERROR("Lua compile error: {}", err);
@@ -213,6 +283,10 @@ bool LuaEngine::execute_internal(const std::string& script,
     int handler_index = lua_gettop(L_) - 1;
 
     status = lua_pcall(L_, 0, LUA_MULTRET, handler_index);
+
+    // Remove the handler
+    lua_remove(L_, handler_index);
+
     if (status != 0) {
         std::string err = lua_tostring(L_, -1);
         lua_settop(L_, base_top);
@@ -244,7 +318,7 @@ bool LuaEngine::execute_file(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
-// Tick / task scheduler
+// Tick / task scheduler — real coroutine-based scheduler
 // ---------------------------------------------------------------------------
 
 void LuaEngine::tick() {
@@ -257,77 +331,171 @@ void LuaEngine::tick() {
 
 void LuaEngine::process_tasks() {
     auto now = std::chrono::steady_clock::now();
-    std::vector<ScheduledTask> ready, remaining;
+
+    // Partition into cancelled, ready, and remaining
+    // First pass: clean up cancelled tasks
+    auto cancelled_end = std::stable_partition(
+        tasks_.begin(), tasks_.end(),
+        [](const ScheduledTask& t) { return !t.cancelled; });
+
+    for (auto it = cancelled_end; it != tasks_.end(); ++it) {
+        release_task_refs(*it);
+    }
+    tasks_.erase(cancelled_end, tasks_.end());
+
+    // Second pass: extract ready tasks (resume_at <= now)
+    std::vector<ScheduledTask> ready;
+    std::vector<ScheduledTask> remaining;
+    remaining.reserve(tasks_.size());
 
     for (auto& task : tasks_) {
-        if (task.cancelled) {
-            if (task.thread_ref != LUA_NOREF)
-                luaL_unref(L_, LUA_REGISTRYINDEX, task.thread_ref);
-            if (task.func_ref != LUA_NOREF)
-                luaL_unref(L_, LUA_REGISTRYINDEX, task.func_ref);
-            for (int r : task.arg_refs)
-                if (r != LUA_NOREF) luaL_unref(L_, LUA_REGISTRYINDEX, r);
-            continue;
-        }
-        if (now >= task.resume_at) ready.push_back(std::move(task));
-        else remaining.push_back(std::move(task));
+        if (now >= task.resume_at)
+            ready.push_back(std::move(task));
+        else
+            remaining.push_back(std::move(task));
     }
     tasks_ = std::move(remaining);
 
+    // Execute ready tasks
     for (auto& task : ready) {
-        lua_State* co = nullptr;
-        if (task.thread_ref != LUA_NOREF) {
-            lua_rawgeti(L_, LUA_REGISTRYINDEX, task.thread_ref);
+        execute_task(task, now);
+    }
+}
+
+void LuaEngine::release_task_refs(ScheduledTask& task) {
+    if (!L_) return;
+    if (task.thread_ref != LUA_NOREF) {
+        luaL_unref(L_, LUA_REGISTRYINDEX, task.thread_ref);
+        task.thread_ref = LUA_NOREF;
+    }
+    if (task.func_ref != LUA_NOREF) {
+        luaL_unref(L_, LUA_REGISTRYINDEX, task.func_ref);
+        task.func_ref = LUA_NOREF;
+    }
+    for (int& r : task.arg_refs) {
+        if (r != LUA_NOREF) {
+            luaL_unref(L_, LUA_REGISTRYINDEX, r);
+            r = LUA_NOREF;
+        }
+    }
+    task.arg_refs.clear();
+}
+
+void LuaEngine::execute_task(ScheduledTask& task, std::chrono::steady_clock::time_point now) {
+    if (!L_) return;
+
+    lua_State* co = nullptr;
+    bool new_thread = false;
+
+    // Resume existing coroutine or create new one from func_ref
+    if (task.thread_ref != LUA_NOREF) {
+        lua_rawgeti(L_, LUA_REGISTRYINDEX, task.thread_ref);
+        if (lua_isthread(L_, -1)) {
             co = lua_tothread(L_, -1);
-            lua_pop(L_, 1);
         }
-        if (!co && task.func_ref != LUA_NOREF) {
-            co = lua_newthread(L_);
-            task.thread_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
-            lua_rawgeti(L_, LUA_REGISTRYINDEX, task.func_ref);
-            lua_xmove(L_, co, 1);
-        }
-        if (!co) continue;
+        lua_pop(L_, 1);
+    }
 
-        int nargs = 0;
-        for (int ref : task.arg_refs) {
-            if (ref != LUA_NOREF) {
-                lua_rawgeti(L_, LUA_REGISTRYINDEX, ref);
-                lua_xmove(L_, co, 1);
-                luaL_unref(L_, LUA_REGISTRYINDEX, ref);
-                ++nargs;
-            }
-        }
-        task.arg_refs.clear();
+    if (!co && task.func_ref != LUA_NOREF) {
+        co = lua_newthread(L_);
+        int thread_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
 
-        if (task.type == ScheduledTask::Type::Delay) {
-            double elapsed = std::chrono::duration<double>(
-                now - (task.resume_at -
-                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                           std::chrono::duration<double>(task.delay_seconds)))).count();
-            lua_pushnumber(co, elapsed);
-            ++nargs;
-        }
-
-        int status = lua_resume(co, nargs);
-        if (status != 0 && status != LUA_YIELD) {
-            const char* err = lua_tostring(co, -1);
-            if (error_cb_)
-                error_cb_({err ? err : "task error", -1, "task"});
-            LOG_ERROR("[Task] {}", err ? err : "unknown error");
-        }
-
+        // Release old thread ref if any
         if (task.thread_ref != LUA_NOREF)
             luaL_unref(L_, LUA_REGISTRYINDEX, task.thread_ref);
-        if (task.func_ref != LUA_NOREF)
-            luaL_unref(L_, LUA_REGISTRYINDEX, task.func_ref);
+        task.thread_ref = thread_ref;
+
+        // Push the function onto the coroutine
+        lua_rawgeti(L_, LUA_REGISTRYINDEX, task.func_ref);
+        lua_xmove(L_, co, 1);
+        new_thread = true;
     }
+
+    if (!co) {
+        release_task_refs(task);
+        return;
+    }
+
+    // Check coroutine status — don't resume dead coroutines
+    int co_status = lua_status(co);
+    if (co_status != 0 && co_status != LUA_YIELD) {
+        release_task_refs(task);
+        return;
+    }
+
+    // Transfer argument refs to coroutine stack
+    int nargs = 0;
+    for (int& ref : task.arg_refs) {
+        if (ref != LUA_NOREF) {
+            lua_rawgeti(L_, LUA_REGISTRYINDEX, ref);
+            lua_xmove(L_, co, 1);
+            luaL_unref(L_, LUA_REGISTRYINDEX, ref);
+            ref = LUA_NOREF;
+            ++nargs;
+        }
+    }
+    task.arg_refs.clear();
+
+    // For delay tasks, push elapsed time as an additional argument
+    if (task.type == ScheduledTask::Type::Delay) {
+        auto scheduled_at = task.resume_at -
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(task.delay_seconds));
+        double elapsed = std::chrono::duration<double>(now - scheduled_at).count();
+        lua_pushnumber(co, elapsed);
+        ++nargs;
+    }
+
+    int status = lua_resume(co, nargs);
+
+    if (status == LUA_YIELD) {
+        // Coroutine yielded — check if it yielded a wait duration
+        // If the top of the coroutine stack has a number, treat it as wait seconds
+        if (lua_gettop(co) > 0 && lua_isnumber(co, -1)) {
+            double wait_seconds = lua_tonumber(co, -1);
+            lua_pop(co, 1);
+
+            // Re-schedule this task
+            ScheduledTask new_task;
+            new_task.id = next_task_id_++;
+            new_task.type = ScheduledTask::Type::Delay;
+            new_task.delay_seconds = wait_seconds;
+            new_task.resume_at = now +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(wait_seconds));
+            new_task.thread_ref = task.thread_ref;
+            task.thread_ref = LUA_NOREF; // Transfer ownership
+            new_task.func_ref = LUA_NOREF;
+            tasks_.push_back(std::move(new_task));
+        } else {
+            // Yielded without a wait time — re-schedule for next tick
+            ScheduledTask new_task;
+            new_task.id = next_task_id_++;
+            new_task.type = ScheduledTask::Type::Defer;
+            new_task.resume_at = now;
+            new_task.thread_ref = task.thread_ref;
+            task.thread_ref = LUA_NOREF;
+            new_task.func_ref = LUA_NOREF;
+            tasks_.push_back(std::move(new_task));
+        }
+    } else if (status != 0) {
+        // Error
+        const char* err = lua_tostring(co, -1);
+        if (error_cb_)
+            error_cb_({err ? err : "task error", -1, "task"});
+        LOG_ERROR("[Task] {}", err ? err : "unknown error");
+    }
+    // else status == 0: coroutine finished normally
+
+    // Release refs we still own
+    release_task_refs(task);
 }
 
 int LuaEngine::schedule_task(ScheduledTask task) {
     task.id = next_task_id_++;
+    int id = task.id;
     tasks_.push_back(std::move(task));
-    return tasks_.back().id;
+    return id;
 }
 
 void LuaEngine::cancel_task(int task_id) {
@@ -337,8 +505,73 @@ void LuaEngine::cancel_task(int task_id) {
 
 size_t LuaEngine::pending_task_count() const {
     size_t c = 0;
-    for (auto& t : tasks_) if (!t.cancelled) ++c;
+    for (const auto& t : tasks_)
+        if (!t.cancelled) ++c;
     return c;
+}
+
+// ---------------------------------------------------------------------------
+// Drawing object store — local registry with sync to Overlay
+// ---------------------------------------------------------------------------
+
+int LuaEngine::create_drawing_object(DrawingObject::Type type) {
+    std::lock_guard<std::mutex> dlock(drawing_mutex_);
+    int id = next_drawing_id_++;
+    DrawingObject obj;
+    obj.type = type;
+    obj.id = id;
+    drawing_objects_[id] = obj;
+
+    // Also register in overlay for rendering
+    Overlay::instance().create_object_with_id(id, type);
+    return id;
+}
+
+bool LuaEngine::get_drawing_object(int id, DrawingObject& out) {
+    std::lock_guard<std::mutex> dlock(drawing_mutex_);
+    auto it = drawing_objects_.find(id);
+    if (it == drawing_objects_.end()) return false;
+    out = it->second;
+    return true;
+}
+
+bool LuaEngine::update_drawing_object(int id, const std::function<void(DrawingObject&)>& fn) {
+    std::lock_guard<std::mutex> dlock(drawing_mutex_);
+    auto it = drawing_objects_.find(id);
+    if (it == drawing_objects_.end()) return false;
+    fn(it->second);
+
+    // Sync to overlay
+    DrawingObject copy = it->second;
+    Overlay::instance().update_object(id, [&copy](DrawingObject& o) { o = copy; });
+    return true;
+}
+
+bool LuaEngine::remove_drawing_object(int id) {
+    std::lock_guard<std::mutex> dlock(drawing_mutex_);
+    auto it = drawing_objects_.find(id);
+    if (it == drawing_objects_.end()) return false;
+
+    if (it->second.image_surface) {
+        cairo_surface_destroy(it->second.image_surface);
+        it->second.image_surface = nullptr;
+    }
+    drawing_objects_.erase(it);
+
+    Overlay::instance().remove_object(id);
+    return true;
+}
+
+void LuaEngine::clear_all_drawing_objects() {
+    std::lock_guard<std::mutex> dlock(drawing_mutex_);
+    for (auto& [id, obj] : drawing_objects_) {
+        if (obj.image_surface) {
+            cairo_surface_destroy(obj.image_surface);
+            obj.image_surface = nullptr;
+        }
+    }
+    drawing_objects_.clear();
+    Overlay::instance().clear_objects();
 }
 
 // ---------------------------------------------------------------------------
@@ -372,23 +605,39 @@ std::optional<std::string> LuaEngine::get_global_string(const std::string& n) {
 }
 
 // ---------------------------------------------------------------------------
-// Signals
+// Signals — proper fire with argument duplication
 // ---------------------------------------------------------------------------
 
 int LuaEngine::fire_signal(const std::string& name, int nargs) {
+    if (!L_) return 0;
     auto it = signals_.find(name);
-    if (it == signals_.end()) return 0;
+    if (it == signals_.end()) {
+        if (nargs > 0) lua_pop(L_, nargs);
+        return 0;
+    }
+
     int fired = 0;
-    for (auto& conn : it->second.connections) {
+
+    // Take a snapshot of connections to handle modifications during iteration
+    auto connections = it->second.connections;
+
+    for (auto& conn : connections) {
         if (!conn.connected || conn.callback_ref == LUA_NOREF) continue;
+
         lua_rawgeti(L_, LUA_REGISTRYINDEX, conn.callback_ref);
-        for (int i = 0; i < nargs; ++i) lua_pushvalue(L_, -(nargs + 1));
+
+        // Duplicate arguments for each callback
+        for (int i = 0; i < nargs; ++i)
+            lua_pushvalue(L_, -(nargs + 1));
+
         if (lua_pcall(L_, nargs, 0, 0) != 0) {
             LOG_ERROR("[Signal:{}] {}", name, lua_tostring(L_, -1));
             lua_pop(L_, 1);
         }
         ++fired;
     }
+
+    // Pop the original arguments
     if (nargs > 0) lua_pop(L_, nargs);
     return fired;
 }
@@ -413,9 +662,11 @@ bool LuaEngine::is_sandboxed(const std::string& full_path,
     if (ec) return false;
     auto base_canonical = std::filesystem::weakly_canonical(base_dir, ec);
     if (ec) return false;
+    std::string cs = canonical.string();
     std::string bs = base_canonical.string();
     if (!bs.empty() && bs.back() != '/') bs += '/';
-    return canonical.string().find(bs) == 0;
+    // Path must start with base or be exactly equal to base (without trailing slash)
+    return cs.find(bs) == 0 || cs == base_canonical.string();
 }
 
 // ---------------------------------------------------------------------------
@@ -577,16 +828,22 @@ void LuaEngine::sandbox() {
 }
 
 // ===========================================================================
-//  Drawing API  — all objects live in Overlay::instance()
+//  Drawing API — objects live in engine's drawing_objects_ store
+//  and are synced to Overlay for rendering
 // ===========================================================================
 
 int LuaEngine::lua_drawing_new(lua_State* L) {
     const char* ts = luaL_checkstring(L, 1);
     auto type = parse_drawing_type(ts);
-    int id = Overlay::instance().create_object(type);
+
+    auto* eng = get_engine(L);
+    if (!eng) return luaL_error(L, "engine not available");
+
+    int id = eng->create_drawing_object(type);
 
     auto* h = static_cast<DrawingHandle*>(lua_newuserdata(L, sizeof(DrawingHandle)));
     h->id = id;
+    h->removed = false;
     luaL_getmetatable(L, DRAWING_OBJ_MT);
     lua_setmetatable(L, -2);
     return 1;
@@ -596,19 +853,26 @@ int LuaEngine::lua_drawing_index(lua_State* L) {
     auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, 1, DRAWING_OBJ_MT));
     const char* key = luaL_checkstring(L, 2);
 
-    // Methods
+    // Methods available even on removed objects
     if (strcmp(key, "Remove") == 0 || strcmp(key, "Destroy") == 0) {
         lua_pushcfunction(L, lua_drawing_remove);
         return 1;
     }
 
-    // Snapshot the object under lock, then push Lua values without lock
+    if (h->removed) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    auto* eng = get_engine(L);
+    if (!eng) { lua_pushnil(L); return 1; }
+
+    // Get a copy from the drawing store
     DrawingObject copy;
-    bool found = false;
-    Overlay::instance().update_object(h->id, [&](DrawingObject& obj) {
-        copy = obj; found = true;
-    });
-    if (!found) { lua_pushnil(L); return 1; }
+    if (!eng->get_drawing_object(h->id, copy)) {
+        lua_pushnil(L);
+        return 1;
+    }
 
     if      (strcmp(key, "Visible") == 0)      lua_pushboolean(L, copy.visible);
     else if (strcmp(key, "ZIndex") == 0)       lua_pushinteger(L, copy.z_index);
@@ -655,141 +919,174 @@ int LuaEngine::lua_drawing_index(lua_State* L) {
 }
 
 int LuaEngine::lua_drawing_newindex(lua_State* L) {
-    auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, 1, DRAWING_OBJ_MT));
-    const char* key = luaL_checkstring(L, 2);
-    auto& ov = Overlay::instance();
+    auto* h = check_drawing_handle(L, 1);
+    if (!h) return 0;
 
-    // ---- Read all Lua values BEFORE taking the overlay lock ----
+    const char* key = luaL_checkstring(L, 2);
+    auto* eng = get_engine(L);
+    if (!eng) return luaL_error(L, "engine not available");
+
+    // ---- Read all Lua values BEFORE taking the lock ----
 
     if (strcmp(key, "Visible") == 0) {
         bool v = lua_toboolean(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.visible = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.visible = v; });
     }
     else if (strcmp(key, "ZIndex") == 0) {
         int v = static_cast<int>(luaL_checkinteger(L, 3));
-        ov.update_object(h->id, [v](DrawingObject& o){ o.z_index = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.z_index = v; });
     }
     else if (strcmp(key, "Transparency") == 0) {
         double v = luaL_checknumber(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.transparency = v; });
+        v = std::clamp(v, 0.0, 1.0);
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.transparency = v; });
     }
     else if (strcmp(key, "Thickness") == 0) {
         double v = luaL_checknumber(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.thickness = v; });
+        if (v < 0) v = 0;
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.thickness = v; });
     }
     else if (strcmp(key, "Filled") == 0) {
         bool v = lua_toboolean(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.filled = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.filled = v; });
     }
     else if (strcmp(key, "Radius") == 0) {
         double v = luaL_checknumber(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.radius = v; });
+        if (v < 0) v = 0;
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.radius = v; });
     }
     else if (strcmp(key, "NumSides") == 0) {
         int v = static_cast<int>(luaL_checkinteger(L, 3));
-        ov.update_object(h->id, [v](DrawingObject& o){ o.num_sides = v; });
+        if (v < 3) v = 3;
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.num_sides = v; });
     }
     else if (strcmp(key, "Center") == 0) {
         bool v = lua_toboolean(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.center = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.center = v; });
     }
     else if (strcmp(key, "Outline") == 0) {
         bool v = lua_toboolean(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.outline = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.outline = v; });
     }
     else if (strcmp(key, "Text") == 0) {
         std::string v = luaL_checkstring(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.text = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.text = v; });
     }
     else if (strcmp(key, "Size") == 0) {
         if (lua_isnumber(L, 3)) {
             double v = lua_tonumber(L, 3);
-            ov.update_object(h->id, [v](DrawingObject& o){ o.text_size = v; });
+            eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.text_size = v; });
         } else {
-            double x = 0, y = 0; read_vec2(L, 3, x, y);
-            ov.update_object(h->id, [x,y](DrawingObject& o){ o.size_x = x; o.size_y = y; });
+            double x = 0, y = 0;
+            read_vec2(L, 3, x, y);
+            eng->update_drawing_object(h->id, [x, y](DrawingObject& o){
+                o.size_x = x; o.size_y = y;
+            });
         }
     }
     else if (strcmp(key, "TextSize") == 0) {
         double v = luaL_checknumber(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.text_size = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.text_size = v; });
     }
     else if (strcmp(key, "Font") == 0) {
         int v = static_cast<int>(luaL_checkinteger(L, 3));
-        ov.update_object(h->id, [v](DrawingObject& o){ o.font = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.font = v; });
     }
     else if (strcmp(key, "Rounding") == 0) {
         double v = luaL_checknumber(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.rounding = v; });
+        if (v < 0) v = 0;
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.rounding = v; });
     }
     else if (strcmp(key, "Position") == 0) {
-        double x = 0, y = 0; read_vec2(L, 3, x, y);
-        ov.update_object(h->id, [x,y](DrawingObject& o){ o.pos_x = x; o.pos_y = y; });
+        double x = 0, y = 0;
+        read_vec2(L, 3, x, y);
+        eng->update_drawing_object(h->id, [x, y](DrawingObject& o){
+            o.pos_x = x; o.pos_y = y;
+        });
     }
     else if (strcmp(key, "From") == 0) {
-        double x = 0, y = 0; read_vec2(L, 3, x, y);
-        ov.update_object(h->id, [x,y](DrawingObject& o){ o.from_x = x; o.from_y = y; });
+        double x = 0, y = 0;
+        read_vec2(L, 3, x, y);
+        eng->update_drawing_object(h->id, [x, y](DrawingObject& o){
+            o.from_x = x; o.from_y = y;
+        });
     }
     else if (strcmp(key, "To") == 0) {
-        double x = 0, y = 0; read_vec2(L, 3, x, y);
-        ov.update_object(h->id, [x,y](DrawingObject& o){ o.to_x = x; o.to_y = y; });
+        double x = 0, y = 0;
+        read_vec2(L, 3, x, y);
+        eng->update_drawing_object(h->id, [x, y](DrawingObject& o){
+            o.to_x = x; o.to_y = y;
+        });
     }
     else if (strcmp(key, "Color") == 0) {
-        double r = 1, g = 1, b = 1; read_color(L, 3, r, g, b);
-        ov.update_object(h->id, [r,g,b](DrawingObject& o){
-            o.color_r = r; o.color_g = g; o.color_b = b; });
+        double r = 1, g = 1, b = 1;
+        read_color(L, 3, r, g, b);
+        eng->update_drawing_object(h->id, [r, g, b](DrawingObject& o){
+            o.color_r = r; o.color_g = g; o.color_b = b;
+        });
     }
     else if (strcmp(key, "OutlineColor") == 0) {
-        double r = 0, g = 0, b = 0; read_color(L, 3, r, g, b);
-        ov.update_object(h->id, [r,g,b](DrawingObject& o){
-            o.outline_r = r; o.outline_g = g; o.outline_b = b; });
+        double r = 0, g = 0, b = 0;
+        read_color(L, 3, r, g, b);
+        eng->update_drawing_object(h->id, [r, g, b](DrawingObject& o){
+            o.outline_r = r; o.outline_g = g; o.outline_b = b;
+        });
     }
     else if (strcmp(key, "PointA") == 0) {
-        double x = 0, y = 0; read_vec2(L, 3, x, y);
-        ov.update_object(h->id, [x,y](DrawingObject& o){
+        double x = 0, y = 0;
+        read_vec2(L, 3, x, y);
+        eng->update_drawing_object(h->id, [x, y](DrawingObject& o){
             if (o.type == DrawingObject::Type::Quad) { o.qa_x = x; o.qa_y = y; }
             else { o.pa_x = x; o.pa_y = y; }
         });
     }
     else if (strcmp(key, "PointB") == 0) {
-        double x = 0, y = 0; read_vec2(L, 3, x, y);
-        ov.update_object(h->id, [x,y](DrawingObject& o){
+        double x = 0, y = 0;
+        read_vec2(L, 3, x, y);
+        eng->update_drawing_object(h->id, [x, y](DrawingObject& o){
             if (o.type == DrawingObject::Type::Quad) { o.qb_x = x; o.qb_y = y; }
             else { o.pb_x = x; o.pb_y = y; }
         });
     }
     else if (strcmp(key, "PointC") == 0) {
-        double x = 0, y = 0; read_vec2(L, 3, x, y);
-        ov.update_object(h->id, [x,y](DrawingObject& o){
+        double x = 0, y = 0;
+        read_vec2(L, 3, x, y);
+        eng->update_drawing_object(h->id, [x, y](DrawingObject& o){
             if (o.type == DrawingObject::Type::Quad) { o.qc_x = x; o.qc_y = y; }
             else { o.pc_x = x; o.pc_y = y; }
         });
     }
     else if (strcmp(key, "PointD") == 0) {
-        double x = 0, y = 0; read_vec2(L, 3, x, y);
-        ov.update_object(h->id, [x,y](DrawingObject& o){ o.qd_x = x; o.qd_y = y; });
+        double x = 0, y = 0;
+        read_vec2(L, 3, x, y);
+        eng->update_drawing_object(h->id, [x, y](DrawingObject& o){
+            o.qd_x = x; o.qd_y = y;
+        });
     }
     else if (strcmp(key, "SizeXY") == 0) {
-        double x = 0, y = 0; read_vec2(L, 3, x, y);
-        ov.update_object(h->id, [x,y](DrawingObject& o){ o.size_x = x; o.size_y = y; });
+        double x = 0, y = 0;
+        read_vec2(L, 3, x, y);
+        eng->update_drawing_object(h->id, [x, y](DrawingObject& o){
+            o.size_x = x; o.size_y = y;
+        });
     }
     else if (strcmp(key, "ImageWidth") == 0) {
         double v = luaL_checknumber(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.image_w = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.image_w = v; });
     }
     else if (strcmp(key, "ImageHeight") == 0) {
         double v = luaL_checknumber(L, 3);
-        ov.update_object(h->id, [v](DrawingObject& o){ o.image_h = v; });
+        eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.image_h = v; });
     }
     else if (strcmp(key, "Data") == 0 || strcmp(key, "ImagePath") == 0) {
         std::string path = luaL_checkstring(L, 3);
-        // Load image outside the overlay lock
+        // Load image outside the lock
         cairo_surface_t* surface = cairo_image_surface_create_from_png(path.c_str());
-        if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        if (surface && cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
             cairo_surface_destroy(surface);
             surface = nullptr;
         }
-        ov.update_object(h->id, [&path, surface](DrawingObject& o){
+        eng->update_drawing_object(h->id, [&path, surface](DrawingObject& o){
             if (o.image_surface) cairo_surface_destroy(o.image_surface);
             o.image_path = path;
             o.image_surface = surface;
@@ -801,27 +1098,40 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
 
 int LuaEngine::lua_drawing_remove(lua_State* L) {
     auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, 1, DRAWING_OBJ_MT));
-    if (h->id >= 0) {
-        Overlay::instance().remove_object(h->id);
+    if (!h->removed && h->id >= 0) {
+        auto* eng = get_engine(L);
+        if (eng) eng->remove_drawing_object(h->id);
+        h->removed = true;
         h->id = -1;
     }
     return 0;
 }
 
-int LuaEngine::lua_drawing_gc(lua_State*) {
-    // No-op: prevents deadlock if GC fires while overlay lock is held.
-    // Users must call :Remove() explicitly.
+int LuaEngine::lua_drawing_gc(lua_State* L) {
+    // Auto-cleanup on garbage collection — safe because we use the engine's
+    // drawing store which has its own lock separate from overlay
+    auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, 1, DRAWING_OBJ_MT));
+    if (!h->removed && h->id >= 0) {
+        auto* eng = get_engine(L);
+        if (eng) eng->remove_drawing_object(h->id);
+        h->removed = true;
+        h->id = -1;
+    }
     return 0;
 }
 
 int LuaEngine::lua_drawing_tostring(lua_State* L) {
     auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, 1, DRAWING_OBJ_MT));
-    lua_pushfstring(L, "Drawing(%d)", h->id);
+    if (h->removed)
+        lua_pushstring(L, "Drawing(removed)");
+    else
+        lua_pushfstring(L, "Drawing(%d)", h->id);
     return 1;
 }
 
-int LuaEngine::lua_drawing_clear(lua_State*) {
-    Overlay::instance().clear_objects();
+int LuaEngine::lua_drawing_clear(lua_State* L) {
+    auto* eng = get_engine(L);
+    if (eng) eng->clear_all_drawing_objects();
     return 0;
 }
 
@@ -839,7 +1149,7 @@ int LuaEngine::lua_drawing_get_screen_size(lua_State* L) {
 }
 
 // ===========================================================================
-//  Task library
+//  Task library — real coroutine-based scheduler
 // ===========================================================================
 
 int LuaEngine::lua_task_spawn(lua_State* L) {
@@ -847,19 +1157,61 @@ int LuaEngine::lua_task_spawn(lua_State* L) {
     auto* eng = get_engine(L);
     if (!eng) return luaL_error(L, "engine not available");
 
-    lua_State* co = lua_newthread(L);
+    // Create coroutine on main thread to keep it rooted
+    lua_State* co = lua_newthread(eng->L_);
+    int thread_ref = luaL_ref(eng->L_, LUA_REGISTRYINDEX);
+
+    // Push function and args onto coroutine
     lua_pushvalue(L, 1);
     lua_xmove(L, co, 1);
-    int nargs = lua_gettop(L) - 2;
+    int nargs = lua_gettop(L) - 1;
     for (int i = 0; i < nargs; ++i) {
         lua_pushvalue(L, i + 2);
         lua_xmove(L, co, 1);
     }
+
     int status = lua_resume(co, nargs);
-    if (status != 0 && status != LUA_YIELD) {
+
+    if (status == LUA_YIELD) {
+        // Coroutine yielded — check for wait time
+        if (lua_gettop(co) > 0 && lua_isnumber(co, -1)) {
+            double wait_seconds = lua_tonumber(co, -1);
+            lua_pop(co, 1);
+
+            ScheduledTask task;
+            task.type = ScheduledTask::Type::Delay;
+            task.delay_seconds = wait_seconds;
+            task.resume_at = std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(wait_seconds));
+            task.thread_ref = thread_ref;
+            task.func_ref = LUA_NOREF;
+            eng->schedule_task(std::move(task));
+        } else {
+            // Schedule for next tick
+            ScheduledTask task;
+            task.type = ScheduledTask::Type::Defer;
+            task.resume_at = std::chrono::steady_clock::now();
+            task.thread_ref = thread_ref;
+            task.func_ref = LUA_NOREF;
+            eng->schedule_task(std::move(task));
+        }
+    } else if (status != 0) {
         const char* err = lua_tostring(co, -1);
         if (eng->error_cb_)
             eng->error_cb_({err ? err : "task.spawn error", -1, "task.spawn"});
+        LOG_ERROR("[task.spawn] {}", err ? err : "unknown error");
+        luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
+    } else {
+        // Coroutine finished immediately
+        luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
+    }
+
+    // Push the thread as return value
+    lua_rawgeti(L, LUA_REGISTRYINDEX, thread_ref);
+    if (!lua_isthread(L, -1)) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
     }
     return 1;
 }
@@ -870,19 +1222,24 @@ int LuaEngine::lua_task_delay(lua_State* L) {
     auto* eng = get_engine(L);
     if (!eng) return luaL_error(L, "engine not available");
 
+    if (seconds < 0) seconds = 0;
+
     ScheduledTask task;
     task.type = ScheduledTask::Type::Delay;
     task.delay_seconds = seconds;
     task.resume_at = std::chrono::steady_clock::now() +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(seconds));
+
     lua_pushvalue(L, 2);
     task.func_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
     int nargs = lua_gettop(L) - 2;
     for (int i = 0; i < nargs; ++i) {
         lua_pushvalue(L, i + 3);
         task.arg_refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX));
     }
+
     int id = eng->schedule_task(std::move(task));
     lua_pushinteger(L, id);
     return 1;
@@ -896,13 +1253,16 @@ int LuaEngine::lua_task_defer(lua_State* L) {
     ScheduledTask task;
     task.type = ScheduledTask::Type::Defer;
     task.resume_at = std::chrono::steady_clock::now();
+
     lua_pushvalue(L, 1);
     task.func_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
     int nargs = lua_gettop(L) - 1;
     for (int i = 0; i < nargs; ++i) {
         lua_pushvalue(L, i + 2);
         task.arg_refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX));
     }
+
     int id = eng->schedule_task(std::move(task));
     lua_pushinteger(L, id);
     return 1;
@@ -910,10 +1270,23 @@ int LuaEngine::lua_task_defer(lua_State* L) {
 
 int LuaEngine::lua_task_wait(lua_State* L) {
     double s = luaL_optnumber(L, 1, 0.03);
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<int>(s * 1000)));
+    if (s < 0) s = 0;
+
+    // If called from a coroutine, yield with the wait time so the scheduler
+    // can properly reschedule. If called from the main thread, fallback to sleep.
+    if (lua_pushthread(L)) {
+        // Main thread — can't yield, use sleep
+        lua_pop(L, 1);
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(static_cast<int>(s * 1000)));
+        lua_pushnumber(L, s);
+        return 1;
+    }
+    lua_pop(L, 1);
+
+    // Coroutine — yield with wait duration
     lua_pushnumber(L, s);
-    return 1;
+    return lua_yield(L, 1);
 }
 
 int LuaEngine::lua_task_cancel(lua_State* L) {
@@ -927,10 +1300,26 @@ int LuaEngine::lua_task_desynchronize(lua_State*) { return 0; }
 int LuaEngine::lua_task_synchronize(lua_State*)   { return 0; }
 
 // ===========================================================================
-//  Signal library
+//  Signal library — with proper connection lifecycle management
 // ===========================================================================
 
-struct SignalUserdata { char name[128]; };
+struct SignalUserdata {
+    char name[128];
+    bool destroyed;
+};
+
+static SignalUserdata* check_signal_ud(lua_State* L, int idx) {
+    auto* ud = static_cast<SignalUserdata*>(luaL_checkudata(L, idx, "SignalObject"));
+    if (ud->destroyed)
+        luaL_error(L, "Signal has been destroyed");
+    return ud;
+}
+
+struct ConnUD {
+    char sig_name[128];
+    int conn_id;
+    bool disconnected;
+};
 
 int LuaEngine::lua_signal_new(lua_State* L) {
     const char* name = luaL_optstring(L, 1, "");
@@ -938,103 +1327,158 @@ int LuaEngine::lua_signal_new(lua_State* L) {
     if (!eng) return luaL_error(L, "engine not available");
 
     std::string sig_name = name;
-    if (sig_name.empty())
-        sig_name = "signal_" + std::to_string(reinterpret_cast<uintptr_t>(L))
-                   + "_" + std::to_string(lua_gc(L, LUA_GCCOUNT, 0));
+    if (sig_name.empty()) {
+        sig_name = "signal_" + std::to_string(eng->next_signal_id_++);
+    }
     eng->get_or_create_signal(sig_name);
 
-    auto* ud = static_cast<SignalUserdata*>(lua_newuserdata(L, sizeof(SignalUserdata)));
+    auto* ud = static_cast<SignalUserdata*>(
+        lua_newuserdata(L, sizeof(SignalUserdata)));
     memset(ud->name, 0, sizeof(ud->name));
     strncpy(ud->name, sig_name.c_str(), sizeof(ud->name) - 1);
+    ud->destroyed = false;
     luaL_getmetatable(L, "SignalObject");
     lua_setmetatable(L, -2);
     return 1;
 }
 
 int LuaEngine::lua_signal_connect(lua_State* L) {
-    auto* ud = static_cast<SignalUserdata*>(luaL_checkudata(L, 1, "SignalObject"));
+    auto* ud = check_signal_ud(L, 1);
+    if (!ud) return 0;
     luaL_checktype(L, 2, LUA_TFUNCTION);
+
     auto* eng = get_engine(L);
     if (!eng) return luaL_error(L, "engine not available");
+
     Signal* sig = eng->get_signal(ud->name);
-    if (!sig) return luaL_error(L, "Signal destroyed");
+    if (!sig) return luaL_error(L, "Signal '%s' not found", ud->name);
 
     lua_pushvalue(L, 2);
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
     Signal::Connection conn;
     conn.callback_ref = ref;
     conn.id = sig->next_id++;
     conn.connected = true;
     sig->connections.push_back(conn);
 
-    struct ConnUD { char sig_name[128]; int conn_id; };
     auto* cud = static_cast<ConnUD*>(lua_newuserdata(L, sizeof(ConnUD)));
-        memset(cud->sig_name, 0, sizeof(cud->sig_name));
-    snprintf(cud->sig_name, sizeof(cud->sig_name), "%s", ud->name);
-    cud->sig_name[sizeof(cud->sig_name) - 1] = '\0';
+    memset(cud->sig_name, 0, sizeof(cud->sig_name));
+    strncpy(cud->sig_name, ud->name, sizeof(cud->sig_name) - 1);
     cud->conn_id = conn.id;
+    cud->disconnected = false;
     luaL_getmetatable(L, "SignalConnection");
     lua_setmetatable(L, -2);
     return 1;
 }
 
 int LuaEngine::lua_signal_fire(lua_State* L) {
-    auto* ud = static_cast<SignalUserdata*>(luaL_checkudata(L, 1, "SignalObject"));
+    auto* ud = check_signal_ud(L, 1);
+    if (!ud) return 0;
+
     int nargs = lua_gettop(L) - 1;
     auto* eng = get_engine(L);
     if (!eng) return 0;
+
     Signal* sig = eng->get_signal(ud->name);
     if (!sig) return 0;
 
-    for (auto& conn : sig->connections) {
+    // Snapshot connections to handle modifications during iteration
+    auto connections_copy = sig->connections;
+
+    for (auto& conn : connections_copy) {
         if (!conn.connected || conn.callback_ref == LUA_NOREF) continue;
+
         lua_rawgeti(L, LUA_REGISTRYINDEX, conn.callback_ref);
-        for (int i = 0; i < nargs; ++i) lua_pushvalue(L, i + 2);
+        for (int i = 0; i < nargs; ++i)
+            lua_pushvalue(L, i + 2);
+
         if (lua_pcall(L, nargs, 0, 0) != 0) {
             LOG_ERROR("[Signal:{}] {}", ud->name, lua_tostring(L, -1));
             lua_pop(L, 1);
         }
     }
+
+    // Also resume any coroutines waiting on this signal
+    // (future enhancement: implement Wait queue)
+
     return 0;
 }
 
-int LuaEngine::lua_signal_wait(lua_State* L) { return lua_yield(L, 0); }
+int LuaEngine::lua_signal_wait(lua_State* L) {
+    // Yield the current coroutine — the signal fire should resume it
+    // For now, simple yield
+    return lua_yield(L, 0);
+}
 
 int LuaEngine::lua_signal_disconnect(lua_State* L) {
-    struct ConnUD { char sig_name[128]; int conn_id; };
     auto* cud = static_cast<ConnUD*>(luaL_checkudata(L, 1, "SignalConnection"));
+    if (cud->disconnected) return 0;
+
     auto* eng = get_engine(L);
     if (!eng) return 0;
+
     Signal* sig = eng->get_signal(cud->sig_name);
     if (!sig) return 0;
-    for (auto& c : sig->connections) {
-        if (c.id == cud->conn_id) {
-            c.connected = false;
-            if (c.callback_ref != LUA_NOREF) {
-                luaL_unref(L, LUA_REGISTRYINDEX, c.callback_ref);
-                c.callback_ref = LUA_NOREF;
+
+    for (auto it = sig->connections.begin(); it != sig->connections.end(); ++it) {
+        if (it->id == cud->conn_id) {
+            it->connected = false;
+            if (it->callback_ref != LUA_NOREF) {
+                luaL_unref(L, LUA_REGISTRYINDEX, it->callback_ref);
+                it->callback_ref = LUA_NOREF;
             }
+            // Remove from the vector entirely to prevent buildup
+            sig->connections.erase(it);
             break;
         }
     }
+    cud->disconnected = true;
     return 0;
 }
 
 int LuaEngine::lua_signal_destroy(lua_State* L) {
     auto* ud = static_cast<SignalUserdata*>(luaL_checkudata(L, 1, "SignalObject"));
+    if (ud->destroyed) return 0;
+
     auto* eng = get_engine(L);
     if (!eng) return 0;
+
     Signal* sig = eng->get_signal(ud->name);
     if (sig) {
-        for (auto& c : sig->connections)
-            if (c.callback_ref != LUA_NOREF)
+        for (auto& c : sig->connections) {
+            if (c.callback_ref != LUA_NOREF) {
                 luaL_unref(L, LUA_REGISTRYINDEX, c.callback_ref);
+                c.callback_ref = LUA_NOREF;
+            }
+        }
         eng->signals_.erase(ud->name);
     }
+    ud->destroyed = true;
     return 0;
 }
 
-int LuaEngine::lua_signal_gc(lua_State*) { return 0; }
+int LuaEngine::lua_signal_gc(lua_State* L) {
+    // Auto-destroy signal on GC if not already destroyed
+    auto* ud = static_cast<SignalUserdata*>(luaL_checkudata(L, 1, "SignalObject"));
+    if (!ud->destroyed) {
+        auto* eng = get_engine(L);
+        if (eng) {
+            Signal* sig = eng->get_signal(ud->name);
+            if (sig) {
+                for (auto& c : sig->connections) {
+                    if (c.callback_ref != LUA_NOREF) {
+                        luaL_unref(L, LUA_REGISTRYINDEX, c.callback_ref);
+                        c.callback_ref = LUA_NOREF;
+                    }
+                }
+                eng->signals_.erase(ud->name);
+            }
+            ud->destroyed = true;
+        }
+    }
+    return 0;
+}
 
 // ===========================================================================
 //  Core Lua globals
@@ -1051,7 +1495,8 @@ int LuaEngine::lua_print(lua_State* L) {
         else if (lua_isnumber(L, i))  output += std::to_string(lua_tonumber(L, i));
         else {
             char buf[64];
-            snprintf(buf, sizeof(buf), "%s: %p", luaL_typename(L, i), lua_topointer(L, i));
+            snprintf(buf, sizeof(buf), "%s: %p",
+                     luaL_typename(L, i), lua_topointer(L, i));
             output += buf;
         }
     }
@@ -1084,15 +1529,20 @@ int LuaEngine::lua_http_get(lua_State* L) {
     const char* url = luaL_checkstring(L, 1);
     auto resp = Http::instance().get(url);
     lua_newtable(L);
-    lua_pushstring(L, resp.body.c_str());    lua_setfield(L, -2, "Body");
-    lua_pushinteger(L, static_cast<lua_Integer>(resp.status_code));    lua_setfield(L, -2, "StatusCode");
-    lua_pushboolean(L, resp.success());      lua_setfield(L, -2, "Success");
+    lua_pushstring(L, resp.body.c_str());
+    lua_setfield(L, -2, "Body");
+    lua_pushinteger(L, static_cast<lua_Integer>(resp.status_code));
+    lua_setfield(L, -2, "StatusCode");
+    lua_pushboolean(L, resp.success());
+    lua_setfield(L, -2, "Success");
     if (!resp.error.empty()) {
-        lua_pushstring(L, resp.error.c_str()); lua_setfield(L, -2, "Error");
+        lua_pushstring(L, resp.error.c_str());
+        lua_setfield(L, -2, "Error");
     }
     lua_newtable(L);
     for (const auto& [k, v] : resp.headers) {
-        lua_pushstring(L, v.c_str()); lua_setfield(L, -2, k.c_str());
+        lua_pushstring(L, v.c_str());
+        lua_setfield(L, -2, k.c_str());
     }
     lua_setfield(L, -2, "Headers");
     return 1;
@@ -1112,41 +1562,99 @@ int LuaEngine::lua_http_post(lua_State* L) {
     }
     auto resp = Http::instance().post(url, body, headers);
     lua_newtable(L);
-    lua_pushstring(L, resp.body.c_str()); lua_setfield(L, -2, "Body");
-    lua_pushinteger(L, static_cast<lua_Integer>(resp.status_code)); lua_setfield(L, -2, "StatusCode");
-    lua_pushboolean(L, resp.success());   lua_setfield(L, -2, "Success");
+    lua_pushstring(L, resp.body.c_str());
+    lua_setfield(L, -2, "Body");
+    lua_pushinteger(L, static_cast<lua_Integer>(resp.status_code));
+    lua_setfield(L, -2, "StatusCode");
+    lua_pushboolean(L, resp.success());
+    lua_setfield(L, -2, "Success");
+    if (!resp.error.empty()) {
+        lua_pushstring(L, resp.error.c_str());
+        lua_setfield(L, -2, "Error");
+    }
     return 1;
 }
 
 // ===========================================================================
-//  wait / spawn
+//  wait / spawn (global versions)
 // ===========================================================================
 
 int LuaEngine::lua_wait(lua_State* L) {
     double s = luaL_optnumber(L, 1, 0.03);
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<int>(s * 1000)));
+    if (s < 0) s = 0;
+
+    // Check if we're in a coroutine
+    if (lua_pushthread(L)) {
+        // Main thread — can't yield
+        lua_pop(L, 1);
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(static_cast<int>(s * 1000)));
+        lua_pushnumber(L, s);
+        lua_pushnumber(L, s);
+        return 2;
+    }
+    lua_pop(L, 1);
+
+    // Coroutine — yield with wait time
     lua_pushnumber(L, s);
-    lua_pushnumber(L, s);
-    return 2;
+    return lua_yield(L, 1);
 }
 
 int LuaEngine::lua_spawn(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
-    lua_State* co = lua_newthread(L);
+    auto* eng = get_engine(L);
+    if (!eng) return luaL_error(L, "engine not available");
+
+    lua_State* co = lua_newthread(eng->L_);
+    int thread_ref = luaL_ref(eng->L_, LUA_REGISTRYINDEX);
+
     lua_pushvalue(L, 1);
     lua_xmove(L, co, 1);
-    int nargs = lua_gettop(L) - 2;
+    int nargs = lua_gettop(L) - 1;
     for (int i = 0; i < nargs; ++i) {
         lua_pushvalue(L, i + 2);
         lua_xmove(L, co, 1);
     }
+
     int status = lua_resume(co, nargs);
-    if (status != 0 && status != LUA_YIELD) {
+
+    if (status == LUA_YIELD) {
+        // Schedule for re-execution
+        if (lua_gettop(co) > 0 && lua_isnumber(co, -1)) {
+            double wait_seconds = lua_tonumber(co, -1);
+            lua_pop(co, 1);
+            ScheduledTask task;
+            task.type = ScheduledTask::Type::Delay;
+            task.delay_seconds = wait_seconds;
+            task.resume_at = std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(wait_seconds));
+            task.thread_ref = thread_ref;
+            task.func_ref = LUA_NOREF;
+            eng->schedule_task(std::move(task));
+        } else {
+            ScheduledTask task;
+            task.type = ScheduledTask::Type::Defer;
+            task.resume_at = std::chrono::steady_clock::now();
+            task.thread_ref = thread_ref;
+            task.func_ref = LUA_NOREF;
+            eng->schedule_task(std::move(task));
+        }
+    } else if (status != 0) {
         const char* err = lua_tostring(co, -1);
-        auto* eng = get_engine(L);
-        if (eng && eng->error_cb_)
+        if (eng->error_cb_)
             eng->error_cb_({err ? err : "spawn error", -1, "spawn"});
+        LOG_ERROR("[spawn] {}", err ? err : "unknown error");
+        luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
+    } else {
+        luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
+    }
+
+    // Return the thread
+    lua_rawgeti(L, LUA_REGISTRYINDEX, thread_ref);
+    if (!lua_isthread(L, -1)) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
     }
     return 1;
 }
@@ -1165,13 +1673,14 @@ int LuaEngine::lua_readfile(lua_State* L) {
     if (!f.is_open()) return luaL_error(L, "Cannot open file: %s", path);
     std::string content((std::istreambuf_iterator<char>(f)),
                          std::istreambuf_iterator<char>());
-    lua_pushstring(L, content.c_str());
+    lua_pushlstring(L, content.c_str(), content.size());
     return 1;
 }
 
 int LuaEngine::lua_writefile(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
-    const char* content = luaL_checkstring(L, 2);
+    size_t content_len;
+    const char* content = luaL_checklstring(L, 2, &content_len);
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full = base + path;
     if (!is_sandboxed(full, base))
@@ -1179,22 +1688,23 @@ int LuaEngine::lua_writefile(lua_State* L) {
     std::error_code ec;
     std::filesystem::create_directories(
         std::filesystem::path(full).parent_path(), ec);
-    std::ofstream f(full);
+    std::ofstream f(full, std::ios::binary);
     if (!f.is_open()) return luaL_error(L, "Cannot write file: %s", path);
-    f << content;
+    f.write(content, static_cast<std::streamsize>(content_len));
     return 0;
 }
 
 int LuaEngine::lua_appendfile(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
-    const char* content = luaL_checkstring(L, 2);
+    size_t content_len;
+    const char* content = luaL_checklstring(L, 2, &content_len);
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full = base + path;
     if (!is_sandboxed(full, base))
         return luaL_error(L, "Access denied: path traversal detected");
-    std::ofstream f(full, std::ios::app);
+    std::ofstream f(full, std::ios::app | std::ios::binary);
     if (!f.is_open()) return luaL_error(L, "Cannot append to file: %s", path);
-    f << content;
+    f.write(content, static_cast<std::streamsize>(content_len));
     return 0;
 }
 
@@ -1203,7 +1713,9 @@ int LuaEngine::lua_isfile(lua_State* L) {
     std::string base = Config::instance().home_dir() + "/workspace/";
     std::string full = base + path;
     if (!is_sandboxed(full, base)) { lua_pushboolean(L, false); return 1; }
-    lua_pushboolean(L, std::filesystem::exists(full));
+    std::error_code ec;
+    lua_pushboolean(L, std::filesystem::exists(full, ec) &&
+                       std::filesystem::is_regular_file(full, ec));
     return 1;
 }
 
@@ -1214,7 +1726,9 @@ int LuaEngine::lua_listfiles(lua_State* L) {
     lua_newtable(L);
     if (!is_sandboxed(full, base)) return 1;
     int idx = 1;
-    if (std::filesystem::exists(full) && std::filesystem::is_directory(full)) {
+    std::error_code ec;
+    if (std::filesystem::exists(full, ec) &&
+        std::filesystem::is_directory(full, ec)) {
         try {
             for (const auto& e : std::filesystem::directory_iterator(full)) {
                 lua_pushstring(L, e.path().filename().string().c_str());
@@ -1258,7 +1772,8 @@ int LuaEngine::lua_getclipboard(lua_State* L) {
                        "xsel --clipboard --output 2>/dev/null || "
                        "wl-paste 2>/dev/null", "r");
     if (pipe) {
-        while (fgets(buf.data(), buf.size(), pipe)) result += buf.data();
+        while (fgets(buf.data(), static_cast<int>(buf.size()), pipe))
+            result += buf.data();
         pclose(pipe);
     }
     lua_pushstring(L, result.c_str());
@@ -1324,42 +1839,70 @@ int LuaEngine::lua_base64_encode(lua_State* L) {
 }
 
 int LuaEngine::lua_base64_decode(lua_State* L) {
-    const char* encoded = luaL_checkstring(L, 1);
+    size_t encoded_len;
+    const char* encoded = luaL_checklstring(L, 1, &encoded_len);
 
     static const auto table = []() {
         std::array<unsigned char, 256> t{};
-        t.fill(0);
+        t.fill(0xFF); // Use 0xFF as invalid marker
         const char* chars =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         for (size_t i = 0; i < 64; ++i)
-            t[static_cast<unsigned char>(chars[i])] = static_cast<unsigned char>(i);
+            t[static_cast<unsigned char>(chars[i])] =
+                static_cast<unsigned char>(i);
+        t[static_cast<unsigned char>('=')] = 0; // Padding
         return t;
     }();
 
-    std::string input(encoded), output;
+    std::string output;
+    output.reserve(encoded_len * 3 / 4);
+
     size_t i = 0;
-    while (i < input.size()) {
-        uint32_t n = 0; int pad = 0;
-        for (int j = 0; j < 4 && i < input.size(); j++, i++) {
-            if (input[i] == '=') { pad++; n <<= 6; }
-            else { n = (n << 6) | table[static_cast<unsigned char>(input[i])]; }
+    while (i < encoded_len) {
+        // Skip whitespace
+        while (i < encoded_len &&
+               (encoded[i] == '\n' || encoded[i] == '\r' ||
+                encoded[i] == ' '  || encoded[i] == '\t'))
+            ++i;
+        if (i >= encoded_len) break;
+
+        uint32_t n = 0;
+        int pad = 0;
+        int chars_read = 0;
+
+        for (int j = 0; j < 4 && i < encoded_len; ++j) {
+            unsigned char c = static_cast<unsigned char>(encoded[i]);
+            if (c == '=') {
+                ++pad;
+                n <<= 6;
+            } else if (table[c] != 0xFF) {
+                n = (n << 6) | table[c];
+            } else {
+                // Skip invalid characters
+                --j;
+                ++i;
+                continue;
+            }
+            ++i;
+            ++chars_read;
         }
+
+        if (chars_read < 2) break;
+
         output += static_cast<char>((n >> 16) & 0xFF);
         if (pad < 2) output += static_cast<char>((n >> 8) & 0xFF);
         if (pad < 1) output += static_cast<char>(n & 0xFF);
     }
+
     lua_pushlstring(L, output.c_str(), output.size());
     return 1;
 }
 
 int LuaEngine::lua_sha256(lua_State* L) {
-    const char* input = luaL_checkstring(L, 1);
-    lua_pushstring(L, Crypto::sha256(input).c_str());
+    size_t len;
+    const char* input = luaL_checklstring(L, 1, &len);
+    lua_pushstring(L, Crypto::sha256(std::string(input, len)).c_str());
     return 1;
 }
 
 } // namespace oss
-
-
-
-
