@@ -51,7 +51,8 @@ jobs:
           set -e
           mkdir -p package/oss-executor
 
-          cp oss-executor/build/OSSExecutor package/oss-executor/
+          # ── FIX 1: lowercase binary name ──
+          cp oss-executor/build/oss-executor package/oss-executor/
           cp -r oss-executor/scripts  package/oss-executor/ 2>/dev/null || true
           cp -r oss-executor/themes   package/oss-executor/ 2>/dev/null || true
           cp -r oss-executor/resources package/oss-executor/ 2>/dev/null || true
@@ -59,7 +60,8 @@ jobs:
           cp oss-executor/run.sh      package/oss-executor/ 2>/dev/null || true
           cp README.md               package/oss-executor/ 2>/dev/null || true
 
-          chmod +x package/oss-executor/OSSExecutor
+          # ── FIX 2: chmod the correct name ──
+          chmod +x package/oss-executor/oss-executor
           [ -f package/oss-executor/run.sh ] && chmod +x package/oss-executor/run.sh
 
           cat > package/oss-executor/install.sh << 'INSTALL_EOF'
@@ -71,7 +73,8 @@ jobs:
           cp -r themes/* ~/.oss-executor/themes/ 2>/dev/null || true
           cp -r resources ~/.oss-executor/ 2>/dev/null || true
           cp config.json ~/.oss-executor/ 2>/dev/null || true
-          sudo cp OSSExecutor /usr/local/bin/oss-executor
+          # ── FIX 3: install the lowercase binary ──
+          sudo cp oss-executor /usr/local/bin/oss-executor
           echo "Installed! Run with: oss-executor"
           INSTALL_EOF
           chmod +x package/oss-executor/install.sh
@@ -183,7 +186,8 @@ jobs:
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/oss-executor
 
-          cp oss-executor/build/OSSExecutor AppDir/usr/bin/
+          # ── FIX 4: lowercase binary name ──
+          cp oss-executor/build/oss-executor AppDir/usr/bin/
           cp -r oss-executor/scripts oss-executor/themes \
                 oss-executor/resources oss-executor/config.json \
                 AppDir/usr/share/oss-executor/ 2>/dev/null || true
@@ -193,7 +197,8 @@ jobs:
           Type=Application
           Name=OSS Executor
           Comment=Open Source Lua Script Executor
-          Exec=OSSExecutor
+          # ── FIX 5: Exec line matches binary ──
+          Exec=oss-executor
           Icon=oss-executor
           Categories=Development;
           Terminal=false
@@ -213,7 +218,8 @@ jobs:
           fi
           export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
           export OSS_HOME="${HOME}/.oss-executor"
-          exec "${HERE}/usr/bin/OSSExecutor" "$@"
+          # ── FIX 6: exec the lowercase binary ──
+          exec "${HERE}/usr/bin/oss-executor" "$@"
           APPRUN_EOF
           chmod +x AppDir/AppRun
 
