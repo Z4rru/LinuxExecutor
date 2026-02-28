@@ -1,5 +1,5 @@
 #include "script_manager.hpp"
-#include "core/lua_engine.hpp"   // real engine — resolved via -I<src>
+#include "core/lua_engine.hpp"
 #include "utils/logger.hpp"
 
 #include <algorithm>
@@ -7,13 +7,9 @@
 
 namespace oss {
 
-// ─────────────────────────────────────────────
-// Path safety: reject anything that escapes dir_
-// ─────────────────────────────────────────────
 std::filesystem::path ScriptManager::safe_script_path(const std::string& name) const {
     if (name.empty() || dir_.empty()) return {};
 
-    // Block directory traversal and absolute paths
     if (name.find("..") != std::string::npos ||
         name.front() == '/'                  ||
         name.front() == '\\')
@@ -24,11 +20,9 @@ std::filesystem::path ScriptManager::safe_script_path(const std::string& name) c
 
     auto candidate = std::filesystem::path(dir_) / name;
 
-    // Canonical parent must still be our dir_ (belt-and-suspenders)
     auto canonical_dir = std::filesystem::weakly_canonical(dir_);
     auto canonical_file = std::filesystem::weakly_canonical(candidate);
 
-    // Verify the resolved file sits inside the scripts directory
     auto [dir_end, _] = std::mismatch(
         canonical_dir.begin(), canonical_dir.end(),
         canonical_file.begin(), canonical_file.end()
@@ -42,7 +36,6 @@ std::filesystem::path ScriptManager::safe_script_path(const std::string& name) c
     return candidate;
 }
 
-// ─────────────────────────────────────────────
 void ScriptManager::set_directory(const std::string& dir) {
     if (dir.empty()) return;
     std::lock_guard lock(mtx_);
@@ -59,9 +52,6 @@ std::string ScriptManager::scripts_directory() const {
     return dir_;
 }
 
-// ─────────────────────────────────────────────
-// List
-// ─────────────────────────────────────────────
 std::vector<SavedScript> ScriptManager::list_scripts() const {
     std::vector<SavedScript> scripts;
 
@@ -85,7 +75,6 @@ std::vector<SavedScript> ScriptManager::list_scripts() const {
             script.path = entry.path().string();
             script.size = entry.file_size();
 
-            // Thread-safe time conversion
             auto ftime = entry.last_write_time();
             auto sctp  = std::chrono::time_point_cast<
                              std::chrono::system_clock::duration>(
@@ -116,9 +105,6 @@ std::vector<SavedScript> ScriptManager::list_scripts() const {
     return scripts;
 }
 
-// ─────────────────────────────────────────────
-// Save
-// ─────────────────────────────────────────────
 bool ScriptManager::save_script(const std::string& name,
                                 const std::string& content)
 {
@@ -134,7 +120,6 @@ bool ScriptManager::save_script(const std::string& name,
     auto path = safe_script_path(name);
     if (path.empty()) return false;
 
-    // Append .lua only when the *filename* has no extension
     if (!path.has_extension()) {
         path.replace_extension(".lua");
     }
@@ -155,9 +140,6 @@ bool ScriptManager::save_script(const std::string& name,
     return true;
 }
 
-// ─────────────────────────────────────────────
-// Load
-// ─────────────────────────────────────────────
 std::string ScriptManager::load_script(const std::string& name) const {
     auto path = safe_script_path(name);
     if (path.empty()) return "";
@@ -172,9 +154,6 @@ std::string ScriptManager::load_script(const std::string& name) const {
                        std::istreambuf_iterator<char>());
 }
 
-// ─────────────────────────────────────────────
-// Delete
-// ─────────────────────────────────────────────
 bool ScriptManager::delete_script(const std::string& name) {
     auto path = safe_script_path(name);
     if (path.empty()) return false;
@@ -189,9 +168,6 @@ bool ScriptManager::delete_script(const std::string& name) {
     }
 }
 
-// ─────────────────────────────────────────────
-// Rename
-// ─────────────────────────────────────────────
 bool ScriptManager::rename_script(const std::string& old_name,
                                   const std::string& new_name)
 {
@@ -210,9 +186,6 @@ bool ScriptManager::rename_script(const std::string& old_name,
     }
 }
 
-// ═════════════════════════════════════════════
-// Real LuaEngine execution — no mocks
-// ═════════════════════════════════════════════
 bool ScriptManager::execute_script(const std::string& name) const {
     std::string source = load_script(name);
     if (source.empty()) {
@@ -235,4 +208,4 @@ bool ScriptManager::execute_inline(const std::string& source) const {
     return true;
 }
 
-} // namespace oss
+}
