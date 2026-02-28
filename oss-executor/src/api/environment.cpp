@@ -2349,6 +2349,142 @@ void Environment::setup_roblox_mock(LuaEngine& engine) {
     }
 }
 
+Environment& Environment::instance() {
+    static Environment env;
+    return env;
+}
+
+void Environment::setup(lua_State* L) {
+    if (!L) return;
+
+    lua_getfield(L, LUA_REGISTRYINDEX, "_oss_env_init");
+    if (lua_toboolean(L, -1)) { lua_pop(L, 1); return; }
+    lua_pop(L, 1);
+
+    // Core globals
+    lua_pushcfunction(L, lua_http_get);       lua_setglobal(L, "_oss_http_get");
+    lua_pushcfunction(L, lua_http_get);       lua_setglobal(L, "HttpGet");
+    lua_pushcfunction(L, lua_http_request);   lua_setglobal(L, "_oss_http_request");
+    lua_pushcfunction(L, lua_typeof);         lua_setglobal(L, "typeof");
+    lua_pushcfunction(L, lua_identify_executor); lua_setglobal(L, "identifyexecutor");
+    lua_pushcfunction(L, lua_identify_executor); lua_setglobal(L, "getexecutorname");
+    lua_pushcfunction(L, lua_printidentity);  lua_setglobal(L, "printidentity");
+
+    // Drawing bridge
+    lua_pushcfunction(L, lua_drawing_new_bridge);    lua_setglobal(L, "_oss_drawing_new");
+    lua_pushcfunction(L, lua_drawing_set_bridge);    lua_setglobal(L, "_oss_drawing_set");
+    lua_pushcfunction(L, lua_drawing_remove_bridge); lua_setglobal(L, "_oss_drawing_remove");
+
+    // GUI bridge
+    lua_pushcfunction(L, lua_gui_create);          lua_setglobal(L, "_oss_gui_create");
+    lua_pushcfunction(L, lua_gui_set);             lua_setglobal(L, "_oss_gui_set");
+    lua_pushcfunction(L, lua_gui_set_parent);      lua_setglobal(L, "_oss_gui_set_parent");
+    lua_pushcfunction(L, lua_gui_remove);          lua_setglobal(L, "_oss_gui_remove");
+    lua_pushcfunction(L, lua_gui_clear);           lua_setglobal(L, "_oss_gui_clear");
+    lua_pushcfunction(L, lua_gui_get_screen_size); lua_setglobal(L, "_oss_gui_screen_size");
+
+    // Debug library
+    lua_getglobal(L, "debug");
+    if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_newtable(L); }
+    lua_pushcfunction(L, lua_debug_getinfo);      lua_setfield(L, -2, "getinfo");
+    lua_pushcfunction(L, lua_debug_getupvalue);   lua_setfield(L, -2, "getupvalue");
+    lua_pushcfunction(L, lua_debug_setupvalue);   lua_setfield(L, -2, "setupvalue");
+    lua_pushcfunction(L, lua_debug_getupvalues);  lua_setfield(L, -2, "getupvalues");
+    lua_pushcfunction(L, lua_debug_setupvalues);  lua_setfield(L, -2, "setupvalues");
+    lua_pushcfunction(L, lua_debug_getconstant);  lua_setfield(L, -2, "getconstant");
+    lua_pushcfunction(L, lua_debug_getconstants); lua_setfield(L, -2, "getconstants");
+    lua_pushcfunction(L, lua_debug_setconstant);  lua_setfield(L, -2, "setconstant");
+    lua_pushcfunction(L, lua_debug_getproto);     lua_setfield(L, -2, "getproto");
+    lua_pushcfunction(L, lua_debug_getprotos);    lua_setfield(L, -2, "getprotos");
+    lua_pushcfunction(L, lua_debug_getstack);     lua_setfield(L, -2, "getstack");
+    lua_pushcfunction(L, lua_debug_setstack);     lua_setfield(L, -2, "setstack");
+    lua_pushcfunction(L, lua_debug_getmetatable); lua_setfield(L, -2, "getmetatable");
+    lua_pushcfunction(L, lua_debug_setmetatable); lua_setfield(L, -2, "setmetatable");
+    lua_pushcfunction(L, lua_debug_getregistry);  lua_setfield(L, -2, "getregistry");
+    lua_pushcfunction(L, lua_debug_traceback);    lua_setfield(L, -2, "traceback");
+    lua_pushcfunction(L, lua_debug_profilebegin); lua_setfield(L, -2, "profilebegin");
+    lua_pushcfunction(L, lua_debug_profileend);   lua_setfield(L, -2, "profileend");
+    lua_setglobal(L, "debug");
+
+    // Flat debug globals
+    lua_pushcfunction(L, lua_debug_getinfo);      lua_setglobal(L, "getinfo");
+    lua_pushcfunction(L, lua_debug_getupvalue);   lua_setglobal(L, "getupvalue");
+    lua_pushcfunction(L, lua_debug_setupvalue);   lua_setglobal(L, "setupvalue");
+    lua_pushcfunction(L, lua_debug_getupvalues);  lua_setglobal(L, "getupvalues");
+    lua_pushcfunction(L, lua_debug_setupvalues);  lua_setglobal(L, "setupvalues");
+    lua_pushcfunction(L, lua_debug_getconstant);  lua_setglobal(L, "getconstant");
+    lua_pushcfunction(L, lua_debug_getconstants); lua_setglobal(L, "getconstants");
+    lua_pushcfunction(L, lua_debug_setconstant);  lua_setglobal(L, "setconstant");
+    lua_pushcfunction(L, lua_debug_getproto);     lua_setglobal(L, "getproto");
+    lua_pushcfunction(L, lua_debug_getprotos);    lua_setglobal(L, "getprotos");
+    lua_pushcfunction(L, lua_debug_getstack);     lua_setglobal(L, "getstack");
+    lua_pushcfunction(L, lua_debug_setstack);     lua_setglobal(L, "setstack");
+
+    // Cache library
+    lua_newtable(L);
+    lua_pushcfunction(L, lua_cache_invalidate); lua_setfield(L, -2, "invalidate");
+    lua_pushcfunction(L, lua_cache_iscached);   lua_setfield(L, -2, "iscached");
+    lua_pushcfunction(L, lua_cache_replace);    lua_setfield(L, -2, "replace");
+    lua_setglobal(L, "cache");
+    lua_pushcfunction(L, lua_cache_invalidate); lua_setglobal(L, "cache_invalidate");
+    lua_pushcfunction(L, lua_cache_iscached);   lua_setglobal(L, "cache_iscached");
+    lua_pushcfunction(L, lua_cache_replace);    lua_setglobal(L, "cache_replace");
+
+    // Metatable functions
+    lua_pushcfunction(L, lua_getrawmetatable);  lua_setglobal(L, "getrawmetatable");
+    lua_pushcfunction(L, lua_setrawmetatable);  lua_setglobal(L, "setrawmetatable");
+    lua_pushcfunction(L, lua_setreadonly);       lua_setglobal(L, "setreadonly");
+    lua_pushcfunction(L, lua_isreadonly);        lua_setglobal(L, "isreadonly");
+    lua_pushcfunction(L, lua_getnamecallmethod); lua_setglobal(L, "getnamecallmethod");
+
+    // Input functions
+    lua_pushcfunction(L, lua_fireclickdetector);  lua_setglobal(L, "fireclickdetector");
+    lua_pushcfunction(L, lua_firetouchinterest);  lua_setglobal(L, "firetouchinterest");
+    lua_pushcfunction(L, lua_fireproximityprompt); lua_setglobal(L, "fireproximityprompt");
+    lua_pushcfunction(L, lua_setfpscap);          lua_setglobal(L, "setfpscap");
+    lua_pushcfunction(L, lua_getfps);             lua_setglobal(L, "getfps");
+
+    // Instance functions
+    lua_pushcfunction(L, lua_getgenv);          lua_setglobal(L, "getgenv");
+    lua_pushcfunction(L, lua_getrenv);          lua_setglobal(L, "getrenv");
+    lua_pushcfunction(L, lua_getreg);           lua_setglobal(L, "getreg");
+    lua_pushcfunction(L, lua_getgc);            lua_setglobal(L, "getgc");
+    lua_pushcfunction(L, lua_gethui);           lua_setglobal(L, "gethui");
+    lua_pushcfunction(L, lua_getinstances);     lua_setglobal(L, "getinstances");
+    lua_pushcfunction(L, lua_getnilinstances);  lua_setglobal(L, "getnilinstances");
+    lua_pushcfunction(L, lua_getconnections);   lua_setglobal(L, "getconnections");
+
+    // Script functions
+    lua_pushcfunction(L, lua_getscripts);        lua_setglobal(L, "getscripts");
+    lua_pushcfunction(L, lua_getrunningscripts); lua_setglobal(L, "getrunningscripts");
+    lua_pushcfunction(L, lua_getloadedmodules);  lua_setglobal(L, "getloadedmodules");
+    lua_pushcfunction(L, lua_getcallingscript);  lua_setglobal(L, "getcallingscript");
+    lua_pushcfunction(L, lua_isfolder);          lua_setglobal(L, "isfolder");
+    lua_pushcfunction(L, lua_delfile);           lua_setglobal(L, "delfile");
+
+    // WebSocket
+    lua_newtable(L);
+    lua_pushcfunction(L, lua_websocket_connect); lua_setfield(L, -2, "connect");
+    lua_setglobal(L, "WebSocket");
+
+    // Closures
+    Closures::register_all(L);
+
+    // Run Roblox mock
+    int status = oss_dostring(L, ROBLOX_MOCK_LUA, "=roblox_mock");
+    if (status != 0) {
+        const char* err = lua_tostring(L, -1);
+        LOG_ERROR("Failed to init Roblox mock: {}", err ? err : "unknown error");
+        lua_pop(L, 1);
+        return;
+    }
+
+    lua_pushboolean(L, 1);
+    lua_setfield(L, LUA_REGISTRYINDEX, "_oss_env_init");
+    LOG_INFO("Environment initialized via setup(lua_State*)");
+}
+
 } // namespace oss
+
 
 
