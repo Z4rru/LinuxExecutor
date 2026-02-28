@@ -53,7 +53,7 @@ void Executor::init() {
     });
 
     Injection::instance().set_status_callback(
-        [this](InjectionStatus, const std::string& msg) {
+        [this](InjectionState, const std::string& msg) {
             if (status_cb_) status_cb_(msg);
         });
 
