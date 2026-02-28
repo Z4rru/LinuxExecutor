@@ -112,13 +112,13 @@ static int lua_drawing_set_bridge(lua_State* L) {
     const char* key = luaL_checkstring(L, 2);
     std::string k(key);
 
-        auto read_vec2 = [L](int idx, double& x, double& y) {
+    auto read_vec2 = [L](int idx, double& x, double& y) {
         if (lua_istable(L, idx)) {
             lua_getfield(L, idx, "X"); x = lua_tonumber(L, -1); lua_pop(L, 1);
             lua_getfield(L, idx, "Y"); y = lua_tonumber(L, -1); lua_pop(L, 1);
         }
     };
-        auto read_color = [L](int idx, double& r, double& g, double& b) {
+    auto read_color = [L](int idx, double& r, double& g, double& b) {
         if (lua_istable(L, idx)) {
             lua_getfield(L, idx, "R"); r = lua_tonumber(L, -1); lua_pop(L, 1);
             lua_getfield(L, idx, "G"); g = lua_tonumber(L, -1); lua_pop(L, 1);
@@ -161,6 +161,200 @@ static int lua_drawing_remove_bridge(lua_State* L) {
     return 0;
 }
 
+// ── GUI Bridge Functions ──
+
+static int lua_gui_create(lua_State* L) {
+    const char* class_name = luaL_checkstring(L, 1);
+    const char* name = luaL_optstring(L, 2, class_name);
+    int id = Overlay::instance().create_gui_element(class_name, name);
+    lua_pushinteger(L, id);
+    return 1;
+}
+
+static int lua_gui_set(lua_State* L) {
+    int id = static_cast<int>(luaL_checkinteger(L, 1));
+    const char* key = luaL_checkstring(L, 2);
+    std::string k(key);
+
+    auto read_color3 = [L](int idx, float& r, float& g, float& b) {
+        if (lua_istable(L, idx)) {
+            lua_getfield(L, idx, "R"); r = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+            lua_getfield(L, idx, "G"); g = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+            lua_getfield(L, idx, "B"); b = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+        }
+    };
+
+    auto read_udim2 = [L](int idx, float& xs, float& xo, float& ys, float& yo) {
+        if (lua_istable(L, idx)) {
+            lua_getfield(L, idx, "X");
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "Scale"); xs = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+                lua_getfield(L, -1, "Offset"); xo = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+            lua_getfield(L, idx, "Y");
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "Scale"); ys = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+                lua_getfield(L, -1, "Offset"); yo = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+        }
+    };
+
+    auto read_udim = [L](int idx) -> float {
+        if (lua_istable(L, idx)) {
+            lua_getfield(L, idx, "Offset");
+            float v = static_cast<float>(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+            return v;
+        }
+        return 0;
+    };
+
+    auto read_vec2 = [L](int idx, float& x, float& y) {
+        if (lua_istable(L, idx)) {
+            lua_getfield(L, idx, "X"); x = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+            lua_getfield(L, idx, "Y"); y = static_cast<float>(lua_tonumber(L, -1)); lua_pop(L, 1);
+        }
+    };
+
+    Overlay::instance().update_gui_element(id, [&](GuiElement& elem) {
+        if (k == "Visible") elem.visible = lua_toboolean(L, 3);
+        else if (k == "Name") { if (lua_isstring(L, 3)) elem.name = lua_tostring(L, 3); }
+        else if (k == "BackgroundColor3") read_color3(3, elem.bg_r, elem.bg_g, elem.bg_b);
+        else if (k == "BackgroundTransparency") elem.bg_transparency = static_cast<float>(lua_tonumber(L, 3));
+        else if (k == "BorderColor3") read_color3(3, elem.border_r, elem.border_g, elem.border_b);
+        else if (k == "BorderSizePixel") elem.border_size = static_cast<int>(lua_tointeger(L, 3));
+        else if (k == "Size") read_udim2(3, elem.size_x_scale, elem.size_x_offset, elem.size_y_scale, elem.size_y_offset);
+        else if (k == "Position") read_udim2(3, elem.pos_x_scale, elem.pos_x_offset, elem.pos_y_scale, elem.pos_y_offset);
+        else if (k == "AnchorPoint") read_vec2(3, elem.anchor_x, elem.anchor_y);
+        else if (k == "Rotation") elem.rotation = static_cast<float>(lua_tonumber(L, 3));
+        else if (k == "ClipsDescendants") elem.clips_descendants = lua_toboolean(L, 3);
+        else if (k == "ZIndex") elem.z_index = static_cast<int>(lua_tointeger(L, 3));
+        else if (k == "LayoutOrder") elem.layout_order = static_cast<int>(lua_tointeger(L, 3));
+        else if (k == "Text") { if (lua_isstring(L, 3)) elem.text = lua_tostring(L, 3); }
+        else if (k == "TextColor3") read_color3(3, elem.text_r, elem.text_g, elem.text_b);
+        else if (k == "TextSize") elem.text_size = static_cast<float>(lua_tonumber(L, 3));
+        else if (k == "TextTransparency") elem.text_transparency = static_cast<float>(lua_tonumber(L, 3));
+        else if (k == "TextStrokeTransparency") elem.text_stroke_transparency = static_cast<float>(lua_tonumber(L, 3));
+        else if (k == "TextStrokeColor3") read_color3(3, elem.text_stroke_r, elem.text_stroke_g, elem.text_stroke_b);
+        else if (k == "TextWrapped") elem.text_wrapped = lua_toboolean(L, 3);
+        else if (k == "TextScaled") elem.text_scaled = lua_toboolean(L, 3);
+        else if (k == "RichText") elem.rich_text = lua_toboolean(L, 3);
+        else if (k == "TextXAlignment") {
+            // Handle Enum value
+            if (lua_istable(L, 3)) {
+                lua_getfield(L, 3, "Value");
+                if (lua_isnumber(L, -1)) elem.text_x_alignment = static_cast<int>(lua_tointeger(L, -1));
+                lua_pop(L, 1);
+                lua_getfield(L, 3, "Name");
+                if (lua_isstring(L, -1)) {
+                    std::string n = lua_tostring(L, -1);
+                    if (n == "Left") elem.text_x_alignment = 0;
+                    else if (n == "Center") elem.text_x_alignment = 1;
+                    else if (n == "Right") elem.text_x_alignment = 2;
+                }
+                lua_pop(L, 1);
+            } else if (lua_isnumber(L, 3)) {
+                elem.text_x_alignment = static_cast<int>(lua_tointeger(L, 3));
+            }
+        }
+        else if (k == "TextYAlignment") {
+            if (lua_istable(L, 3)) {
+                lua_getfield(L, 3, "Name");
+                if (lua_isstring(L, -1)) {
+                    std::string n = lua_tostring(L, -1);
+                    if (n == "Top") elem.text_y_alignment = 0;
+                    else if (n == "Center") elem.text_y_alignment = 1;
+                    else if (n == "Bottom") elem.text_y_alignment = 2;
+                }
+                lua_pop(L, 1);
+            } else if (lua_isnumber(L, 3)) {
+                elem.text_y_alignment = static_cast<int>(lua_tointeger(L, 3));
+            }
+        }
+        else if (k == "Image") { if (lua_isstring(L, 3)) elem.image = lua_tostring(L, 3); }
+        else if (k == "ImageColor3") read_color3(3, elem.image_r, elem.image_g, elem.image_b);
+        else if (k == "ImageTransparency") elem.image_transparency = static_cast<float>(lua_tonumber(L, 3));
+        else if (k == "Enabled") elem.enabled = lua_toboolean(L, 3);
+        else if (k == "DisplayOrder") elem.display_order = static_cast<int>(lua_tointeger(L, 3));
+        else if (k == "IgnoreGuiInset") elem.ignore_gui_inset = lua_toboolean(L, 3);
+        else if (k == "ResetOnSpawn") { /* accepted, no effect */ }
+        else if (k == "Active") { /* accepted, no effect in overlay */ }
+        else if (k == "Selectable") { /* accepted, no effect in overlay */ }
+        else if (k == "Font") { /* accepted, future: map font enum */ }
+        else if (k == "AutomaticSize") { /* accepted, future: auto sizing */ }
+        else if (k == "CornerRadius") {
+            // UICorner's CornerRadius is a UDim
+            elem.corner_radius = read_udim(3);
+        }
+        else if (k == "Thickness") {
+            // UIStroke
+            elem.stroke_thickness = static_cast<float>(lua_tonumber(L, 3));
+            elem.has_stroke = true;
+        }
+        else if (k == "Color") {
+            // UIStroke Color or UIGradient - context dependent
+            // For UIStroke applied to parent:
+            if (elem.class_name == "UIStroke") {
+                read_color3(3, elem.stroke_r, elem.stroke_g, elem.stroke_b);
+            }
+        }
+        else if (k == "Transparency" && elem.class_name == "UIStroke") {
+            elem.stroke_transparency = static_cast<float>(lua_tonumber(L, 3));
+        }
+        else if (k == "PaddingTop") elem.pad_top = read_udim(3);
+        else if (k == "PaddingBottom") elem.pad_bottom = read_udim(3);
+        else if (k == "PaddingLeft") elem.pad_left = read_udim(3);
+        else if (k == "PaddingRight") elem.pad_right = read_udim(3);
+        else if (k == "Padding") {
+            // UIListLayout Padding (UDim)
+            float p = read_udim(3);
+            elem.pad_top = p;
+        }
+        else if (k == "CanvasSize") {
+            float dummy_xs, dummy_xo, ys, yo;
+            read_udim2(3, dummy_xs, dummy_xo, ys, yo);
+            elem.canvas_size_y = yo;
+        }
+        else if (k == "CanvasPosition") {
+            float sx, sy;
+            read_vec2(3, sx, sy);
+            elem.scroll_position = sy;
+        }
+        else if (k == "ScrollingEnabled") elem.scrolling_enabled = lua_toboolean(L, 3);
+        // Silently accept other properties without error
+    });
+    return 0;
+}
+
+static int lua_gui_set_parent(lua_State* L) {
+    int child_id = static_cast<int>(luaL_checkinteger(L, 1));
+    int parent_id = static_cast<int>(luaL_checkinteger(L, 2));
+    Overlay::instance().set_gui_parent(child_id, parent_id);
+    return 0;
+}
+
+static int lua_gui_remove(lua_State* L) {
+    int id = static_cast<int>(luaL_checkinteger(L, 1));
+    Overlay::instance().remove_gui_element(id);
+    return 0;
+}
+
+static int lua_gui_clear(lua_State* L) {
+    (void)L;
+    Overlay::instance().clear_gui_elements();
+    return 0;
+}
+
+static int lua_gui_get_screen_size(lua_State* L) {
+    lua_pushinteger(L, Overlay::instance().screen_width());
+    lua_pushinteger(L, Overlay::instance().screen_height());
+    return 2;
+}
+
+// ── Debug functions ──
+
 static int lua_debug_getinfo(lua_State* L) {
     int level = 0;
     lua_Debug ar;
@@ -188,26 +382,20 @@ static int lua_debug_getinfo(lua_State* L) {
         lua_pushstring(L, ar.source);
         lua_setfield(L, -2, "short_src");
     }
-
     if (ar.name) {
         lua_pushstring(L, ar.name);
         lua_setfield(L, -2, "name");
     }
-
     if (ar.what) {
         lua_pushstring(L, ar.what);
         lua_setfield(L, -2, "what");
     }
-
     lua_pushinteger(L, ar.currentline);
     lua_setfield(L, -2, "currentline");
-
     lua_pushinteger(L, ar.linedefined);
     lua_setfield(L, -2, "linedefined");
-
     lua_pushinteger(L, ar.lastlinedefined);
     lua_setfield(L, -2, "lastlinedefined");
-
     lua_pushinteger(L, ar.nups);
     lua_setfield(L, -2, "nups");
 
@@ -216,7 +404,6 @@ static int lua_debug_getinfo(lua_State* L) {
         lua_pushstring(L, filter);
         lua_setfield(L, -2, "filter");
     }
-
     return 1;
 }
 
@@ -515,7 +702,7 @@ static int lua_gethui(lua_State* L) {
     lua_pushvalue(L, -2);
     lua_pushstring(L, "CoreGui");
     lua_call(L, 2, 1);
-    lua_remove(L, -2); // remove 'game' from beneath result
+    lua_remove(L, -2); // Fix: remove 'game' from beneath result
     return 1;
 }
 
@@ -602,6 +789,11 @@ static int lua_websocket_connect(lua_State* L) {
 
     return 1;
 }
+
+// ── The Roblox mock Lua code ──
+// Now with GUI bridge integration: Instance.new for GUI classes calls
+// _oss_gui_create, property writes call _oss_gui_set, Parent assignment
+// calls _oss_gui_set_parent, and Destroy calls _oss_gui_remove.
 
 static const char* ROBLOX_MOCK_LUA = R"LUA(
 
@@ -791,11 +983,52 @@ for _,v in ipairs({
     "TextChanged","ReturnPressedFromOnScreenKeyboard"
 }) do _instance_events[v]=true end
 
+-- GUI class set for overlay bridge
+local _gui_classes={
+    ScreenGui=true,BillboardGui=true,SurfaceGui=true,
+    Frame=true,TextLabel=true,TextButton=true,TextBox=true,
+    ImageLabel=true,ImageButton=true,ScrollingFrame=true,
+    ViewportFrame=true,CanvasGroup=true,
+    UICorner=true,UIStroke=true,UIGradient=true,UIPadding=true,
+    UIListLayout=true,UIGridLayout=true,UIScale=true,
+    UIAspectRatioConstraint=true,UISizeConstraint=true,UITextSizeConstraint=true
+}
+
+-- Properties that should be forwarded to the C++ overlay bridge
+local _gui_bridge_props={
+    Visible=true,Name=true,
+    BackgroundColor3=true,BackgroundTransparency=true,
+    BorderColor3=true,BorderSizePixel=true,
+    Size=true,Position=true,AnchorPoint=true,
+    Rotation=true,ClipsDescendants=true,ZIndex=true,LayoutOrder=true,
+    Text=true,TextColor3=true,TextSize=true,TextTransparency=true,
+    TextStrokeTransparency=true,TextStrokeColor3=true,
+    TextWrapped=true,TextScaled=true,RichText=true,
+    TextXAlignment=true,TextYAlignment=true,
+    Image=true,ImageColor3=true,ImageTransparency=true,
+    Enabled=true,DisplayOrder=true,IgnoreGuiInset=true,
+    ResetOnSpawn=true,Active=true,Selectable=true,Font=true,
+    AutomaticSize=true,CornerRadius=true,Thickness=true,Color=true,
+    Transparency=true,PaddingTop=true,PaddingBottom=true,
+    PaddingLeft=true,PaddingRight=true,Padding=true,
+    CanvasSize=true,CanvasPosition=true,ScrollingEnabled=true,
+    SortOrder=true,FillDirection=true,
+    HorizontalAlignment=true,VerticalAlignment=true,
+}
+
 local function make_instance(class_name,name,parent)
     local children={}
     local properties={}
     local events={}
     local inst={}
+    local is_gui = _gui_classes[class_name] or false
+    local gui_id = 0
+
+    -- Create overlay element for GUI classes
+    if is_gui and _oss_gui_create then
+        gui_id = _oss_gui_create(class_name, name or class_name)
+    end
+
     local mt={__type="Instance",__tostring=function() return name or class_name end}
 
     local function find_child(_,child_name)
@@ -811,6 +1044,7 @@ local function make_instance(class_name,name,parent)
         if key=="Name" then return name or class_name end
         if key=="ClassName" then return class_name end
         if key=="Parent" then return parent end
+        if key=="_gui_id" then return gui_id end
         if key=="IsA" then return function(_,check) return check==class_name or check=="Instance" or check=="GuiObject" or check=="BasePart" end end
         if key=="FindFirstChild" then return find_child end
         if key=="FindFirstChildOfClass" then
@@ -872,8 +1106,34 @@ local function make_instance(class_name,name,parent)
             end
         end
         if key=="Clone" then return function() return make_instance(class_name,name,nil) end end
-        if key=="Destroy" or key=="Remove" then return function() end end
-        if key=="ClearAllChildren" then return function() children={} end end
+        if key=="Destroy" or key=="Remove" then
+            return function()
+                if is_gui and gui_id>0 and _oss_gui_remove then
+                    pcall(_oss_gui_remove, gui_id)
+                end
+                -- Remove from parent's children
+                if parent and type(parent)=="table" then
+                    local pc=rawget(parent,"_children")
+                    if pc then
+                        for i=#pc,1,-1 do
+                            if pc[i]==inst then table.remove(pc,i) break end
+                        end
+                    end
+                end
+                parent=nil
+            end
+        end
+        if key=="ClearAllChildren" then
+            return function()
+                for _,c in ipairs(children) do
+                    if type(c)=="table" then
+                        local d=c.Destroy
+                        if d then pcall(d) end
+                    end
+                end
+                children={}
+            end
+        end
         if key=="GetFullName" then
             return function()
                 local parts={name or class_name}
@@ -921,17 +1181,68 @@ local function make_instance(class_name,name,parent)
         if child then return child end
         return nil
     end
+
     mt.__newindex=function(self,key,value)
-        if key=="Name" then name=value
+        if key=="Name" then
+            name=value
+            if is_gui and gui_id>0 and _oss_gui_set then
+                pcall(_oss_gui_set, gui_id, "Name", value)
+            end
         elseif key=="Parent" then
+            -- Remove from old parent's children list
+            if parent and type(parent)=="table" then
+                local pc=rawget(parent,"_children")
+                if pc then
+                    for i=#pc,1,-1 do
+                        if pc[i]==inst then table.remove(pc,i) break end
+                    end
+                end
+            end
             parent=value
             if type(value)=="table" then
                 local gc=rawget(value,"_children")
                 if gc then table.insert(gc,inst) end
             end
-        else properties[key]=value end
+            -- Bridge: set parent in overlay
+            if is_gui and gui_id>0 and _oss_gui_set_parent then
+                local parent_gui_id=0
+                if type(value)=="table" then
+                    local pgid=value._gui_id
+                    if pgid and pgid>0 then parent_gui_id=pgid end
+                end
+                pcall(_oss_gui_set_parent, gui_id, parent_gui_id)
+            end
+        else
+            properties[key]=value
+            -- Bridge: forward GUI property changes to overlay
+            if is_gui and gui_id>0 and _oss_gui_set and _gui_bridge_props[key] then
+                pcall(_oss_gui_set, gui_id, key, value)
+            end
+            -- If this is a UICorner/UIStroke/UIPadding being modified,
+            -- also update the parent in the overlay
+            if is_gui and gui_id>0 and parent and type(parent)=="table" then
+                local pgid=parent._gui_id
+                if pgid and pgid>0 and _oss_gui_set then
+                    if class_name=="UICorner" and key=="CornerRadius" then
+                        pcall(_oss_gui_set, pgid, "CornerRadius", value)
+                    elseif class_name=="UIStroke" then
+                        if key=="Thickness" or key=="Color" or key=="Transparency" then
+                            pcall(_oss_gui_set, pgid, key, value)
+                        end
+                    elseif class_name=="UIPadding" then
+                        if key=="PaddingTop" or key=="PaddingBottom" or key=="PaddingLeft" or key=="PaddingRight" then
+                            pcall(_oss_gui_set, pgid, key, value)
+                        end
+                    end
+                end
+            end
+            -- Fire property changed signal
+            local sig_key="_PropChanged_"..key
+            if events[sig_key] then events[sig_key]:Fire(value) end
+        end
     end
     rawset(inst,"_children",children)
+    rawset(inst,"_gui_id_raw",gui_id)
     setmetatable(inst,mt)
     return inst,children,properties
 end
@@ -954,6 +1265,10 @@ function InstanceModule.new(class_name,parent)
     if class_name=="ScreenGui" or class_name=="BillboardGui" or class_name=="SurfaceGui" then
         props.Enabled=true;props.ResetOnSpawn=true;props.DisplayOrder=0
         props.IgnoreGuiInset=false;props.ZIndexBehavior=EnumMock.ZIndexBehavior.Sibling
+        -- Bridge initial properties
+        if inst._gui_id and inst._gui_id>0 and _oss_gui_set then
+            pcall(_oss_gui_set, inst._gui_id, "Enabled", true)
+        end
     elseif class_name=="Frame" or class_name=="TextLabel" or class_name=="TextButton"
            or class_name=="ImageLabel" or class_name=="ImageButton" or class_name=="ScrollingFrame"
            or class_name=="TextBox" or class_name=="ViewportFrame" or class_name=="CanvasGroup" then
@@ -964,6 +1279,15 @@ function InstanceModule.new(class_name,parent)
         props.AnchorPoint=Vector2.new(0,0);props.BorderSizePixel=0;props.ClipsDescendants=false
         props.LayoutOrder=0;props.Rotation=0;props.AutomaticSize=EnumMock.AutomaticSize.None
         props.Active=false;props.Selectable=false
+        -- Bridge initial GUI properties
+        if inst._gui_id and inst._gui_id>0 and _oss_gui_set then
+            pcall(_oss_gui_set, inst._gui_id, "Visible", true)
+            pcall(_oss_gui_set, inst._gui_id, "Size", props.Size)
+            pcall(_oss_gui_set, inst._gui_id, "Position", props.Position)
+            pcall(_oss_gui_set, inst._gui_id, "BackgroundColor3", props.BackgroundColor3)
+            pcall(_oss_gui_set, inst._gui_id, "BackgroundTransparency", props.BackgroundTransparency)
+            pcall(_oss_gui_set, inst._gui_id, "ZIndex", props.ZIndex)
+        end
         if class_name=="TextLabel" or class_name=="TextButton" or class_name=="TextBox" then
             props.TextWrapped=false;props.TextScaled=false;props.RichText=false
             props.TextXAlignment=EnumMock.TextXAlignment.Center
@@ -1004,7 +1328,8 @@ function InstanceModule.new(class_name,parent)
             rawset(inst,"SetPrimaryPartCFrame",function() end)
             rawset(inst,"GetExtentsSize",function() return Vector3.new(4,4,4) end)
         end
-    elseif class_name=="UICorner" then props.CornerRadius=UDim.new(0,8)
+    elseif class_name=="UICorner" then
+        props.CornerRadius=UDim.new(0,8)
     elseif class_name=="UIStroke" then
         props.Thickness=1;props.Color=Color3.new(0,0,0);props.Transparency=0
         props.ApplyStrokeMode=EnumMock.ApplyStrokeMode.Contextual
@@ -1079,14 +1404,23 @@ function InstanceModule.new(class_name,parent)
         props.CFrame=CFrame.new();props.Position=Vector3.new()
         props.WorldCFrame=CFrame.new();props.WorldPosition=Vector3.new()
     end
+
+    -- Auto-parent if parent was provided to Instance.new
     if parent and type(parent)=="table" then
         local pc=rawget(parent,"_children")
         if pc then table.insert(pc,inst) end
+        -- Bridge: set parent in overlay
+        if is_gui and gui_id>0 and _oss_gui_set_parent then
+            local parent_gui_id=0
+            local pgid=parent._gui_id
+            if pgid and pgid>0 then parent_gui_id=pgid end
+            pcall(_oss_gui_set_parent, gui_id, parent_gui_id)
+        end
     end
     return inst
 end
 
-local Drawing={Fonts={UI=0,System=1,Plex=2,Monospace=3}}
+Drawing={Fonts={UI=0,System=1,Plex=2,Monospace=3}}
 local _drawing_type_map={Line=0,Text=1,Circle=2,Square=3,Triangle=4,Quad=5,Image=6}
 
 function Drawing.new(class_name)
@@ -1251,7 +1585,20 @@ local function make_service(name)
         rawset(svc,"Create",function(_,inst2,info,pt)
             local tween,_,tp=make_instance("Tween","Tween")
             tp.PlaybackState=EnumMock.PlaybackState.Begin
-            rawset(tween,"Play",function() tp.PlaybackState=EnumMock.PlaybackState.Playing end)
+            rawset(tween,"Play",function()
+                tp.PlaybackState=EnumMock.PlaybackState.Playing
+                -- Apply tween properties immediately for GUI visibility
+                if pt and type(inst2)=="table" then
+                    for k,v in pairs(pt) do
+                        inst2[k]=v
+                    end
+                end
+                -- Fire Completed after a brief delay simulation
+                if tp.Completed then
+                    tp.PlaybackState=EnumMock.PlaybackState.Completed
+                    tp.Completed:Fire(EnumMock.PlaybackState.Completed)
+                end
+            end)
             rawset(tween,"Cancel",function() tp.PlaybackState=EnumMock.PlaybackState.Cancelled end)
             rawset(tween,"Pause",function() tp.PlaybackState=EnumMock.PlaybackState.Paused end)
             tp.Completed=Signal.new("Completed")
@@ -1262,33 +1609,153 @@ local function make_service(name)
         end)
     elseif name=="HttpService" then
         rawset(svc,"JSONEncode",function(_,obj)
-            if type(obj)=="string" then return '"'..obj:gsub('"','\\"')..'"' end
-            if type(obj)=="number" or type(obj)=="boolean" then return tostring(obj) end
-            if obj==nil then return "null" end
-            if type(obj)=="table" then
-                local parts={} local is_array=(#obj>0)
-                if is_array then
-                    for _,v in ipairs(obj) do
-                        local s2=game:GetService("HttpService")
-                        table.insert(parts,s2:JSONEncode(v))
-                    end
-                    return "["..table.concat(parts,",").."]"
-                else
-                    for k,v in pairs(obj) do
-                        local s2=game:GetService("HttpService")
-                        table.insert(parts,'"'..tostring(k)..'":'..s2:JSONEncode(v))
-                    end
-                    return "{"..table.concat(parts,",").."}"
+            local function encode(v)
+                if v==nil then return "null" end
+                local t=type(v)
+                if t=="string" then
+                    return '"'..v:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n'):gsub('\r','\\r'):gsub('\t','\\t')..'"'
                 end
+                if t=="number" then
+                    if v~=v then return '"NaN"' end
+                    if v==math.huge then return '1e309' end
+                    if v==-math.huge then return '-1e309' end
+                    return tostring(v)
+                end
+                if t=="boolean" then return tostring(v) end
+                if t=="table" then
+                    local is_array=true
+                    local max_i=0
+                    for k,_ in pairs(v) do
+                        if type(k)~="number" or k<1 or k~=math.floor(k) then
+                            is_array=false;break
+                        end
+                        if k>max_i then max_i=k end
+                    end
+                    if is_array and max_i==#v then
+                        local parts={}
+                        for i=1,#v do parts[i]=encode(v[i]) end
+                        return "["..table.concat(parts,",").."]"
+                    else
+                        local parts={}
+                        for k2,v2 in pairs(v) do
+                            table.insert(parts, encode(tostring(k2))..":"..encode(v2))
+                        end
+                        return "{"..table.concat(parts,",").."}"
+                    end
+                end
+                return '"'..tostring(v)..'"'
             end
-            return tostring(obj)
+            return encode(obj)
         end)
         rawset(svc,"JSONDecode",function(_,str)
             if type(str)~="string" then return {} end
-            local s=str:gsub("%[","{"):gsub("%]","}")
-            s=s:gsub("null","nil"):gsub('"([^"]-)"%s*:',function(k) return '["'..k..'"]='; end)
-            local fn=loadstring("return "..s)
-            if fn then local ok,result=pcall(fn) if ok then return result end end
+            -- Proper JSON parser
+            local pos=1
+            local function skip_ws()
+                while pos<=#str do
+                    local c=str:sub(pos,pos)
+                    if c==" " or c=="\t" or c=="\n" or c=="\r" then pos=pos+1
+                    else break end
+                end
+            end
+            local parse_value -- forward declaration
+            local function parse_string()
+                if str:sub(pos,pos)~='"' then return nil end
+                pos=pos+1
+                local result={}
+                while pos<=#str do
+                    local c=str:sub(pos,pos)
+                    if c=='"' then pos=pos+1;return table.concat(result) end
+                    if c=='\\' then
+                        pos=pos+1;c=str:sub(pos,pos)
+                        if c=='"' then result[#result+1]='"'
+                        elseif c=='\\' then result[#result+1]='\\'
+                        elseif c=='/' then result[#result+1]='/'
+                        elseif c=='n' then result[#result+1]='\n'
+                        elseif c=='r' then result[#result+1]='\r'
+                        elseif c=='t' then result[#result+1]='\t'
+                        elseif c=='b' then result[#result+1]='\b'
+                        elseif c=='f' then result[#result+1]='\f'
+                        elseif c=='u' then
+                            local hex=str:sub(pos+1,pos+4)
+                            local code=tonumber(hex,16) or 0
+                            if code<128 then result[#result+1]=string.char(code)
+                            else result[#result+1]='?' end
+                            pos=pos+4
+                        end
+                    else
+                        result[#result+1]=c
+                    end
+                    pos=pos+1
+                end
+                return table.concat(result)
+            end
+            local function parse_number()
+                local start=pos
+                if str:sub(pos,pos)=='-' then pos=pos+1 end
+                while pos<=#str and str:sub(pos,pos):match("[%d]") do pos=pos+1 end
+                if pos<=#str and str:sub(pos,pos)=='.' then
+                    pos=pos+1
+                    while pos<=#str and str:sub(pos,pos):match("[%d]") do pos=pos+1 end
+                end
+                if pos<=#str and str:sub(pos,pos):lower()=='e' then
+                    pos=pos+1
+                    if str:sub(pos,pos)=='+' or str:sub(pos,pos)=='-' then pos=pos+1 end
+                    while pos<=#str and str:sub(pos,pos):match("[%d]") do pos=pos+1 end
+                end
+                return tonumber(str:sub(start,pos-1))
+            end
+            local function parse_array()
+                pos=pos+1 -- skip [
+                local arr={}
+                skip_ws()
+                if str:sub(pos,pos)==']' then pos=pos+1;return arr end
+                while true do
+                    skip_ws()
+                    local val=parse_value()
+                    arr[#arr+1]=val
+                    skip_ws()
+                    if str:sub(pos,pos)==',' then pos=pos+1
+                    elseif str:sub(pos,pos)==']' then pos=pos+1;break
+                    else break end
+                end
+                return arr
+            end
+            local function parse_object()
+                pos=pos+1 -- skip {
+                local obj2={}
+                skip_ws()
+                if str:sub(pos,pos)=='}' then pos=pos+1;return obj2 end
+                while true do
+                    skip_ws()
+                    local key=parse_string()
+                    skip_ws()
+                    if str:sub(pos,pos)==':' then pos=pos+1 end
+                    skip_ws()
+                    local val=parse_value()
+                    if key then obj2[key]=val end
+                    skip_ws()
+                    if str:sub(pos,pos)==',' then pos=pos+1
+                    elseif str:sub(pos,pos)=='}' then pos=pos+1;break
+                    else break end
+                end
+                return obj2
+            end
+            parse_value=function()
+                skip_ws()
+                local c=str:sub(pos,pos)
+                if c=='"' then return parse_string()
+                elseif c=='{' then return parse_object()
+                elseif c=='[' then return parse_array()
+                elseif c=='t' then pos=pos+4;return true
+                elseif c=='f' then pos=pos+5;return false
+                elseif c=='n' then pos=pos+4;return nil
+                elseif c=='-' or c:match("[%d]") then return parse_number()
+                end
+                return nil
+            end
+            local ok,result=pcall(parse_value)
+            if ok then return result end
             return {}
         end)
         rawset(svc,"GenerateGUID",function(_,wrap)
@@ -1300,8 +1767,8 @@ local function make_service(name)
             if wrap==false then return g end
             return "{"..g.."}"
         end)
-        rawset(svc,"UrlEncode",function(_,str)
-            return (str:gsub("[^%w%-_%.~]",function(c) return string.format("%%%02X",string.byte(c)) end))
+        rawset(svc,"UrlEncode",function(_,str2)
+            return (str2:gsub("[^%w%-_%.~]",function(c) return string.format("%%%02X",string.byte(c)) end))
         end)
         rawset(svc,"RequestAsync",function(_,opts) return _G._oss_http_request(opts) end)
     elseif name=="ReplicatedStorage" or name=="ServerStorage" or name=="ServerScriptService"
@@ -1381,11 +1848,45 @@ _G.Vector3=Vector3;_G.Vector2=Vector2
 _G.Color3=Color3;_G.UDim=UDim;_G.UDim2=UDim2
 _G.CFrame=CFrame;_G.Drawing=Drawing
 
+-- Heartbeat/RenderStepped ticker: fire signals periodically
+-- This runs via a coroutine-based approach using wait()
+local _heartbeat_running=false
+local function _start_heartbeat()
+    if _heartbeat_running then return end
+    _heartbeat_running=true
+    local rs=make_service("RunService")
+    local last_time=os.clock()
+    -- We'll fire these from the wait() implementation
+    _G._oss_tick_signals=function()
+        local now=os.clock()
+        local dt=now-last_time
+        if dt<0.001 then dt=0.016 end
+        last_time=now
+        if rs and rs.RenderStepped then pcall(function() rs.RenderStepped:Fire(dt) end) end
+        if rs and rs.Heartbeat then pcall(function() rs.Heartbeat:Fire(dt) end) end
+        if rs and rs.Stepped then pcall(function() rs.Stepped:Fire(now,dt) end) end
+        if rs and rs.PreRender then pcall(function() rs.PreRender:Fire(dt) end) end
+        if rs and rs.PostSimulation then pcall(function() rs.PostSimulation:Fire(dt) end) end
+    end
+end
+_start_heartbeat()
+
 local _c_wait=wait
 local _c_spawn=spawn
 local _c_delay=delay
 
-wait=_c_wait or function(t) return t or 0,t or 0 end
+wait=function(t)
+    t=t or 0.03
+    -- Tick signals on every wait call
+    if _G._oss_tick_signals then pcall(_G._oss_tick_signals) end
+    if _c_wait then return _c_wait(t) end
+    -- Busy-wait fallback with os.clock (not ideal but prevents instant return)
+    local start=os.clock()
+    while os.clock()-start<t do end
+    local elapsed=os.clock()-start
+    return elapsed,os.clock()
+end
+
 spawn=_c_spawn or function(fn,...) if type(fn)=="function" then pcall(fn,...) end end
 delay=_c_delay or function(t,fn,...) if type(fn)=="function" then pcall(fn,...) end end
 tick=tick or function() return os.clock() end
@@ -1632,12 +2133,27 @@ void Environment::setup(LuaEngine& engine) {
     lua_pushcfunction(L, lua_printidentity);
     lua_setglobal(L, "printidentity");
 
+    // Drawing bridge
     lua_pushcfunction(L, lua_drawing_new_bridge);
     lua_setglobal(L, "_oss_drawing_new");
     lua_pushcfunction(L, lua_drawing_set_bridge);
     lua_setglobal(L, "_oss_drawing_set");
     lua_pushcfunction(L, lua_drawing_remove_bridge);
     lua_setglobal(L, "_oss_drawing_remove");
+
+    // GUI bridge
+    lua_pushcfunction(L, lua_gui_create);
+    lua_setglobal(L, "_oss_gui_create");
+    lua_pushcfunction(L, lua_gui_set);
+    lua_setglobal(L, "_oss_gui_set");
+    lua_pushcfunction(L, lua_gui_set_parent);
+    lua_setglobal(L, "_oss_gui_set_parent");
+    lua_pushcfunction(L, lua_gui_remove);
+    lua_setglobal(L, "_oss_gui_remove");
+    lua_pushcfunction(L, lua_gui_clear);
+    lua_setglobal(L, "_oss_gui_clear");
+    lua_pushcfunction(L, lua_gui_get_screen_size);
+    lua_setglobal(L, "_oss_gui_screen_size");
 
     setup_debug_lib(engine);
     setup_cache_lib(engine);
@@ -1660,7 +2176,7 @@ void Environment::setup(LuaEngine& engine) {
     lua_pushboolean(L, 1);
     lua_setfield(L, LUA_REGISTRYINDEX, "_oss_env_init");
 
-    LOG_INFO("Roblox API mock environment initialized");
+    LOG_INFO("Roblox API mock environment initialized with GUI bridge");
 }
 
 void Environment::setup_debug_lib(LuaEngine& engine) {
@@ -1674,58 +2190,40 @@ void Environment::setup_debug_lib(LuaEngine& engine) {
 
     lua_pushcfunction(L, lua_debug_getinfo);
     lua_setfield(L, -2, "getinfo");
-
     lua_pushcfunction(L, lua_debug_getupvalue);
     lua_setfield(L, -2, "getupvalue");
-
     lua_pushcfunction(L, lua_debug_setupvalue);
     lua_setfield(L, -2, "setupvalue");
-
     lua_pushcfunction(L, lua_debug_getupvalues);
     lua_setfield(L, -2, "getupvalues");
-
     lua_pushcfunction(L, lua_debug_setupvalues);
     lua_setfield(L, -2, "setupvalues");
-
     lua_pushcfunction(L, lua_debug_getconstant);
     lua_setfield(L, -2, "getconstant");
-
     lua_pushcfunction(L, lua_debug_getconstants);
     lua_setfield(L, -2, "getconstants");
-
     lua_pushcfunction(L, lua_debug_setconstant);
     lua_setfield(L, -2, "setconstant");
-
     lua_pushcfunction(L, lua_debug_getproto);
     lua_setfield(L, -2, "getproto");
-
     lua_pushcfunction(L, lua_debug_getprotos);
     lua_setfield(L, -2, "getprotos");
-
     lua_pushcfunction(L, lua_debug_getstack);
     lua_setfield(L, -2, "getstack");
-
     lua_pushcfunction(L, lua_debug_setstack);
     lua_setfield(L, -2, "setstack");
-
     lua_pushcfunction(L, lua_debug_getmetatable);
     lua_setfield(L, -2, "getmetatable");
-
     lua_pushcfunction(L, lua_debug_setmetatable);
     lua_setfield(L, -2, "setmetatable");
-
     lua_pushcfunction(L, lua_debug_getregistry);
     lua_setfield(L, -2, "getregistry");
-
     lua_pushcfunction(L, lua_debug_traceback);
     lua_setfield(L, -2, "traceback");
-
     lua_pushcfunction(L, lua_debug_profilebegin);
     lua_setfield(L, -2, "profilebegin");
-
     lua_pushcfunction(L, lua_debug_profileend);
     lua_setfield(L, -2, "profileend");
-
     lua_setglobal(L, "debug");
 
     engine.register_function("getinfo", lua_debug_getinfo);
@@ -1821,6 +2319,22 @@ void Environment::setup_drawing_bridge(LuaEngine& engine) {
     lua_setglobal(L, "_oss_drawing_remove");
 }
 
+void Environment::setup_gui_bridge(LuaEngine& engine) {
+    lua_State* L = engine.state();
+    lua_pushcfunction(L, lua_gui_create);
+    lua_setglobal(L, "_oss_gui_create");
+    lua_pushcfunction(L, lua_gui_set);
+    lua_setglobal(L, "_oss_gui_set");
+    lua_pushcfunction(L, lua_gui_set_parent);
+    lua_setglobal(L, "_oss_gui_set_parent");
+    lua_pushcfunction(L, lua_gui_remove);
+    lua_setglobal(L, "_oss_gui_remove");
+    lua_pushcfunction(L, lua_gui_clear);
+    lua_setglobal(L, "_oss_gui_clear");
+    lua_pushcfunction(L, lua_gui_get_screen_size);
+    lua_setglobal(L, "_oss_gui_screen_size");
+}
+
 void Environment::setup_roblox_mock(LuaEngine& engine) {
     lua_State* L = engine.state();
     int status = luaL_dostring(L, ROBLOX_MOCK_LUA);
@@ -1832,5 +2346,3 @@ void Environment::setup_roblox_mock(LuaEngine& engine) {
 }
 
 } // namespace oss
-
-
