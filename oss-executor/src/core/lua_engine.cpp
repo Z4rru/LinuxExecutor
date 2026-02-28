@@ -176,19 +176,31 @@ void* LuaEngine::lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
     auto* engine = static_cast<LuaEngine*>(ud);
 
     if (nsize == 0) {
-        engine->total_allocated_ -= osize;
+        if (engine->total_allocated_ >= osize)
+            engine->total_allocated_ -= osize;
+        else
+            engine->total_allocated_ = 0;
         free(ptr);
         return nullptr;
     }
 
-    if (engine->total_allocated_ - osize + nsize > MAX_MEMORY) {
+    // Safe memory-limit check with underflow protection
+    size_t projected = engine->total_allocated_;
+    if (projected >= osize)
+        projected = projected - osize + nsize;
+    else
+        projected = nsize;
+
+    if (projected > MAX_MEMORY) {
         LOG_ERROR("LuaEngine: Memory limit exceeded ({} MB)",
                   MAX_MEMORY / (1024 * 1024));
         return nullptr;
     }
 
-    engine->total_allocated_ += nsize - osize;
-    return realloc(ptr, nsize);
+    void* result = realloc(ptr, nsize);
+    if (result)
+        engine->total_allocated_ = projected;
+    return result;
 }
 
 // ===========================================================================
@@ -216,6 +228,15 @@ bool LuaEngine::init() {
 
     LOG_INFO("LuaEngine: Initializing embedded Luau VM");
 
+    // Reset state BEFORE creating VM so allocator tracking starts at zero
+    next_task_id_    = 1;
+    tasks_.clear();
+    signals_.clear();
+    drawing_objects_.clear();
+    next_drawing_id_ = 1;
+    next_signal_id_  = 1;
+    total_allocated_ = 0;
+
     L_ = lua_newstate(lua_alloc, this);
     if (!L_) {
         last_error_ = "Failed to create Lua state";
@@ -228,18 +249,9 @@ bool LuaEngine::init() {
     // Install interrupt for cancellation support
     lua_callbacks(L_)->interrupt = lua_interrupt;
 
-    // Store engine pointer in registry for retrieval from C functions
+        // Store engine pointer in registry for retrieval from C functions
     lua_pushlightuserdata(L_, this);
     lua_setfield(L_, LUA_REGISTRYINDEX, "__oss_engine");
-
-    // Reset scheduler / drawing / signal state
-    next_task_id_    = 1;
-    tasks_.clear();
-    signals_.clear();
-    drawing_objects_.clear();
-    next_drawing_id_ = 1;
-    next_signal_id_  = 1;
-    total_allocated_ = 0;
 
     setup_environment();
     register_custom_libs();
@@ -1386,16 +1398,18 @@ int LuaEngine::lua_task_spawn(lua_State* L) {
         if (eng->error_cb_)
             eng->error_cb_({err ? err : "task.spawn error", -1, "task.spawn"});
         LOG_ERROR("[task.spawn] {}", err ? err : "unknown error");
-        lua_unref(eng->L_, thread_ref);
-    } else {
-        lua_unref(eng->L_, thread_ref);
     }
 
-    // Return the thread
+    // Push thread for return BEFORE releasing the reference
     lua_rawgeti(L, LUA_REGISTRYINDEX, thread_ref);
     if (!lua_isthread(L, -1)) {
         lua_pop(L, 1);
         lua_pushnil(L);
+    }
+
+    // Release ref if coroutine completed or errored (yielded refs are owned by tasks)
+    if (status != LUA_YIELD) {
+        lua_unref(eng->L_, thread_ref);
     }
     return 1;
 }
@@ -1809,15 +1823,18 @@ int LuaEngine::lua_spawn(lua_State* L) {
         if (eng->error_cb_)
             eng->error_cb_({err ? err : "spawn error", -1, "spawn"});
         LOG_ERROR("[spawn] {}", err ? err : "unknown error");
-        lua_unref(eng->L_, thread_ref);
-    } else {
-        lua_unref(eng->L_, thread_ref);
     }
 
+    // Push thread for return BEFORE releasing the reference
     lua_rawgeti(L, LUA_REGISTRYINDEX, thread_ref);
     if (!lua_isthread(L, -1)) {
         lua_pop(L, 1);
         lua_pushnil(L);
+    }
+
+    // Release ref if coroutine completed or errored (yielded refs are owned by tasks)
+    if (status != LUA_YIELD) {
+        lua_unref(eng->L_, thread_ref);
     }
     return 1;
 }
@@ -2086,4 +2103,5 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
 
