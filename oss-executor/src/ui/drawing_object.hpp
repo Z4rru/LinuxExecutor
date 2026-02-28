@@ -2,76 +2,49 @@
 #pragma once
 
 #include <string>
-#include <cstdint>
-
-// Forward-declare so we don't pull in all of cairo.h
-struct _cairo_surface;
-typedef struct _cairo_surface cairo_surface_t;
+#include <cairo.h>
 
 namespace oss {
 
 struct DrawingObject {
-    enum class Type {
-        None = 0,
-        Line,
-        Text,
-        Image,
-        Circle,
-        Square,
-        Triangle,
-        Quad
-    };
+    enum class Type { Line, Text, Circle, Square, Triangle, Quad, Image };
 
-    Type type = Type::None;
-    int   id  = 0;
+    int id = 0;
+    Type type = Type::Line;
+    bool visible = true;
+    int z_index = 0;
 
-    // ── common properties ───────────────────────────────────────
-    bool  visible      = true;
-    int   z_index      = 0;
-    float transparency = 0.0f;
-    float thickness    = 1.0f;
-    float rounding     = 0.0f;
-    bool  filled       = false;
-    bool  outline      = false;
-    bool  center       = false;     // text center-alignment
+    double pos_x = 0, pos_y = 0;
+    double from_x = 0, from_y = 0, to_x = 0, to_y = 0;
+    double size_x = 0, size_y = 0;
+    double radius = 0;
+    double thickness = 1.0;
+    double transparency = 0.0;
+    double rounding = 0;
+    int num_sides = 64;
+    bool filled = true;
+    bool center = false;
+    bool outline = false;
 
-    // ── generic position / size ─────────────────────────────────
-    float pos_x  = 0.0f, pos_y  = 0.0f;
-    float size_x = 0.0f, size_y = 0.0f;
+    double color_r = 1.0, color_g = 1.0, color_b = 1.0;
+    double outline_r = 0, outline_g = 0, outline_b = 0;
 
-    // ── line end-points ─────────────────────────────────────────
-    float from_x = 0.0f, from_y = 0.0f;
-    float to_x   = 0.0f, to_y   = 0.0f;
+    double pa_x = 0, pa_y = 0;
+    double pb_x = 0, pb_y = 0;
+    double pc_x = 0, pc_y = 0;
 
-    // ── circle ──────────────────────────────────────────────────
-    float radius    = 0.0f;
-    int   num_sides = 0;
+    double qa_x = 0, qa_y = 0;
+    double qb_x = 0, qb_y = 0;
+    double qc_x = 0, qc_y = 0;
+    double qd_x = 0, qd_y = 0;
 
-    // ── colour (RGB, 0-1) ───────────────────────────────────────
-    float color_r   = 1.0f, color_g   = 1.0f, color_b   = 1.0f;
-    float outline_r = 0.0f, outline_g = 0.0f, outline_b = 0.0f;
-
-    // ── text ────────────────────────────────────────────────────
     std::string text;
-    float       text_size = 14.0f;
-    int         font      = 0;     // integer font selector (used in switch)
+    double text_size = 16.0;
+    int font = 0;
 
-    // ── triangle vertices ───────────────────────────────────────
-    float pa_x = 0.0f, pa_y = 0.0f;
-    float pb_x = 0.0f, pb_y = 0.0f;
-    float pc_x = 0.0f, pc_y = 0.0f;
-
-    // ── quad vertices ───────────────────────────────────────────
-    float qa_x = 0.0f, qa_y = 0.0f;
-    float qb_x = 0.0f, qb_y = 0.0f;
-    float qc_x = 0.0f, qc_y = 0.0f;
-    float qd_x = 0.0f, qd_y = 0.0f;
-
-    // ── image ───────────────────────────────────────────────────
-    float            image_w       = 0.0f;
-    float            image_h       = 0.0f;
-    std::string      image_path;
+    std::string image_path;
     cairo_surface_t* image_surface = nullptr;
+    double image_w = 0, image_h = 0;
 };
 
 } // namespace oss
