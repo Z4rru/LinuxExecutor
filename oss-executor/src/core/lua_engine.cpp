@@ -264,15 +264,19 @@ bool LuaEngine::init() {
 
     LOG_INFO("LuaEngine: Initializing embedded Luau VM");
 
-    // Reset state BEFORE creating VM so allocator tracking starts at zero
+       // Reset tracking BEFORE creating VM so allocator starts at zero
     next_task_id_    = 1;
     tasks_.clear();
     signals_.clear();
-    drawing_objects_.clear();
+    {
+        std::lock_guard<std::mutex> dlock(drawing_mutex_);
+        drawing_objects_.clear();
+    }
     next_drawing_id_ = 1;
     next_signal_id_  = 1;
     total_allocated_ = 0;
 
+    LOG_DEBUG("LuaEngine: Creating Luau state...");
     L_ = lua_newstate(lua_alloc, this);
     if (!L_) {
         last_error_ = "Failed to create Lua state";
@@ -280,21 +284,30 @@ bool LuaEngine::init() {
         return false;
     }
 
+    LOG_DEBUG("LuaEngine: Opening standard libraries...");
     luaL_openlibs(L_);
 
+    LOG_DEBUG("LuaEngine: Setting up callbacks and registry...");
     // Install interrupt for cancellation support
     lua_callbacks(L_)->interrupt = lua_interrupt;
 
-        // Store engine pointer in registry for retrieval from C functions
+    // Store engine pointer in registry for retrieval from C functions
     lua_pushlightuserdata(L_, this);
     lua_setfield(L_, LUA_REGISTRYINDEX, "__oss_engine");
 
+    LOG_DEBUG("LuaEngine: Setting up environment...");
     setup_environment();
+    LOG_DEBUG("LuaEngine: Registering custom libraries...");
     register_custom_libs();
+    LOG_DEBUG("LuaEngine: Registering task library...");
     register_task_lib();
+    LOG_DEBUG("LuaEngine: Registering drawing library...");
     register_drawing_lib();
+    LOG_DEBUG("LuaEngine: Registering signal library...");
     register_signal_lib();
+    LOG_DEBUG("LuaEngine: Setting up environment API...");
     Environment::instance().setup(L_);
+    LOG_DEBUG("LuaEngine: Applying sandbox...");
     sandbox();
 
     ready_.store(true, std::memory_order_release);
@@ -2147,6 +2160,7 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
 
 
 
