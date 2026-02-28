@@ -45,8 +45,24 @@ private:
     void register_websocket_lib  (lua_State* L);
 
     // ── UI / bridge layers ─────────────────────────────────
+        // ── UI / bridge layers ─────────────────────────────────
     void register_gui_bridge     (lua_State* L);
     void register_roblox_mock    (lua_State* L);
+
+    // ── Setup helpers (called from setup(LuaEngine&)) ──────
+    void setup_debug_lib         (LuaEngine& engine);
+    void setup_cache_lib         (LuaEngine& engine);
+    void setup_metatable_lib     (LuaEngine& engine);
+    void setup_input_lib         (LuaEngine& engine);
+    void setup_instance_lib      (LuaEngine& engine);
+    void setup_script_lib        (LuaEngine& engine);
+    void setup_websocket_lib     (LuaEngine& engine);
+    void setup_thread_lib        (LuaEngine& engine);
+    void setup_closure_lib       (LuaEngine& engine);
+    void setup_drawing_bridge    (LuaEngine& engine);
+    void setup_gui_bridge        (LuaEngine& engine);
+    void setup_roblox_mock       (LuaEngine& engine);
 };
 
 } // namespace oss
+
