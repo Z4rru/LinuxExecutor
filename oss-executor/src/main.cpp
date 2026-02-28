@@ -1,9 +1,3 @@
-// src/main.cpp
-// Entry point — wires together Logger → Config → Executor → App
-
-// ── GIO/GTK environment fixups ──────────────────────────────────────────────
-// Must run before any GLib constructor (priority < 200).
-
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
@@ -20,8 +14,6 @@ static void fix_gio_before_anything() {
     setenv("NO_AT_BRIDGE",         "1",     0);
 }
 
-// ── Normal includes ─────────────────────────────────────────────────────────
-
 #include "ui/app.hpp"
 #include "core/executor.hpp"
 #include "utils/logger.hpp"
@@ -31,16 +23,12 @@ static void fix_gio_before_anything() {
 #include <iostream>
 #include <filesystem>
 
-// ── Async-signal-safe shutdown ──────────────────────────────────────────────
-
 static void signal_handler(int sig) {
     static constexpr char msg[] = "\n[!] Signal received, shutting down...\n";
     ssize_t unused = write(STDERR_FILENO, msg, sizeof(msg) - 1);
     (void)unused;
     _exit(128 + sig);
 }
-
-// ── Banner ──────────────────────────────────────────────────────────────────
 
 #ifndef APP_VERSION
 #define APP_VERSION "2.0.0"
@@ -58,8 +46,6 @@ static void print_banner() {
         "   ╚═══════════════════════════════════════════╝\n"
         << std::endl;
 }
-
-// ── Ensure home directories exist ───────────────────────────────────────────
 
 static void ensure_home_dirs(const std::string& home) {
     static constexpr const char* subdirs[] = {
@@ -79,10 +65,7 @@ static void ensure_home_dirs(const std::string& home) {
     }
 }
 
-// ── main ────────────────────────────────────────────────────────────────────
-
 int main(int argc, char** argv) {
-    // ── 1. Signal handlers ──
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
@@ -92,27 +75,18 @@ int main(int argc, char** argv) {
     int exit_code = 0;
 
     try {
-        // ── 2. Config (singleton — constructor creates home dirs) ──
-        // Must come before Logger so we know the log directory.
         auto& config = oss::Config::instance();
         std::string home = config.home_dir();
 
-        // ── 3. Logger ──
-        // Logger::init is STATIC — no instance() call.
-        // Signature: static void init(const std::string& log_dir = ".")
         oss::Logger::init(home + "/logs");
         LOG_INFO("OSS Executor v{} starting", APP_VERSION);
 
-        // ── 4. Load config file ──
-        // Config::load requires a path argument.
         std::string config_path = home + "/config.json";
         config.load(config_path);
         LOG_INFO("Configuration loaded from {}", config_path);
 
-        // ── 5. Home directory tree ──
         ensure_home_dirs(home);
 
-        // ── 6. Executor (Lua engine + hooks + injection) ──
         auto& executor = oss::Executor::instance();
 
         executor.set_output_callback([](const std::string& msg) {
@@ -135,18 +109,15 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // ── 7. Auto-execute startup scripts ──
         if (config.get<bool>("executor.autoexec_on_start", true)) {
             executor.auto_execute();
         }
 
-        // ── 8. GTK Application ──
         LOG_INFO("Starting UI...");
         oss::App app(argc, argv);
         exit_code = app.run();
         LOG_INFO("UI exited with code {}", exit_code);
 
-        // ── 9. Graceful shutdown (reverse order) ──
         executor.shutdown();
         oss::Logger::shutdown();
         LOG_INFO("OSS Executor shut down cleanly");
