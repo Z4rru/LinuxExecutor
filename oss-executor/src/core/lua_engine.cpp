@@ -389,7 +389,7 @@ std::string LuaEngine::compile(const std::string& source) {
     options.debugLevel        = 1;
     options.coverageLevel     = 0;
 
-    std::string bytecode = Luau::compile(std::string(source, len), options);
+    std::string bytecode = Luau::compile(source, options);
 
     if (bytecode.empty()) {
         last_error_ = "Compilation produced empty bytecode";
@@ -2169,6 +2169,7 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
 
 
 
