@@ -90,6 +90,14 @@ public:
     std::vector<uint8_t> read_bytes(uintptr_t address, size_t size);
     bool write_bytes(uintptr_t address, const std::vector<uint8_t>& bytes);
 
+    bool read(uintptr_t address, void* buffer, size_t size) {
+        return read_raw(address, buffer, size);
+    }
+
+    bool write(uintptr_t address, const void* buffer, size_t size) {
+        return write_raw(address, buffer, size);
+    }
+
     template<typename T>
     std::optional<T> read(uintptr_t address) {
         T value{};
