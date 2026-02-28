@@ -13,6 +13,9 @@ namespace oss {
 class Closures {
 public:
     static void register_all(lua_State* L);
+    static void cancel_execution();
+    static void reset_cancellation();
+    static void pump_deferred();
 
     struct HookEntry {
         int original_ref = LUA_NOREF;
@@ -20,7 +23,6 @@ public:
         std::string name;
     };
 
-    // ── Globals ──────────────────────────────────────────────
     static int l_print(lua_State* L);
     static int l_warn(lua_State* L);
     static int l_wait(lua_State* L);
@@ -30,7 +32,6 @@ public:
     static int l_typeof(lua_State* L);
     static int l_tick(lua_State* L);
 
-    // ── Instance ─────────────────────────────────────────────
     static int l_instance_new(lua_State* L);
     static int l_instance_index(lua_State* L);
     static int l_instance_newindex(lua_State* L);
@@ -41,7 +42,6 @@ public:
     static int l_instance_waitforchild(lua_State* L);
     static int l_instance_isA(lua_State* L);
 
-    // ── Data Types ───────────────────────────────────────────
     static int l_color3_new(lua_State* L);
     static int l_color3_fromRGB(lua_State* L);
     static int l_color3_fromHSV(lua_State* L);
@@ -57,19 +57,16 @@ public:
     static int l_colorsequence_new(lua_State* L);
     static int l_numbersequence_new(lua_State* L);
 
-    // ── Drawing ──────────────────────────────────────────────
     static int l_drawing_new(lua_State* L);
     static int l_drawing_index(lua_State* L);
     static int l_drawing_newindex(lua_State* L);
     static int l_drawing_remove(lua_State* L);
     static int l_cleardrawcache(lua_State* L);
 
-    // ── Services / Game ──────────────────────────────────────
     static int l_game_getservice(lua_State* L);
     static int l_game_httpget(lua_State* L);
     static int l_game_index(lua_State* L);
 
-    // ── Executor ─────────────────────────────────────────────
     static int l_getgenv(lua_State* L);
     static int l_getrenv(lua_State* L);
     static int l_getrawmetatable(lua_State* L);
@@ -84,7 +81,6 @@ public:
     static int l_gethui(lua_State* L);
     static int l_setfpscap(lua_State* L);
 
-    // ── Closure Manipulation ─────────────────────────────────
     static int l_isexecutorclosure(lua_State* L);
     static int l_hookfunction(lua_State* L);
     static int l_hookmetamethod(lua_State* L);
@@ -100,7 +96,6 @@ public:
     static int get_calling_script(lua_State* L);
     static int newlclosure(lua_State* L);
 
-    // ── File System ──────────────────────────────────────────
     static int l_readfile(lua_State* L);
     static int l_writefile(lua_State* L);
     static int l_isfile(lua_State* L);
@@ -110,7 +105,6 @@ public:
     static int l_delfile(lua_State* L);
     static int l_appendfile(lua_State* L);
 
-    // ── Task Library ─────────────────────────────────────────
     static int l_task_wait(lua_State* L);
     static int l_task_spawn(lua_State* L);
     static int l_task_defer(lua_State* L);
@@ -118,7 +112,6 @@ public:
     static int l_task_cancel(lua_State* L);
 
 private:
-    // ── Internal closure plumbing ────────────────────────────
     static int wrap_closure(lua_State* L);
     static int closure_handler(lua_State* L);
     static int get_script_closure(lua_State* L);
