@@ -1,28 +1,38 @@
-cmake_minimum_required(VERSION 3.16)
-project(OSSExecutor VERSION 2.0.0 LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.20)
+project(oss-executor VERSION 2.0.0 LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(GTK4   REQUIRED IMPORTED_TARGET gtk4)
-pkg_check_modules(LUAJIT REQUIRED IMPORTED_TARGET luajit)
-pkg_check_modules(CAIRO  REQUIRED IMPORTED_TARGET cairo)
+option(OSS_BUILD_TESTS "Build unit tests" OFF)
 
+# ── System dependencies ──
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
 find_package(CURL    REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
+# ── Luau (always fetched) ──
 include(FetchContent)
+FetchContent_Declare(Luau
+    GIT_REPOSITORY https://github.com/luau-lang/luau.git
+    GIT_TAG        0.620
+    GIT_SHALLOW    TRUE)
+set(LUAU_BUILD_CLI   OFF CACHE BOOL "" FORCE)
+set(LUAU_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LUAU_BUILD_WEB   OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(Luau)
 
+# ── spdlog (find-or-fetch) ──
 find_package(spdlog 1.12 QUIET CONFIG)
 if(NOT spdlog_FOUND)
-    message(STATUS "spdlog not found — fetching via FetchContent")
     FetchContent_Declare(spdlog
         GIT_REPOSITORY https://github.com/gabime/spdlog.git
         GIT_TAG        v1.13.0
@@ -31,9 +41,9 @@ if(NOT spdlog_FOUND)
     FetchContent_MakeAvailable(spdlog)
 endif()
 
+# ── nlohmann_json (find-or-fetch) ──
 find_package(nlohmann_json 3.11 QUIET CONFIG)
 if(NOT nlohmann_json_FOUND)
-    message(STATUS "nlohmann_json not found — fetching via FetchContent")
     FetchContent_Declare(json
         GIT_REPOSITORY https://github.com/nlohmann/json.git
         GIT_TAG        v3.11.3
@@ -41,6 +51,7 @@ if(NOT nlohmann_json_FOUND)
     FetchContent_MakeAvailable(json)
 endif()
 
+# ── Main executable (explicit sources) ──
 set(SOURCES
     src/main.cpp
     src/core/executor.cpp
@@ -70,6 +81,10 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${Luau_SOURCE_DIR}/Compiler/include
+    ${Luau_SOURCE_DIR}/Ast/include
+    ${Luau_SOURCE_DIR}/VM/include
+    ${Luau_SOURCE_DIR}/Common/include
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
@@ -78,28 +93,46 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::GTK4
-    PkgConfig::LUAJIT
-    PkgConfig::CAIRO
     CURL::libcurl
     OpenSSL::SSL
     OpenSSL::Crypto
     Threads::Threads
+    Luau.Compiler
+    Luau.Ast
+    Luau.VM
     spdlog::spdlog
     nlohmann_json::nlohmann_json
     ${CMAKE_DL_LIBS}
     m
 )
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
-   CMAKE_CXX_COMPILER_VERSION VERSION_LESS "9.0")
-    target_link_libraries(${PROJECT_NAME} PRIVATE stdc++fs)
-endif()
-
 target_compile_options(${PROJECT_NAME} PRIVATE
-    -Wall -Wextra -Wpedantic
-    -Wno-unused-parameter
+    -Wall -Wextra -Wpedantic -Wno-unused-parameter
 )
 
+# ── Injection payload shared library ──
+add_library(oss-payload SHARED src/core/payload.cpp)
+
+target_include_directories(oss-payload PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${Luau_SOURCE_DIR}/Compiler/include
+    ${Luau_SOURCE_DIR}/Ast/include
+    ${Luau_SOURCE_DIR}/VM/include
+    ${Luau_SOURCE_DIR}/VM/src
+    ${Luau_SOURCE_DIR}/Common/include
+)
+
+target_link_libraries(oss-payload PRIVATE
+    Luau.Compiler Luau.Ast Luau.VM
+    Threads::Threads ${CMAKE_DL_LIBS}
+)
+
+set_target_properties(oss-payload PROPERTIES
+    OUTPUT_NAME "oss_payload"
+    PREFIX      "lib"
+)
+
+# ── Post-build resource copy ──
 if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -107,7 +140,11 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
             $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources)
 endif()
 
-install(TARGETS ${PROJECT_NAME} DESTINATION bin)
+# ── Install ──
+install(TARGETS ${PROJECT_NAME} oss-payload
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib)
 install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
+install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
