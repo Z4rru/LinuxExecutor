@@ -1,3 +1,4 @@
+// src/ui/overlay.cpp
 #include "overlay.hpp"
 #include <cmath>
 #include <algorithm>
@@ -131,6 +132,19 @@ int Overlay::create_object(DrawingObject::Type type) {
     objects_[id] = std::move(obj);
     dirty_.store(true, std::memory_order_release);
     return id;
+}
+
+void Overlay::create_object_with_id(int id, DrawingObject::Type type) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    DrawingObject obj;
+    obj.id   = id;
+    obj.type = type;
+    objects_[id] = std::move(obj);
+    // Keep next_id_ ahead of any caller-chosen ID
+    if (id >= next_id_) {
+        next_id_ = id + 1;
+    }
+    dirty_.store(true, std::memory_order_release);
 }
 
 void Overlay::remove_object(int id) {
