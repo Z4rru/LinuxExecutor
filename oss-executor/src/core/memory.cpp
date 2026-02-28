@@ -1,4 +1,3 @@
-
 #include "memory.hpp"
 #include "utils/logger.hpp"
 
@@ -20,10 +19,6 @@
 #endif
 
 namespace oss {
-
-// =============================================================================
-//  AOBPattern
-// =============================================================================
 
 AOBPattern AOBPattern::from_ida(const std::string& pattern) {
     AOBPattern result;
@@ -51,10 +46,6 @@ AOBPattern AOBPattern::from_code_style(const std::vector<uint8_t>& pattern,
         result.mask[i] = (mask[i] == 'x');
     return result;
 }
-
-// =============================================================================
-//  Static process discovery
-// =============================================================================
 
 std::optional<pid_t> Memory::find_process(const std::string& name) {
     for (const auto& entry : std::filesystem::directory_iterator("/proc")) {
@@ -136,10 +127,6 @@ std::vector<pid_t> Memory::find_all_processes(const std::string& name) {
     return results;
 }
 
-// =============================================================================
-//  Lifetime
-// =============================================================================
-
 Memory::Memory(pid_t pid) : pid_(pid) {}
 
 Memory::~Memory() {
@@ -181,10 +168,6 @@ Memory& Memory::operator=(Memory&& other) noexcept {
     return *this;
 }
 
-// =============================================================================
-//  Accessors
-// =============================================================================
-
 void Memory::set_pid(pid_t pid) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pid_ != pid) {
@@ -203,10 +186,6 @@ pid_t Memory::target_pid()  const { return pid_;      }
 bool  Memory::is_valid()    const { return pid_ > 0;  }
 bool  Memory::is_attached() const { return attached_;  }
 
-// =============================================================================
-//  File descriptor helpers
-// =============================================================================
-
 int Memory::open_mem(int flags) {
     if (pid_ <= 0) return -1;
     std::string path = "/proc/" + std::to_string(pid_) + "/mem";
@@ -220,22 +199,16 @@ void Memory::close_mem() {
     }
 }
 
-// =============================================================================
-//  Attach / detach
-// =============================================================================
-
 bool Memory::attach() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (pid_ <= 0) return false;
 
     close_mem();
 
-    // Try read-write first (needed for write_raw via pwrite64)
     mem_fd_ = open_mem(O_RDWR);
     if (mem_fd_ < 0) {
         mem_fd_ = open_mem(O_RDONLY);
         if (mem_fd_ < 0) {
-            // Try ptrace attach to gain permissions, then retry
             if (ptrace(PTRACE_ATTACH, pid_, nullptr, nullptr) == 0) {
                 int status;
                 waitpid(pid_, &status, 0);
@@ -263,7 +236,6 @@ bool Memory::attach(pid_t pid) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (attached_ && pid_ == pid) return true;
 
-    // Inline detach (cannot call detach() — would deadlock on mutex_)
     close_mem();
     attached_        = false;
     regions_cached_  = false;
@@ -310,10 +282,6 @@ void Memory::detach() {
     total_scanned_   = 0;
     regions_scanned_ = 0;
 }
-
-// =============================================================================
-//  Region helpers
-// =============================================================================
 
 std::vector<MemoryRegion> Memory::get_regions(bool refresh) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -402,11 +370,7 @@ std::vector<MemoryRegion> Memory::get_readable_regions() {
     size_t total_size = 0;
     for (auto& r : all) {
         if (!r.readable()) continue;
-
-        // Skip special kernel regions
         if (r.path == "[vvar]" || r.path == "[vsyscall]") continue;
-
-        // Skip very small regions (< 4 KiB)
         if (r.size() < 4096) continue;
 
         result.push_back(r);
@@ -457,10 +421,6 @@ Memory::get_module_size(const std::string& module_name) {
     return std::nullopt;
 }
 
-// =============================================================================
-//  Raw read / write
-// =============================================================================
-
 bool Memory::read_proc_mem(uintptr_t addr, void* buf, size_t len) {
     if (mem_fd_ < 0) return false;
     ssize_t result = ::pread64(mem_fd_, buf, len, static_cast<off64_t>(addr));
@@ -478,18 +438,15 @@ bool Memory::read_process_vm(uintptr_t addr, void* buf, size_t len) {
 bool Memory::read_raw(uintptr_t address, void* buffer, size_t size) {
     if (pid_ <= 0 || !buffer || size == 0) return false;
 
-    // Prefer /proc/pid/mem fd (fast, no context-switch per call)
     if (read_proc_mem(address, buffer, size))
         return true;
 
-    // Fallback: process_vm_readv
     return read_process_vm(address, buffer, size);
 }
 
 bool Memory::write_raw(uintptr_t address, const void* buffer, size_t size) {
     if (pid_ <= 0 || !buffer || size == 0) return false;
 
-    // Prefer /proc/pid/mem fd (needs O_RDWR)
     if (mem_fd_ >= 0) {
         ssize_t result = ::pwrite64(mem_fd_, buffer, size,
                                     static_cast<off64_t>(address));
@@ -497,7 +454,6 @@ bool Memory::write_raw(uintptr_t address, const void* buffer, size_t size) {
             return true;
     }
 
-    // Fallback: process_vm_writev
     {
         struct iovec local_iov  = { const_cast<void*>(buffer), size };
         struct iovec remote_iov = { reinterpret_cast<void*>(address), size };
@@ -507,7 +463,6 @@ bool Memory::write_raw(uintptr_t address, const void* buffer, size_t size) {
             return true;
     }
 
-    // Last resort: ptrace word-by-word write
     if (ptrace(PTRACE_ATTACH, pid_, nullptr, nullptr) != 0)
         return false;
     int status;
@@ -546,10 +501,6 @@ bool Memory::write_raw_v(uintptr_t address, const void* buffer, size_t size) {
     ssize_t result = process_vm_writev(pid_, &local_iov, 1, &remote_iov, 1, 0);
     return result == static_cast<ssize_t>(size);
 }
-
-// =============================================================================
-//  Byte / string / pointer helpers
-// =============================================================================
 
 std::vector<uint8_t> Memory::read_bytes(uintptr_t address, size_t size) {
     std::vector<uint8_t> result(size);
@@ -612,14 +563,9 @@ std::optional<uintptr_t> Memory::resolve_pointer_chain(
     return current;
 }
 
-// =============================================================================
-//  Batch I/O
-// =============================================================================
-
 void Memory::batch_read(std::vector<BatchReadEntry>& entries) {
     if (pid_ <= 0 || entries.empty()) return;
 
-    // Fast path: pread64 per entry
     if (mem_fd_ >= 0) {
         for (auto& e : entries) {
             ssize_t r = ::pread64(mem_fd_, e.buffer, e.size,
@@ -629,7 +575,6 @@ void Memory::batch_read(std::vector<BatchReadEntry>& entries) {
         return;
     }
 
-    // Vectorised path with IOV_MAX batching
     size_t offset = 0;
     while (offset < entries.size()) {
         size_t batch_count = std::min(entries.size() - offset, MAX_IOV_COUNT);
@@ -667,7 +612,6 @@ void Memory::batch_read(std::vector<BatchReadEntry>& entries) {
 void Memory::batch_write(std::vector<BatchWriteEntry>& entries) {
     if (pid_ <= 0 || entries.empty()) return;
 
-    // Fast path: pwrite64 per entry
     if (mem_fd_ >= 0) {
         for (auto& e : entries) {
             ssize_t r = ::pwrite64(mem_fd_, e.buffer, e.size,
@@ -677,7 +621,6 @@ void Memory::batch_write(std::vector<BatchWriteEntry>& entries) {
         return;
     }
 
-    // Vectorised path with IOV_MAX batching
     size_t offset = 0;
     while (offset < entries.size()) {
         size_t batch_count = std::min(entries.size() - offset, MAX_IOV_COUNT);
@@ -711,10 +654,6 @@ void Memory::batch_write(std::vector<BatchWriteEntry>& entries) {
         offset += batch_count;
     }
 }
-
-// =============================================================================
-//  AOB / pattern scanning
-// =============================================================================
 
 std::optional<uintptr_t> Memory::pattern_scan(
     const std::vector<uint8_t>& pattern,
@@ -859,10 +798,6 @@ Memory::aob_scan_all_regions(const std::string& ida_pattern,
     return results;
 }
 
-// =============================================================================
-//  Classic pattern scanning (scored, multi-pattern)
-// =============================================================================
-
 std::vector<PatternResult> Memory::scan_pattern(
     const std::vector<MemoryRegion>& regions,
     const uint8_t* pattern,
@@ -935,10 +870,6 @@ uintptr_t Memory::find_pattern_first(
     return 0;
 }
 
-// =============================================================================
-//  Luau state discovery
-// =============================================================================
-
 LuauStateInfo Memory::find_luau_state() {
     if (!attached_) return {};
 
@@ -950,7 +881,6 @@ LuauStateInfo Memory::find_luau_state() {
 
     LOG_INFO("Scanning {} regions for Luau state...", regions.size());
 
-    // Strategy 1: Find task scheduler via known patterns
     auto result = scan_for_task_scheduler(regions);
     if (result.valid) {
         LOG_INFO("Found Luau state via TaskScheduler at 0x{:x} (confidence {}%)",
@@ -958,7 +888,6 @@ LuauStateInfo Memory::find_luau_state() {
         return result;
     }
 
-    // Strategy 2: Direct lua_State scan
     result = scan_for_lua_state_direct(regions);
     if (result.valid) {
         LOG_INFO("Found Luau state via direct scan at 0x{:x} (confidence {}%)",
@@ -966,7 +895,6 @@ LuauStateInfo Memory::find_luau_state() {
         return result;
     }
 
-    // Strategy 3: String table scan
     result = scan_for_string_table(regions);
     if (result.valid) {
         LOG_INFO("Found Luau state via string table at 0x{:x} (confidence {}%)",
@@ -1044,7 +972,6 @@ LuauStateInfo Memory::scan_for_lua_state_direct(
         }
     }
 
-    // Also add all writable anonymous regions not already included
     for (const auto& r : regions) {
         if (r.writable() && r.is_private() && r.path.empty() &&
             r.size() >= 65536) {
@@ -1235,10 +1162,6 @@ bool Memory::validate_global_state(uintptr_t addr) {
     return valid_ptrs >= 5;
 }
 
-// =============================================================================
-//  Remote memory allocation (syscall injection via ptrace)
-// =============================================================================
-
 uintptr_t Memory::remote_alloc(size_t size, int prot) {
 #if defined(__x86_64__)
     if (pid_ <= 0) return 0;
@@ -1255,20 +1178,18 @@ uintptr_t Memory::remote_alloc(size_t size, int prot) {
     ptrace(PTRACE_GETREGS, pid_, nullptr, &orig_regs);
     regs = orig_regs;
 
-    // mmap syscall (9 on x86_64)
     regs.rax = 9;
     regs.rdi = 0;
     regs.rsi = size;
     regs.rdx = prot;
-    regs.r10 = 0x22;                   // MAP_PRIVATE | MAP_ANONYMOUS
-    regs.r8  = static_cast<uintptr_t>(-1);  // fd = -1
+    regs.r10 = 0x22;
+    regs.r8  = static_cast<uintptr_t>(-1);
     regs.r9  = 0;
 
     uintptr_t rip = orig_regs.rip;
     long orig_word = ptrace(PTRACE_PEEKTEXT, pid_,
                             reinterpret_cast<void*>(rip), nullptr);
 
-    // Write syscall instruction (0x050F)
     long syscall_insn = (orig_word & ~0xFFFF) | 0x050F;
     ptrace(PTRACE_POKETEXT, pid_, reinterpret_cast<void*>(rip),
            reinterpret_cast<void*>(syscall_insn));
@@ -1280,7 +1201,6 @@ uintptr_t Memory::remote_alloc(size_t size, int prot) {
     ptrace(PTRACE_GETREGS, pid_, nullptr, &regs);
     uintptr_t result = regs.rax;
 
-    // Restore original instruction and registers
     ptrace(PTRACE_POKETEXT, pid_, reinterpret_cast<void*>(rip),
            reinterpret_cast<void*>(orig_word));
     ptrace(PTRACE_SETREGS, pid_, nullptr, &orig_regs);
@@ -1312,7 +1232,6 @@ bool Memory::remote_free(uintptr_t addr, size_t size) {
     ptrace(PTRACE_GETREGS, pid_, nullptr, &orig_regs);
     regs = orig_regs;
 
-    // munmap syscall (11 on x86_64)
     regs.rax = 11;
     regs.rdi = addr;
     regs.rsi = size;
@@ -1340,10 +1259,6 @@ bool Memory::remote_free(uintptr_t addr, size_t size) {
     return false;
 #endif
 }
-
-// =============================================================================
-//  Patching
-// =============================================================================
 
 bool Memory::nop_bytes(uintptr_t address, size_t count) {
 #if defined(__aarch64__)
@@ -1385,10 +1300,6 @@ bool Memory::patch_bytes(uintptr_t address,
     }
     return write_bytes(address, bytes);
 }
-
-// =============================================================================
-//  Deferred buffers
-// =============================================================================
 
 size_t Memory::flush_write_buffer(WriteBuffer& buffer) {
     if (buffer.empty()) return 0;
