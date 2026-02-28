@@ -4,6 +4,12 @@
 #include "utils/crypto.hpp"
 #include "utils/config.hpp"
 #include "api/environment.hpp"
+#include "../utils/logger.hpp"
+
+#include "lua.h"
+#include "lualib.h"
+#include "luacode.h"
+#include "Luau/Compiler.h"
 
 #include <filesystem>
 #include <fstream>
@@ -12,6 +18,7 @@
 #include <cstring>
 #include <array>
 #include <algorithm>
+#include <cstdlib>
 
 namespace oss {
 
@@ -35,8 +42,8 @@ static LuaEngine* get_engine(lua_State* L) {
 static const char* DRAWING_OBJ_MT = "DrawingObject";
 
 struct DrawingHandle {
-    int id;
-    bool removed; // Track removal state to prevent use-after-free
+    int  id;
+    bool removed;
 };
 
 static DrawingObject::Type parse_drawing_type(const char* s) {
@@ -52,16 +59,13 @@ static DrawingObject::Type parse_drawing_type(const char* s) {
     return DrawingObject::Type::Line;
 }
 
-// Reads {X=,Y=} or {[1],[2]} into x,y
 static bool read_vec2(lua_State* L, int idx, double& x, double& y) {
     if (!lua_istable(L, idx)) return false;
-
     int abs_idx = (idx > 0) ? idx : lua_gettop(L) + idx + 1;
 
     lua_getfield(L, abs_idx, "X");
     if (lua_isnumber(L, -1)) {
-        x = lua_tonumber(L, -1);
-        lua_pop(L, 1);
+        x = lua_tonumber(L, -1); lua_pop(L, 1);
         lua_getfield(L, abs_idx, "Y");
         if (lua_isnumber(L, -1)) y = lua_tonumber(L, -1);
         lua_pop(L, 1);
@@ -78,16 +82,13 @@ static bool read_vec2(lua_State* L, int idx, double& x, double& y) {
     return true;
 }
 
-// Reads {R=,G=,B=} or {[1],[2],[3]} into r,g,b
 static bool read_color(lua_State* L, int idx, double& r, double& g, double& b) {
     if (!lua_istable(L, idx)) return false;
-
     int abs_idx = (idx > 0) ? idx : lua_gettop(L) + idx + 1;
 
     lua_getfield(L, abs_idx, "R");
     if (lua_isnumber(L, -1)) {
-        r = lua_tonumber(L, -1);
-        lua_pop(L, 1);
+        r = lua_tonumber(L, -1); lua_pop(L, 1);
         lua_getfield(L, abs_idx, "G");
         if (lua_isnumber(L, -1)) g = lua_tonumber(L, -1);
         lua_pop(L, 1);
@@ -131,14 +132,79 @@ static DrawingHandle* check_drawing_handle(lua_State* L, int idx) {
     auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, idx, DRAWING_OBJ_MT));
     if (h->removed) {
         luaL_error(L, "Drawing object has been removed");
-        return nullptr; // unreachable after luaL_error
+        return nullptr;
     }
     return h;
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle
+// Signal helper structs
 // ---------------------------------------------------------------------------
+
+struct SignalUserdata {
+    char name[128];
+    bool destroyed;
+};
+
+static SignalUserdata* check_signal_ud(lua_State* L, int idx) {
+    auto* ud = static_cast<SignalUserdata*>(luaL_checkudata(L, idx, "SignalObject"));
+    if (ud->destroyed)
+        luaL_error(L, "Signal has been destroyed");
+    return ud;
+}
+
+struct ConnUD {
+    char sig_name[128];
+    int  conn_id;
+    bool disconnected;
+};
+
+// ===========================================================================
+// Singleton
+// ===========================================================================
+
+LuaEngine& LuaEngine::instance() {
+    static LuaEngine inst;
+    return inst;
+}
+
+// ===========================================================================
+// Luau custom allocator with memory cap
+// ===========================================================================
+
+void* LuaEngine::lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
+    auto* engine = static_cast<LuaEngine*>(ud);
+
+    if (nsize == 0) {
+        engine->total_allocated_ -= osize;
+        free(ptr);
+        return nullptr;
+    }
+
+    if (engine->total_allocated_ - osize + nsize > MAX_MEMORY) {
+        LOG_ERROR("LuaEngine: Memory limit exceeded ({} MB)",
+                  MAX_MEMORY / (1024 * 1024));
+        return nullptr;
+    }
+
+    engine->total_allocated_ += nsize - osize;
+    return realloc(ptr, nsize);
+}
+
+// ===========================================================================
+// Luau interrupt callback (instruction quota hook)
+// ===========================================================================
+
+void LuaEngine::lua_interrupt(lua_State* L, int gc) {
+    (void)gc;
+    auto* eng = get_engine(L);
+    if (eng && !eng->is_running())
+        luaL_error(L, "Script execution cancelled");
+}
+
+// ===========================================================================
+// Lifecycle
+// ===========================================================================
 
 LuaEngine::LuaEngine() = default;
 
@@ -148,31 +214,44 @@ bool LuaEngine::init() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (L_) shutdown_internal();
 
-    L_ = luaL_newstate();
-    if (!L_) { LOG_ERROR("Failed to create Lua state"); return false; }
+    LOG_INFO("LuaEngine: Initializing embedded Luau VM");
+
+    L_ = lua_newstate(lua_alloc, this);
+    if (!L_) {
+        last_error_ = "Failed to create Lua state";
+        LOG_ERROR("LuaEngine: {}", last_error_);
+        return false;
+    }
 
     luaL_openlibs(L_);
 
+    // Install interrupt for cancellation support
+    lua_callbacks(L_)->interrupt = lua_interrupt;
+
+    // Store engine pointer in registry for retrieval from C functions
     lua_pushlightuserdata(L_, this);
     lua_setfield(L_, LUA_REGISTRYINDEX, "__oss_engine");
 
-    // Reset task scheduler state
-    next_task_id_ = 1;
+    // Reset scheduler / drawing / signal state
+    next_task_id_    = 1;
     tasks_.clear();
     signals_.clear();
     drawing_objects_.clear();
     next_drawing_id_ = 1;
+    next_signal_id_  = 1;
+    total_allocated_ = 0;
 
     setup_environment();
     register_custom_libs();
     register_task_lib();
     register_drawing_lib();
     register_signal_lib();
-    Environment::setup(*this);
+    Environment::instance().setup(L_);
     sandbox();
 
+    ready_.store(true, std::memory_order_release);
     running_ = true;
-    LOG_INFO("Lua engine initialized (LuaJIT)");
+    LOG_INFO("LuaEngine: VM initialized successfully");
     return true;
 }
 
@@ -182,6 +261,7 @@ void LuaEngine::shutdown() {
 }
 
 void LuaEngine::shutdown_internal() {
+    ready_.store(false, std::memory_order_release);
     running_ = false;
 
     // Clean up tasks — release all Lua refs before closing state
@@ -197,7 +277,7 @@ void LuaEngine::shutdown_internal() {
     }
     tasks_.clear();
 
-    // Clean up signals — release callback refs
+    // Clean up signals
     if (L_) {
         for (auto& [name, sig] : signals_) {
             for (auto& conn : sig.connections) {
@@ -210,7 +290,7 @@ void LuaEngine::shutdown_internal() {
     }
     signals_.clear();
 
-    // Clean up drawing object store
+    // Clean up drawing objects
     {
         std::lock_guard<std::mutex> dlock(drawing_mutex_);
         for (auto& [id, obj] : drawing_objects_) {
@@ -221,89 +301,179 @@ void LuaEngine::shutdown_internal() {
         }
         drawing_objects_.clear();
     }
-
-    // Also tell the overlay to drop everything
     Overlay::instance().clear_objects();
 
+    // Drain script queue
+    {
+        std::lock_guard<std::mutex> ql(queue_mutex_);
+        while (!script_queue_.empty()) script_queue_.pop();
+    }
+
     if (L_) { lua_close(L_); L_ = nullptr; }
+
+    LOG_INFO("LuaEngine: Shutdown complete");
 }
 
 void LuaEngine::reset() { shutdown(); init(); }
 
-// ---------------------------------------------------------------------------
-// Execution
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Luau bytecode compiler
+// ===========================================================================
 
-bool LuaEngine::execute(const std::string& script, const std::string& chunk_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return execute_internal(script, chunk_name);
+std::string LuaEngine::compile(const std::string& source) {
+    Luau::CompileOptions options;
+    options.optimizationLevel = 1;
+    options.debugLevel        = 1;
+    options.coverageLevel     = 0;
+
+    std::string bytecode = Luau::compile(source, options);
+
+    if (bytecode.empty()) {
+        last_error_ = "Compilation produced empty bytecode";
+        return "";
+    }
+
+    // Luau convention: bytecode[0] == 0 means compile error, message follows
+    if (bytecode[0] == 0) {
+        last_error_ = "Compile error: " + bytecode.substr(1);
+        LOG_ERROR("LuaEngine: {}", last_error_);
+        return "";
+    }
+
+    return bytecode;
 }
 
-bool LuaEngine::execute_internal(const std::string& script,
+// ===========================================================================
+// Execution
+// ===========================================================================
+
+bool LuaEngine::execute(const std::string& source,
+                         const std::string& chunk_name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return execute_internal(source, chunk_name);
+}
+
+bool LuaEngine::execute_internal(const std::string& source,
                                   const std::string& chunk_name) {
-    if (!L_) {
-        if (error_cb_) error_cb_({"Engine not initialized", -1, chunk_name});
+    if (!L_ || !ready_.load()) {
+        last_error_ = "VM not initialized";
+        if (error_cb_) error_cb_({last_error_, -1, chunk_name});
+        if (exec_cb_)  exec_cb_(false, last_error_);
         return false;
     }
 
     running_.store(true, std::memory_order_release);
     current_engine = this;
-    int base_top = lua_gettop(L_);
 
-    lua_sethook(L_, [](lua_State* L, lua_Debug*) {
-        auto* eng = get_engine(L);
-        if (eng && !eng->is_running())
-            luaL_error(L, "Script execution cancelled");
-    }, LUA_MASKCOUNT, 1000000);
-
-    int status = luaL_loadbuffer(L_, script.c_str(), script.size(),
-                                 chunk_name.c_str());
-    if (status != 0) {
-        std::string err = lua_tostring(L_, -1);
-        lua_settop(L_, base_top);
-        LuaError error;
-        error.message = err;
-        error.source = chunk_name;
-        auto c1 = err.find(':');
-        if (c1 != std::string::npos) {
-            auto c2 = err.find(':', c1 + 1);
-            if (c2 != std::string::npos)
-                try { error.line = std::stoi(err.substr(c1 + 1, c2 - c1 - 1)); }
-                catch (...) {}
-        }
-        if (error_cb_) error_cb_(error);
-        LOG_ERROR("Lua compile error: {}", err);
-        lua_sethook(L_, nullptr, 0, 0);
+    // Compile source to Luau bytecode
+    std::string bytecode = compile(source);
+    if (bytecode.empty()) {
+        if (error_cb_) error_cb_({last_error_, -1, chunk_name});
+        if (exec_cb_)  exec_cb_(false, last_error_);
         current_engine = nullptr;
         return false;
     }
 
-    lua_pushcfunction(L_, lua_pcall_handler);
-    lua_insert(L_, -2);
-    int handler_index = lua_gettop(L_) - 1;
-
-    status = lua_pcall(L_, 0, LUA_MULTRET, handler_index);
-
-    // Remove the handler
-    lua_remove(L_, handler_index);
-
-    if (status != 0) {
-        std::string err = lua_tostring(L_, -1);
-        lua_settop(L_, base_top);
-        LuaError error;
-        error.message = err;
-        error.source = chunk_name;
-        if (error_cb_) error_cb_(error);
-        LOG_ERROR("Lua runtime error: {}", err);
-        lua_sethook(L_, nullptr, 0, 0);
-        current_engine = nullptr;
-        return false;
-    }
-
-    lua_settop(L_, base_top);
-    lua_sethook(L_, nullptr, 0, 0);
+    bool result = execute_bytecode_internal(bytecode, chunk_name);
     current_engine = nullptr;
-    return true;
+    return result;
+}
+
+bool LuaEngine::execute_bytecode(const std::string& bytecode,
+                                  const std::string& chunk_name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return execute_bytecode_internal(bytecode, chunk_name);
+}
+
+bool LuaEngine::execute_bytecode_internal(const std::string& bytecode,
+                                           const std::string& chunk_name) {
+    if (!L_ || !ready_.load()) {
+        last_error_ = "VM not initialized";
+        if (exec_cb_) exec_cb_(false, last_error_);
+        return false;
+    }
+
+    LOG_DEBUG("LuaEngine: Executing '{}' ({} bytes bytecode)",
+              chunk_name, bytecode.size());
+
+    lua_State* thread = lua_newthread(L_);
+    luaL_sandboxthread(thread);
+
+    int load_result = luau_load(thread, chunk_name.c_str(),
+                                 bytecode.data(), bytecode.size(), 0);
+
+    if (load_result != 0) {
+        last_error_ = lua_tostring(thread, -1);
+        LOG_ERROR("LuaEngine: Load error: {}", last_error_);
+        lua_pop(L_, 1); // pop thread
+        if (error_cb_) error_cb_({last_error_, -1, chunk_name});
+        if (exec_cb_)  exec_cb_(false, last_error_);
+        return false;
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+
+    int exec_result = lua_resume(thread, nullptr, 0);
+
+    auto elapsed = std::chrono::steady_clock::now() - start_time;
+    double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+
+    if (exec_result == 0) {
+        LOG_INFO("LuaEngine: '{}' completed in {:.1f}ms", chunk_name, ms);
+        lua_pop(L_, 1); // pop thread
+        if (exec_cb_) exec_cb_(true, "");
+        return true;
+    } else if (exec_result == LUA_YIELD) {
+        LOG_DEBUG("LuaEngine: '{}' yielded after {:.1f}ms", chunk_name, ms);
+
+        // If the coroutine yielded a wait duration, schedule it
+        if (lua_gettop(thread) > 0 && lua_isnumber(thread, -1)) {
+            double wait_seconds = lua_tonumber(thread, -1);
+            lua_pop(thread, 1);
+
+            // Reference the thread so it stays alive
+            lua_pushthread(thread);
+            lua_xmove(thread, L_, 1);
+            int thread_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
+
+            // Pop original thread from main stack
+            lua_pop(L_, 1);
+
+            ScheduledTask task;
+            task.type = ScheduledTask::Type::Delay;
+            task.delay_seconds = wait_seconds;
+            task.resume_at = std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(wait_seconds));
+            task.thread_ref = thread_ref;
+            task.func_ref   = LUA_NOREF;
+            schedule_task(std::move(task));
+        } else {
+            // Keep thread alive for next-tick resume
+            lua_pushthread(thread);
+            lua_xmove(thread, L_, 1);
+            int thread_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
+            lua_pop(L_, 1);
+
+            ScheduledTask task;
+            task.type = ScheduledTask::Type::Defer;
+            task.resume_at = std::chrono::steady_clock::now();
+            task.thread_ref = thread_ref;
+            task.func_ref   = LUA_NOREF;
+            schedule_task(std::move(task));
+        }
+
+        if (exec_cb_) exec_cb_(true, "");
+        return true;
+    } else {
+        const char* err = lua_tostring(thread, -1);
+        last_error_ = err ? err : "Unknown runtime error";
+        LOG_ERROR("LuaEngine: Runtime error in '{}': {}", chunk_name, last_error_);
+        lua_pop(L_, 1); // pop thread
+        if (error_cb_) error_cb_({last_error_, -1, chunk_name});
+        if (exec_cb_)  exec_cb_(false, last_error_);
+        return false;
+    }
 }
 
 bool LuaEngine::execute_file(const std::string& path) {
@@ -317,9 +487,33 @@ bool LuaEngine::execute_file(const std::string& path) {
     return execute(content, "@" + path);
 }
 
-// ---------------------------------------------------------------------------
-// Tick / task scheduler — real coroutine-based scheduler
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Script queue
+// ===========================================================================
+
+void LuaEngine::queue_script(const std::string& source,
+                              const std::string& name) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    script_queue_.push({source, name.empty() ? "=queued_script" : name});
+}
+
+void LuaEngine::process_queue() {
+    std::queue<QueuedScript> to_run;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::swap(to_run, script_queue_);
+    }
+
+    while (!to_run.empty()) {
+        auto& script = to_run.front();
+        execute(script.source, script.name);
+        to_run.pop();
+    }
+}
+
+// ===========================================================================
+// Tick / task scheduler — coroutine-based
+// ===========================================================================
 
 void LuaEngine::tick() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -332,18 +526,16 @@ void LuaEngine::tick() {
 void LuaEngine::process_tasks() {
     auto now = std::chrono::steady_clock::now();
 
-    // Partition into cancelled, ready, and remaining
-    // First pass: clean up cancelled tasks
+    // Remove cancelled tasks
     auto cancelled_end = std::stable_partition(
         tasks_.begin(), tasks_.end(),
         [](const ScheduledTask& t) { return !t.cancelled; });
 
-    for (auto it = cancelled_end; it != tasks_.end(); ++it) {
+    for (auto it = cancelled_end; it != tasks_.end(); ++it)
         release_task_refs(*it);
-    }
     tasks_.erase(cancelled_end, tasks_.end());
 
-    // Second pass: extract ready tasks (resume_at <= now)
+    // Partition ready vs remaining
     std::vector<ScheduledTask> ready;
     std::vector<ScheduledTask> remaining;
     remaining.reserve(tasks_.size());
@@ -356,10 +548,8 @@ void LuaEngine::process_tasks() {
     }
     tasks_ = std::move(remaining);
 
-    // Execute ready tasks
-    for (auto& task : ready) {
+    for (auto& task : ready)
         execute_task(task, now);
-    }
 }
 
 void LuaEngine::release_task_refs(ScheduledTask& task) {
@@ -381,7 +571,8 @@ void LuaEngine::release_task_refs(ScheduledTask& task) {
     task.arg_refs.clear();
 }
 
-void LuaEngine::execute_task(ScheduledTask& task, std::chrono::steady_clock::time_point now) {
+void LuaEngine::execute_task(ScheduledTask& task,
+                              std::chrono::steady_clock::time_point now) {
     if (!L_) return;
 
     lua_State* co = nullptr;
@@ -390,17 +581,16 @@ void LuaEngine::execute_task(ScheduledTask& task, std::chrono::steady_clock::tim
     // Resume existing coroutine or create new one from func_ref
     if (task.thread_ref != LUA_NOREF) {
         lua_rawgeti(L_, LUA_REGISTRYINDEX, task.thread_ref);
-        if (lua_isthread(L_, -1)) {
+        if (lua_isthread(L_, -1))
             co = lua_tothread(L_, -1);
-        }
         lua_pop(L_, 1);
     }
 
     if (!co && task.func_ref != LUA_NOREF) {
         co = lua_newthread(L_);
+        luaL_sandboxthread(co);
         int thread_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
 
-        // Release old thread ref if any
         if (task.thread_ref != LUA_NOREF)
             luaL_unref(L_, LUA_REGISTRYINDEX, task.thread_ref);
         task.thread_ref = thread_ref;
@@ -416,7 +606,7 @@ void LuaEngine::execute_task(ScheduledTask& task, std::chrono::steady_clock::tim
         return;
     }
 
-    // Check coroutine status — don't resume dead coroutines
+    // Don't resume dead coroutines
     int co_status = lua_status(co);
     if (co_status != 0 && co_status != LUA_YIELD) {
         release_task_refs(task);
@@ -436,7 +626,7 @@ void LuaEngine::execute_task(ScheduledTask& task, std::chrono::steady_clock::tim
     }
     task.arg_refs.clear();
 
-    // For delay tasks, push elapsed time as an additional argument
+    // For delay tasks, push elapsed time
     if (task.type == ScheduledTask::Type::Delay) {
         auto scheduled_at = task.resume_at -
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -446,54 +636,48 @@ void LuaEngine::execute_task(ScheduledTask& task, std::chrono::steady_clock::tim
         ++nargs;
     }
 
-    int status = lua_resume(co, nargs);
+    int status = lua_resume(co, nullptr, nargs);
 
     if (status == LUA_YIELD) {
-        // Coroutine yielded — check if it yielded a wait duration
-        // If the top of the coroutine stack has a number, treat it as wait seconds
         if (lua_gettop(co) > 0 && lua_isnumber(co, -1)) {
             double wait_seconds = lua_tonumber(co, -1);
             lua_pop(co, 1);
 
-            // Re-schedule this task
             ScheduledTask new_task;
-            new_task.id = next_task_id_++;
-            new_task.type = ScheduledTask::Type::Delay;
+            new_task.id            = next_task_id_++;
+            new_task.type          = ScheduledTask::Type::Delay;
             new_task.delay_seconds = wait_seconds;
-            new_task.resume_at = now +
+            new_task.resume_at     = now +
                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                     std::chrono::duration<double>(wait_seconds));
             new_task.thread_ref = task.thread_ref;
-            task.thread_ref = LUA_NOREF; // Transfer ownership
-            new_task.func_ref = LUA_NOREF;
+            task.thread_ref     = LUA_NOREF;
+            new_task.func_ref   = LUA_NOREF;
             tasks_.push_back(std::move(new_task));
         } else {
-            // Yielded without a wait time — re-schedule for next tick
             ScheduledTask new_task;
-            new_task.id = next_task_id_++;
-            new_task.type = ScheduledTask::Type::Defer;
-            new_task.resume_at = now;
+            new_task.id         = next_task_id_++;
+            new_task.type       = ScheduledTask::Type::Defer;
+            new_task.resume_at  = now;
             new_task.thread_ref = task.thread_ref;
-            task.thread_ref = LUA_NOREF;
-            new_task.func_ref = LUA_NOREF;
+            task.thread_ref     = LUA_NOREF;
+            new_task.func_ref   = LUA_NOREF;
             tasks_.push_back(std::move(new_task));
         }
     } else if (status != 0) {
-        // Error
         const char* err = lua_tostring(co, -1);
         if (error_cb_)
             error_cb_({err ? err : "task error", -1, "task"});
         LOG_ERROR("[Task] {}", err ? err : "unknown error");
     }
-    // else status == 0: coroutine finished normally
+    // status == 0: coroutine finished normally
 
-    // Release refs we still own
     release_task_refs(task);
 }
 
 int LuaEngine::schedule_task(ScheduledTask task) {
     task.id = next_task_id_++;
-    int id = task.id;
+    int id  = task.id;
     tasks_.push_back(std::move(task));
     return id;
 }
@@ -510,19 +694,17 @@ size_t LuaEngine::pending_task_count() const {
     return c;
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Drawing object store — local registry with sync to Overlay
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 int LuaEngine::create_drawing_object(DrawingObject::Type type) {
     std::lock_guard<std::mutex> dlock(drawing_mutex_);
     int id = next_drawing_id_++;
     DrawingObject obj;
     obj.type = type;
-    obj.id = id;
+    obj.id   = id;
     drawing_objects_[id] = obj;
-
-    // Also register in overlay for rendering
     Overlay::instance().create_object_with_id(id, type);
     return id;
 }
@@ -535,15 +717,15 @@ bool LuaEngine::get_drawing_object(int id, DrawingObject& out) {
     return true;
 }
 
-bool LuaEngine::update_drawing_object(int id, const std::function<void(DrawingObject&)>& fn) {
+bool LuaEngine::update_drawing_object(int id,
+                                       const std::function<void(DrawingObject&)>& fn) {
     std::lock_guard<std::mutex> dlock(drawing_mutex_);
     auto it = drawing_objects_.find(id);
     if (it == drawing_objects_.end()) return false;
     fn(it->second);
-
-    // Sync to overlay
     DrawingObject copy = it->second;
-    Overlay::instance().update_object(id, [&copy](DrawingObject& o) { o = copy; });
+    Overlay::instance().update_object(id,
+        [&copy](DrawingObject& o) { o = copy; });
     return true;
 }
 
@@ -551,13 +733,11 @@ bool LuaEngine::remove_drawing_object(int id) {
     std::lock_guard<std::mutex> dlock(drawing_mutex_);
     auto it = drawing_objects_.find(id);
     if (it == drawing_objects_.end()) return false;
-
     if (it->second.image_surface) {
         cairo_surface_destroy(it->second.image_surface);
         it->second.image_surface = nullptr;
     }
     drawing_objects_.erase(it);
-
     Overlay::instance().remove_object(id);
     return true;
 }
@@ -574,39 +754,56 @@ void LuaEngine::clear_all_drawing_objects() {
     Overlay::instance().clear_objects();
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Global registration helpers
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
-void LuaEngine::register_function(const std::string& name, lua_CFunction func) {
-    if (L_) { lua_pushcfunction(L_, func); lua_setglobal(L_, name.c_str()); }
+void LuaEngine::register_function(const std::string& name,
+                                   lua_CFunction func) {
+    if (!L_) return;
+    lua_pushcfunction(L_, func, name.c_str());
+    lua_setglobal(L_, name.c_str());
 }
 
-void LuaEngine::register_library(const std::string& name, const luaL_Reg* funcs) {
-    if (L_) { luaL_register(L_, name.c_str(), funcs); lua_pop(L_, 1); }
+void LuaEngine::register_library(const std::string& name,
+                                  const luaL_Reg* funcs) {
+    if (!L_) return;
+    lua_newtable(L_);
+    for (const luaL_Reg* f = funcs; f->name; ++f) {
+        lua_pushcfunction(L_, f->func, f->name);
+        lua_setfield(L_, -2, f->name);
+    }
+    lua_setglobal(L_, name.c_str());
 }
 
-void LuaEngine::set_global_string(const std::string& n, const std::string& v) {
+void LuaEngine::set_global_string(const std::string& n,
+                                   const std::string& v) {
     if (L_) { lua_pushstring(L_, v.c_str()); lua_setglobal(L_, n.c_str()); }
 }
+
 void LuaEngine::set_global_number(const std::string& n, double v) {
     if (L_) { lua_pushnumber(L_, v); lua_setglobal(L_, n.c_str()); }
 }
+
 void LuaEngine::set_global_bool(const std::string& n, bool v) {
     if (L_) { lua_pushboolean(L_, v); lua_setglobal(L_, n.c_str()); }
 }
+
 std::optional<std::string> LuaEngine::get_global_string(const std::string& n) {
     if (!L_) return std::nullopt;
     lua_getglobal(L_, n.c_str());
     if (lua_isstring(L_, -1)) {
-        std::string v = lua_tostring(L_, -1); lua_pop(L_, 1); return v;
+        std::string v = lua_tostring(L_, -1);
+        lua_pop(L_, 1);
+        return v;
     }
-    lua_pop(L_, 1); return std::nullopt;
+    lua_pop(L_, 1);
+    return std::nullopt;
 }
 
-// ---------------------------------------------------------------------------
-// Signals — proper fire with argument duplication
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Signals — fire with argument duplication
+// ===========================================================================
 
 int LuaEngine::fire_signal(const std::string& name, int nargs) {
     if (!L_) return 0;
@@ -617,16 +814,12 @@ int LuaEngine::fire_signal(const std::string& name, int nargs) {
     }
 
     int fired = 0;
-
-    // Take a snapshot of connections to handle modifications during iteration
     auto connections = it->second.connections;
 
     for (auto& conn : connections) {
         if (!conn.connected || conn.callback_ref == LUA_NOREF) continue;
 
         lua_rawgeti(L_, LUA_REGISTRYINDEX, conn.callback_ref);
-
-        // Duplicate arguments for each callback
         for (int i = 0; i < nargs; ++i)
             lua_pushvalue(L_, -(nargs + 1));
 
@@ -637,7 +830,6 @@ int LuaEngine::fire_signal(const std::string& name, int nargs) {
         ++fired;
     }
 
-    // Pop the original arguments
     if (nargs > 0) lua_pop(L_, nargs);
     return fired;
 }
@@ -648,12 +840,14 @@ Signal* LuaEngine::get_signal(const std::string& n) {
 }
 
 Signal& LuaEngine::get_or_create_signal(const std::string& n) {
-    auto& s = signals_[n]; s.name = n; return s;
+    auto& s = signals_[n];
+    s.name  = n;
+    return s;
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Sandbox helpers
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 bool LuaEngine::is_sandboxed(const std::string& full_path,
                               const std::string& base_dir) {
@@ -665,17 +859,16 @@ bool LuaEngine::is_sandboxed(const std::string& full_path,
     std::string cs = canonical.string();
     std::string bs = base_canonical.string();
     if (!bs.empty() && bs.back() != '/') bs += '/';
-    // Path must start with base or be exactly equal to base (without trailing slash)
     return cs.find(bs) == 0 || cs == base_canonical.string();
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Environment / library setup
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 void LuaEngine::setup_environment() {
-    lua_pushcfunction(L_, lua_print);   lua_setglobal(L_, "print");
-    lua_pushcfunction(L_, lua_warn_handler); lua_setglobal(L_, "warn");
+    register_function("print", lua_print);
+    register_function("warn",  lua_warn_handler);
 }
 
 void LuaEngine::register_task_lib() {
@@ -696,16 +889,16 @@ void LuaEngine::register_drawing_lib() {
     // Metatable for drawing userdata
     luaL_newmetatable(L_, DRAWING_OBJ_MT);
 
-    lua_pushcfunction(L_, lua_drawing_index);
+    lua_pushcfunction(L_, lua_drawing_index, "__index");
     lua_setfield(L_, -2, "__index");
 
-    lua_pushcfunction(L_, lua_drawing_newindex);
+    lua_pushcfunction(L_, lua_drawing_newindex, "__newindex");
     lua_setfield(L_, -2, "__newindex");
 
-    lua_pushcfunction(L_, lua_drawing_gc);
+    lua_pushcfunction(L_, lua_drawing_gc, "__gc");
     lua_setfield(L_, -2, "__gc");
 
-    lua_pushcfunction(L_, lua_drawing_tostring);
+    lua_pushcfunction(L_, lua_drawing_tostring, "__tostring");
     lua_setfield(L_, -2, "__tostring");
 
     lua_pop(L_, 1);
@@ -713,16 +906,16 @@ void LuaEngine::register_drawing_lib() {
     // Drawing library table
     lua_newtable(L_);
 
-    lua_pushcfunction(L_, lua_drawing_new);
+    lua_pushcfunction(L_, lua_drawing_new, "Drawing.new");
     lua_setfield(L_, -2, "new");
 
-    lua_pushcfunction(L_, lua_drawing_clear);
+    lua_pushcfunction(L_, lua_drawing_clear, "Drawing.clear");
     lua_setfield(L_, -2, "clear");
 
-    lua_pushcfunction(L_, lua_drawing_is_rendered);
+    lua_pushcfunction(L_, lua_drawing_is_rendered, "Drawing.isRendered");
     lua_setfield(L_, -2, "isRendered");
 
-    lua_pushcfunction(L_, lua_drawing_get_screen_size);
+    lua_pushcfunction(L_, lua_drawing_get_screen_size, "Drawing.getScreenSize");
     lua_setfield(L_, -2, "getScreenSize");
 
     lua_setglobal(L_, "Drawing");
@@ -732,19 +925,23 @@ void LuaEngine::register_signal_lib() {
     luaL_newmetatable(L_, "SignalObject");
     lua_pushstring(L_, "__index");
     lua_newtable(L_);
-    lua_pushcfunction(L_, lua_signal_connect); lua_setfield(L_, -2, "Connect");
-    lua_pushcfunction(L_, lua_signal_fire);    lua_setfield(L_, -2, "Fire");
-    lua_pushcfunction(L_, lua_signal_wait);    lua_setfield(L_, -2, "Wait");
-    lua_pushcfunction(L_, lua_signal_destroy); lua_setfield(L_, -2, "Destroy");
+    lua_pushcfunction(L_, lua_signal_connect, "Signal.Connect");
+    lua_setfield(L_, -2, "Connect");
+    lua_pushcfunction(L_, lua_signal_fire, "Signal.Fire");
+    lua_setfield(L_, -2, "Fire");
+    lua_pushcfunction(L_, lua_signal_wait, "Signal.Wait");
+    lua_setfield(L_, -2, "Wait");
+    lua_pushcfunction(L_, lua_signal_destroy, "Signal.Destroy");
+    lua_setfield(L_, -2, "Destroy");
     lua_settable(L_, -3);
-    lua_pushcfunction(L_, lua_signal_gc);
+    lua_pushcfunction(L_, lua_signal_gc, "Signal.__gc");
     lua_setfield(L_, -2, "__gc");
     lua_pop(L_, 1);
 
     luaL_newmetatable(L_, "SignalConnection");
     lua_pushstring(L_, "__index");
     lua_newtable(L_);
-    lua_pushcfunction(L_, lua_signal_disconnect);
+    lua_pushcfunction(L_, lua_signal_disconnect, "Connection.Disconnect");
     lua_setfield(L_, -2, "Disconnect");
     lua_settable(L_, -3);
     lua_pop(L_, 1);
@@ -753,13 +950,13 @@ void LuaEngine::register_signal_lib() {
 }
 
 void LuaEngine::register_custom_libs() {
-    register_function("readfile",    lua_readfile);
-    register_function("writefile",   lua_writefile);
-    register_function("appendfile",  lua_appendfile);
-    register_function("isfile",      lua_isfile);
-    register_function("listfiles",   lua_listfiles);
-    register_function("delfolder",   lua_delfolder);
-    register_function("makefolder",  lua_makefolder);
+    register_function("readfile",   lua_readfile);
+    register_function("writefile",  lua_writefile);
+    register_function("appendfile", lua_appendfile);
+    register_function("isfile",     lua_isfile);
+    register_function("listfiles",  lua_listfiles);
+    register_function("delfolder",  lua_delfolder);
+    register_function("makefolder", lua_makefolder);
 
     static const luaL_Reg http_lib[] = {
         {"get",  lua_http_get},
@@ -767,18 +964,20 @@ void LuaEngine::register_custom_libs() {
         {nullptr, nullptr}
     };
     register_library("http", http_lib);
+
+    // Alias http.get as global http_get
     lua_getglobal(L_, "http");
     lua_getfield(L_, -1, "get");
     lua_setglobal(L_, "http_get");
     lua_pop(L_, 1);
 
-    register_function("wait",              lua_wait);
-    register_function("spawn",             lua_spawn);
-    register_function("getclipboard",      lua_getclipboard);
-    register_function("setclipboard",      lua_setclipboard);
-    register_function("identifyexecutor",  lua_identifyexecutor);
-    register_function("getexecutorname",   lua_getexecutorname);
-    register_function("gethwid",           lua_get_hwid);
+    register_function("wait",             lua_wait);
+    register_function("spawn",            lua_spawn);
+    register_function("getclipboard",     lua_getclipboard);
+    register_function("setclipboard",     lua_setclipboard);
+    register_function("identifyexecutor", lua_identifyexecutor);
+    register_function("getexecutorname",  lua_getexecutorname);
+    register_function("gethwid",          lua_get_hwid);
 
     static const luaL_Reg console_lib[] = {
         {"print", lua_rconsole_print},
@@ -798,7 +997,7 @@ void LuaEngine::register_custom_libs() {
     set_global_string("_EXECUTOR",         "OSS Executor");
     set_global_string("_EXECUTOR_VERSION", "2.0.0");
     set_global_number("_EXECUTOR_LEVEL",   8);
-    set_global_bool  ("_OSS",             true);
+    set_global_bool  ("_OSS",              true);
 
     execute_internal(R"(
         syn = syn or {}
@@ -816,6 +1015,11 @@ void LuaEngine::register_custom_libs() {
 }
 
 void LuaEngine::sandbox() {
+    // Apply Luau sandbox first
+    luaL_sandbox(L_);
+    luaL_sandboxthread(L_);
+
+    // Additional restrictions via script
     execute_internal(R"(
         local safe_os = {
             time = os.time, clock = os.clock,
@@ -828,8 +1032,7 @@ void LuaEngine::sandbox() {
 }
 
 // ===========================================================================
-//  Drawing API — objects live in engine's drawing_objects_ store
-//  and are synced to Overlay for rendering
+//  Drawing API
 // ===========================================================================
 
 int LuaEngine::lua_drawing_new(lua_State* L) {
@@ -842,7 +1045,7 @@ int LuaEngine::lua_drawing_new(lua_State* L) {
     int id = eng->create_drawing_object(type);
 
     auto* h = static_cast<DrawingHandle*>(lua_newuserdata(L, sizeof(DrawingHandle)));
-    h->id = id;
+    h->id      = id;
     h->removed = false;
     luaL_getmetatable(L, DRAWING_OBJ_MT);
     lua_setmetatable(L, -2);
@@ -853,26 +1056,18 @@ int LuaEngine::lua_drawing_index(lua_State* L) {
     auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, 1, DRAWING_OBJ_MT));
     const char* key = luaL_checkstring(L, 2);
 
-    // Methods available even on removed objects
     if (strcmp(key, "Remove") == 0 || strcmp(key, "Destroy") == 0) {
-        lua_pushcfunction(L, lua_drawing_remove);
+        lua_pushcfunction(L, lua_drawing_remove, "Drawing:Remove");
         return 1;
     }
 
-    if (h->removed) {
-        lua_pushnil(L);
-        return 1;
-    }
+    if (h->removed) { lua_pushnil(L); return 1; }
 
     auto* eng = get_engine(L);
     if (!eng) { lua_pushnil(L); return 1; }
 
-    // Get a copy from the drawing store
     DrawingObject copy;
-    if (!eng->get_drawing_object(h->id, copy)) {
-        lua_pushnil(L);
-        return 1;
-    }
+    if (!eng->get_drawing_object(h->id, copy)) { lua_pushnil(L); return 1; }
 
     if      (strcmp(key, "Visible") == 0)      lua_pushboolean(L, copy.visible);
     else if (strcmp(key, "ZIndex") == 0)       lua_pushinteger(L, copy.z_index);
@@ -926,8 +1121,6 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
     auto* eng = get_engine(L);
     if (!eng) return luaL_error(L, "engine not available");
 
-    // ---- Read all Lua values BEFORE taking the lock ----
-
     if (strcmp(key, "Visible") == 0) {
         bool v = lua_toboolean(L, 3);
         eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.visible = v; });
@@ -937,13 +1130,11 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
         eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.z_index = v; });
     }
     else if (strcmp(key, "Transparency") == 0) {
-        double v = luaL_checknumber(L, 3);
-        v = std::clamp(v, 0.0, 1.0);
+        double v = std::clamp(luaL_checknumber(L, 3), 0.0, 1.0);
         eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.transparency = v; });
     }
     else if (strcmp(key, "Thickness") == 0) {
-        double v = luaL_checknumber(L, 3);
-        if (v < 0) v = 0;
+        double v = std::max(0.0, luaL_checknumber(L, 3));
         eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.thickness = v; });
     }
     else if (strcmp(key, "Filled") == 0) {
@@ -951,13 +1142,11 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
         eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.filled = v; });
     }
     else if (strcmp(key, "Radius") == 0) {
-        double v = luaL_checknumber(L, 3);
-        if (v < 0) v = 0;
+        double v = std::max(0.0, luaL_checknumber(L, 3));
         eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.radius = v; });
     }
     else if (strcmp(key, "NumSides") == 0) {
-        int v = static_cast<int>(luaL_checkinteger(L, 3));
-        if (v < 3) v = 3;
+        int v = std::max(3, static_cast<int>(luaL_checkinteger(L, 3)));
         eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.num_sides = v; });
     }
     else if (strcmp(key, "Center") == 0) {
@@ -993,8 +1182,7 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
         eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.font = v; });
     }
     else if (strcmp(key, "Rounding") == 0) {
-        double v = luaL_checknumber(L, 3);
-        if (v < 0) v = 0;
+        double v = std::max(0.0, luaL_checknumber(L, 3));
         eng->update_drawing_object(h->id, [v](DrawingObject& o){ o.rounding = v; });
     }
     else if (strcmp(key, "Position") == 0) {
@@ -1080,7 +1268,6 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
     }
     else if (strcmp(key, "Data") == 0 || strcmp(key, "ImagePath") == 0) {
         std::string path = luaL_checkstring(L, 3);
-        // Load image outside the lock
         cairo_surface_t* surface = cairo_image_surface_create_from_png(path.c_str());
         if (surface && cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
             cairo_surface_destroy(surface);
@@ -1088,7 +1275,7 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
         }
         eng->update_drawing_object(h->id, [&path, surface](DrawingObject& o){
             if (o.image_surface) cairo_surface_destroy(o.image_surface);
-            o.image_path = path;
+            o.image_path    = path;
             o.image_surface = surface;
         });
     }
@@ -1102,20 +1289,18 @@ int LuaEngine::lua_drawing_remove(lua_State* L) {
         auto* eng = get_engine(L);
         if (eng) eng->remove_drawing_object(h->id);
         h->removed = true;
-        h->id = -1;
+        h->id      = -1;
     }
     return 0;
 }
 
 int LuaEngine::lua_drawing_gc(lua_State* L) {
-    // Auto-cleanup on garbage collection — safe because we use the engine's
-    // drawing store which has its own lock separate from overlay
     auto* h = static_cast<DrawingHandle*>(luaL_checkudata(L, 1, DRAWING_OBJ_MT));
     if (!h->removed && h->id >= 0) {
         auto* eng = get_engine(L);
         if (eng) eng->remove_drawing_object(h->id);
         h->removed = true;
-        h->id = -1;
+        h->id      = -1;
     }
     return 0;
 }
@@ -1149,7 +1334,7 @@ int LuaEngine::lua_drawing_get_screen_size(lua_State* L) {
 }
 
 // ===========================================================================
-//  Task library — real coroutine-based scheduler
+//  Task library — coroutine-based scheduler (Luau)
 // ===========================================================================
 
 int LuaEngine::lua_task_spawn(lua_State* L) {
@@ -1157,8 +1342,8 @@ int LuaEngine::lua_task_spawn(lua_State* L) {
     auto* eng = get_engine(L);
     if (!eng) return luaL_error(L, "engine not available");
 
-    // Create coroutine on main thread to keep it rooted
     lua_State* co = lua_newthread(eng->L_);
+    luaL_sandboxthread(co);
     int thread_ref = luaL_ref(eng->L_, LUA_REGISTRYINDEX);
 
     // Push function and args onto coroutine
@@ -1170,30 +1355,27 @@ int LuaEngine::lua_task_spawn(lua_State* L) {
         lua_xmove(L, co, 1);
     }
 
-    int status = lua_resume(co, nargs);
+    int status = lua_resume(co, nullptr, nargs);
 
     if (status == LUA_YIELD) {
-        // Coroutine yielded — check for wait time
         if (lua_gettop(co) > 0 && lua_isnumber(co, -1)) {
             double wait_seconds = lua_tonumber(co, -1);
             lua_pop(co, 1);
-
             ScheduledTask task;
-            task.type = ScheduledTask::Type::Delay;
+            task.type          = ScheduledTask::Type::Delay;
             task.delay_seconds = wait_seconds;
-            task.resume_at = std::chrono::steady_clock::now() +
+            task.resume_at     = std::chrono::steady_clock::now() +
                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                     std::chrono::duration<double>(wait_seconds));
             task.thread_ref = thread_ref;
-            task.func_ref = LUA_NOREF;
+            task.func_ref   = LUA_NOREF;
             eng->schedule_task(std::move(task));
         } else {
-            // Schedule for next tick
             ScheduledTask task;
-            task.type = ScheduledTask::Type::Defer;
-            task.resume_at = std::chrono::steady_clock::now();
+            task.type       = ScheduledTask::Type::Defer;
+            task.resume_at  = std::chrono::steady_clock::now();
             task.thread_ref = thread_ref;
-            task.func_ref = LUA_NOREF;
+            task.func_ref   = LUA_NOREF;
             eng->schedule_task(std::move(task));
         }
     } else if (status != 0) {
@@ -1203,11 +1385,10 @@ int LuaEngine::lua_task_spawn(lua_State* L) {
         LOG_ERROR("[task.spawn] {}", err ? err : "unknown error");
         luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
     } else {
-        // Coroutine finished immediately
         luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
     }
 
-    // Push the thread as return value
+    // Return the thread
     lua_rawgeti(L, LUA_REGISTRYINDEX, thread_ref);
     if (!lua_isthread(L, -1)) {
         lua_pop(L, 1);
@@ -1225,9 +1406,9 @@ int LuaEngine::lua_task_delay(lua_State* L) {
     if (seconds < 0) seconds = 0;
 
     ScheduledTask task;
-    task.type = ScheduledTask::Type::Delay;
+    task.type          = ScheduledTask::Type::Delay;
     task.delay_seconds = seconds;
-    task.resume_at = std::chrono::steady_clock::now() +
+    task.resume_at     = std::chrono::steady_clock::now() +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(seconds));
 
@@ -1251,7 +1432,7 @@ int LuaEngine::lua_task_defer(lua_State* L) {
     if (!eng) return luaL_error(L, "engine not available");
 
     ScheduledTask task;
-    task.type = ScheduledTask::Type::Defer;
+    task.type      = ScheduledTask::Type::Defer;
     task.resume_at = std::chrono::steady_clock::now();
 
     lua_pushvalue(L, 1);
@@ -1272,10 +1453,9 @@ int LuaEngine::lua_task_wait(lua_State* L) {
     double s = luaL_optnumber(L, 1, 0.03);
     if (s < 0) s = 0;
 
-    // If called from a coroutine, yield with the wait time so the scheduler
-    // can properly reschedule. If called from the main thread, fallback to sleep.
+    // Check if we're on the main thread
     if (lua_pushthread(L)) {
-        // Main thread — can't yield, use sleep
+        // Main thread — can't yield, fallback to sleep
         lua_pop(L, 1);
         std::this_thread::sleep_for(
             std::chrono::milliseconds(static_cast<int>(s * 1000)));
@@ -1300,26 +1480,8 @@ int LuaEngine::lua_task_desynchronize(lua_State*) { return 0; }
 int LuaEngine::lua_task_synchronize(lua_State*)   { return 0; }
 
 // ===========================================================================
-//  Signal library — with proper connection lifecycle management
+//  Signal library
 // ===========================================================================
-
-struct SignalUserdata {
-    char name[128];
-    bool destroyed;
-};
-
-static SignalUserdata* check_signal_ud(lua_State* L, int idx) {
-    auto* ud = static_cast<SignalUserdata*>(luaL_checkudata(L, idx, "SignalObject"));
-    if (ud->destroyed)
-        luaL_error(L, "Signal has been destroyed");
-    return ud;
-}
-
-struct ConnUD {
-    char sig_name[128];
-    int conn_id;
-    bool disconnected;
-};
 
 int LuaEngine::lua_signal_new(lua_State* L) {
     const char* name = luaL_optstring(L, 1, "");
@@ -1327,9 +1489,8 @@ int LuaEngine::lua_signal_new(lua_State* L) {
     if (!eng) return luaL_error(L, "engine not available");
 
     std::string sig_name = name;
-    if (sig_name.empty()) {
+    if (sig_name.empty())
         sig_name = "signal_" + std::to_string(eng->next_signal_id_++);
-    }
     eng->get_or_create_signal(sig_name);
 
     auto* ud = static_cast<SignalUserdata*>(
@@ -1358,15 +1519,15 @@ int LuaEngine::lua_signal_connect(lua_State* L) {
 
     Signal::Connection conn;
     conn.callback_ref = ref;
-    conn.id = sig->next_id++;
-    conn.connected = true;
+    conn.id           = sig->next_id++;
+    conn.connected    = true;
     sig->connections.push_back(conn);
 
     auto* cud = static_cast<ConnUD*>(lua_newuserdata(L, sizeof(ConnUD)));
     memset(cud->sig_name, 0, sizeof(cud->sig_name));
     snprintf(cud->sig_name, sizeof(cud->sig_name), "%s", ud->name);
-    cud->conn_id = conn.id;
-    cud->disconnected = false;
+    cud->conn_id      = conn.id;
+    cud->disconnected  = false;
     luaL_getmetatable(L, "SignalConnection");
     lua_setmetatable(L, -2);
     return 1;
@@ -1383,7 +1544,6 @@ int LuaEngine::lua_signal_fire(lua_State* L) {
     Signal* sig = eng->get_signal(ud->name);
     if (!sig) return 0;
 
-    // Snapshot connections to handle modifications during iteration
     auto connections_copy = sig->connections;
 
     for (auto& conn : connections_copy) {
@@ -1399,15 +1559,10 @@ int LuaEngine::lua_signal_fire(lua_State* L) {
         }
     }
 
-    // Also resume any coroutines waiting on this signal
-    // (future enhancement: implement Wait queue)
-
     return 0;
 }
 
 int LuaEngine::lua_signal_wait(lua_State* L) {
-    // Yield the current coroutine — the signal fire should resume it
-    // For now, simple yield
     return lua_yield(L, 0);
 }
 
@@ -1428,7 +1583,6 @@ int LuaEngine::lua_signal_disconnect(lua_State* L) {
                 luaL_unref(L, LUA_REGISTRYINDEX, it->callback_ref);
                 it->callback_ref = LUA_NOREF;
             }
-            // Remove from the vector entirely to prevent buildup
             sig->connections.erase(it);
             break;
         }
@@ -1459,7 +1613,6 @@ int LuaEngine::lua_signal_destroy(lua_State* L) {
 }
 
 int LuaEngine::lua_signal_gc(lua_State* L) {
-    // Auto-destroy signal on GC if not already destroyed
     auto* ud = static_cast<SignalUserdata*>(luaL_checkudata(L, 1, "SignalObject"));
     if (!ud->destroyed) {
         auto* eng = get_engine(L);
@@ -1509,17 +1662,13 @@ int LuaEngine::lua_print(lua_State* L) {
 int LuaEngine::lua_warn_handler(lua_State* L) {
     const char* msg = luaL_checkstring(L, 1);
 
-    // ─── Suppress phantom execution warnings ────────────────────────
-    // Generated when scripts execute without a real Roblox process.
-    // Harmless in local/mock mode — downgrade to debug level.
     if (msg) {
         const char* phantom = strstr(msg, "Phantom exec");
         if (phantom) {
             LOG_DEBUG("[Lua] (mock mode) {}", msg);
-            return 0;  // Don't display in UI console
+            return 0;
         }
     }
-    // ─────────────────────────────────────────────────────────────────
 
     auto* eng = get_engine(L);
     if (eng && eng->output_cb_) eng->output_cb_(std::string("[WARN] ") + msg);
@@ -1530,7 +1679,10 @@ int LuaEngine::lua_warn_handler(lua_State* L) {
 int LuaEngine::lua_pcall_handler(lua_State* L) {
     const char* msg = lua_tostring(L, -1);
     if (!msg) msg = "Unknown error";
-    luaL_traceback(L, L, msg, 1);
+    // Note: luaL_traceback is not available in stock Luau, but the Luau VM
+    // provides stack traces in error messages by default.
+    // If a custom traceback helper is available, call it here.
+    lua_pushstring(L, msg);
     return 1;
 }
 
@@ -1544,7 +1696,7 @@ int LuaEngine::lua_http_get(lua_State* L) {
     lua_newtable(L);
     lua_pushstring(L, resp.body.c_str());
     lua_setfield(L, -2, "Body");
-    lua_pushinteger(L, static_cast<lua_Integer>(resp.status_code));
+    lua_pushinteger(L, static_cast<int>(resp.status_code));
     lua_setfield(L, -2, "StatusCode");
     lua_pushboolean(L, resp.success());
     lua_setfield(L, -2, "Success");
@@ -1577,7 +1729,7 @@ int LuaEngine::lua_http_post(lua_State* L) {
     lua_newtable(L);
     lua_pushstring(L, resp.body.c_str());
     lua_setfield(L, -2, "Body");
-    lua_pushinteger(L, static_cast<lua_Integer>(resp.status_code));
+    lua_pushinteger(L, static_cast<int>(resp.status_code));
     lua_setfield(L, -2, "StatusCode");
     lua_pushboolean(L, resp.success());
     lua_setfield(L, -2, "Success");
@@ -1596,9 +1748,7 @@ int LuaEngine::lua_wait(lua_State* L) {
     double s = luaL_optnumber(L, 1, 0.03);
     if (s < 0) s = 0;
 
-    // Check if we're in a coroutine
     if (lua_pushthread(L)) {
-        // Main thread — can't yield
         lua_pop(L, 1);
         std::this_thread::sleep_for(
             std::chrono::milliseconds(static_cast<int>(s * 1000)));
@@ -1608,7 +1758,6 @@ int LuaEngine::lua_wait(lua_State* L) {
     }
     lua_pop(L, 1);
 
-    // Coroutine — yield with wait time
     lua_pushnumber(L, s);
     return lua_yield(L, 1);
 }
@@ -1619,6 +1768,7 @@ int LuaEngine::lua_spawn(lua_State* L) {
     if (!eng) return luaL_error(L, "engine not available");
 
     lua_State* co = lua_newthread(eng->L_);
+    luaL_sandboxthread(co);
     int thread_ref = luaL_ref(eng->L_, LUA_REGISTRYINDEX);
 
     lua_pushvalue(L, 1);
@@ -1629,28 +1779,27 @@ int LuaEngine::lua_spawn(lua_State* L) {
         lua_xmove(L, co, 1);
     }
 
-    int status = lua_resume(co, nargs);
+    int status = lua_resume(co, nullptr, nargs);
 
     if (status == LUA_YIELD) {
-        // Schedule for re-execution
         if (lua_gettop(co) > 0 && lua_isnumber(co, -1)) {
             double wait_seconds = lua_tonumber(co, -1);
             lua_pop(co, 1);
             ScheduledTask task;
-            task.type = ScheduledTask::Type::Delay;
+            task.type          = ScheduledTask::Type::Delay;
             task.delay_seconds = wait_seconds;
-            task.resume_at = std::chrono::steady_clock::now() +
+            task.resume_at     = std::chrono::steady_clock::now() +
                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                     std::chrono::duration<double>(wait_seconds));
             task.thread_ref = thread_ref;
-            task.func_ref = LUA_NOREF;
+            task.func_ref   = LUA_NOREF;
             eng->schedule_task(std::move(task));
         } else {
             ScheduledTask task;
-            task.type = ScheduledTask::Type::Defer;
-            task.resume_at = std::chrono::steady_clock::now();
+            task.type       = ScheduledTask::Type::Defer;
+            task.resume_at  = std::chrono::steady_clock::now();
             task.thread_ref = thread_ref;
-            task.func_ref = LUA_NOREF;
+            task.func_ref   = LUA_NOREF;
             eng->schedule_task(std::move(task));
         }
     } else if (status != 0) {
@@ -1663,7 +1812,6 @@ int LuaEngine::lua_spawn(lua_State* L) {
         luaL_unref(eng->L_, LUA_REGISTRYINDEX, thread_ref);
     }
 
-    // Return the thread
     lua_rawgeti(L, LUA_REGISTRYINDEX, thread_ref);
     if (!lua_isthread(L, -1)) {
         lua_pop(L, 1);
@@ -1857,13 +2005,13 @@ int LuaEngine::lua_base64_decode(lua_State* L) {
 
     static const auto table = []() {
         std::array<unsigned char, 256> t{};
-        t.fill(0xFF); // Use 0xFF as invalid marker
+        t.fill(0xFF);
         const char* chars =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         for (size_t i = 0; i < 64; ++i)
             t[static_cast<unsigned char>(chars[i])] =
                 static_cast<unsigned char>(i);
-        t[static_cast<unsigned char>('=')] = 0; // Padding
+        t[static_cast<unsigned char>('=')] = 0;
         return t;
     }();
 
@@ -1872,7 +2020,6 @@ int LuaEngine::lua_base64_decode(lua_State* L) {
 
     size_t i = 0;
     while (i < encoded_len) {
-        // Skip whitespace
         while (i < encoded_len &&
                (encoded[i] == '\n' || encoded[i] == '\r' ||
                 encoded[i] == ' '  || encoded[i] == '\t'))
@@ -1891,7 +2038,6 @@ int LuaEngine::lua_base64_decode(lua_State* L) {
             } else if (table[c] != 0xFF) {
                 n = (n << 6) | table[c];
             } else {
-                // Skip invalid characters
                 --j;
                 ++i;
                 continue;
@@ -1919,5 +2065,3 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
-
-
