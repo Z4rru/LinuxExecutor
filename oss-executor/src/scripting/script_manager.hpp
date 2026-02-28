@@ -31,7 +31,6 @@ public:
     bool        delete_script(const std::string& name);
     bool        rename_script(const std::string& old_name, const std::string& new_name);
 
-    // ── real execution through LuaEngine ──
     bool execute_script(const std::string& name) const;
     bool execute_inline(const std::string& source) const;
 
@@ -42,11 +41,10 @@ private:
     ScriptManager(const ScriptManager&)            = delete;
     ScriptManager& operator=(const ScriptManager&) = delete;
 
-    // Returns empty path on invalid/malicious name
     std::filesystem::path safe_script_path(const std::string& name) const;
 
     mutable std::mutex mtx_;
     std::string        dir_;
 };
 
-} // namespace oss
+}
