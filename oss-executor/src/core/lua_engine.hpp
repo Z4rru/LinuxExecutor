@@ -139,8 +139,9 @@ public:
     friend class Executor;
 
 private:
-    LuaEngine() = default;
-    ~LuaEngine() { shutdown(); }
+    // ── FIX 1: declare only — definitions live in lua_engine.cpp ────────
+    LuaEngine();
+    ~LuaEngine();
     LuaEngine(const LuaEngine&)            = delete;
     LuaEngine& operator=(const LuaEngine&) = delete;
 
@@ -148,6 +149,10 @@ private:
     bool execute_internal(const std::string& script,
                           const std::string& chunk_name);
     void shutdown_internal();
+
+    // ── FIX 2: missing declaration that lua_engine.cpp defines & calls ──
+    bool execute_bytecode_internal(const std::string& bytecode,
+                                   const std::string& chunk_name);
 
     // ── task scheduler internals ────────────────────────────────────────
     void process_tasks();
