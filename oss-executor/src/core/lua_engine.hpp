@@ -10,11 +10,8 @@
 #include <atomic>
 #include <chrono>
 
-extern "C" {
-#include <luajit-2.1/lua.h>
-#include <luajit-2.1/lualib.h>
-#include <luajit-2.1/lauxlib.h>
-}
+#include "lua.h"
+#include "lualib.h"
 
 #include "utils/logger.hpp"
 #include "ui/drawing_object.hpp"
@@ -56,7 +53,7 @@ struct Signal {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  LuaEngine — singleton, embeds LuaJIT / Luau
+//  LuaEngine — singleton, embeds Luau VM
 // ═══════════════════════════════════════════════════════════════════════════
 
 class LuaEngine {
@@ -137,6 +134,9 @@ public:
     std::unordered_map<std::string, Signal> signals_;
     OutputCallback output_cb_;
     ErrorCallback  error_cb_;
+
+    // Allow Executor to construct / destruct its owned LuaEngine member
+    friend class Executor;
 
 private:
     LuaEngine() = default;
@@ -250,8 +250,8 @@ private:
     // ═══════════════════════════════════════════════════════════════════
 
     lua_State*        L_ = nullptr;
-    std::atomic<bool> ready_{false};    // VM initialised successfully
-    std::atomic<bool> running_{false};  // actively inside execute()
+    std::atomic<bool> ready_{false};
+    std::atomic<bool> running_{false};
     mutable std::mutex mutex_;
 
     // Error reporting
@@ -282,7 +282,7 @@ private:
 
     // Custom allocator bookkeeping
     size_t total_allocated_ = 0;
-    static constexpr size_t MAX_MEMORY = 256 * 1024 * 1024; // 256 MB
+    static constexpr size_t MAX_MEMORY = 256 * 1024 * 1024;
 };
 
 } // namespace oss
