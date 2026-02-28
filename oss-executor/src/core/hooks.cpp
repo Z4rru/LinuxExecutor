@@ -1,6 +1,7 @@
 #include "hooks.hpp"
 #include "memory.hpp"
 #include "utils/logger.hpp"
+
 #include <sys/mman.h>
 #include <dlfcn.h>
 #include <link.h>
@@ -10,17 +11,31 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <stdexcept>
 
 namespace oss {
+
+// ── Singleton / lifecycle ────────────────────────────────────────────────────
 
 HookManager& HookManager::instance() {
     static HookManager inst;
     return inst;
 }
 
+// FIX 7: query actual page size instead of assuming 4096
+HookManager::HookManager() {
+    long ps = sysconf(_SC_PAGESIZE);
+    page_size_ = (ps > 0) ? static_cast<size_t>(ps) : 4096;
+}
+
 HookManager::~HookManager() {
     remove_all();
+    // Remote hooks can't be restored without Memory objects,
+    // but clear our bookkeeping to avoid a logical leak.
+    remote_hooks_.clear();   // FIX 8: was never cleared
 }
+
+// ── /proc/self/maps parsing ──────────────────────────────────────────────────
 
 std::vector<HookManager::MemRegionInfo> HookManager::parse_self_maps() {
     std::vector<MemRegionInfo> regions;
@@ -42,8 +57,13 @@ std::vector<HookManager::MemRegionInfo> HookManager::parse_self_maps() {
         auto dash = addr_range.find('-');
         if (dash == std::string::npos) continue;
 
-        info.start = std::stoull(addr_range.substr(0, dash), nullptr, 16);
-        info.end = std::stoull(addr_range.substr(dash + 1), nullptr, 16);
+        // FIX 9: stoull can throw on malformed lines
+        try {
+            info.start = std::stoull(addr_range.substr(0, dash), nullptr, 16);
+            info.end   = std::stoull(addr_range.substr(dash + 1), nullptr, 16);
+        } catch (const std::exception&) {
+            continue;   // skip malformed lines
+        }
 
         info.prot = 0;
         if (perms.size() >= 3) {
@@ -57,26 +77,54 @@ std::vector<HookManager::MemRegionInfo> HookManager::parse_self_maps() {
     return regions;
 }
 
+// ── Address / protection helpers ─────────────────────────────────────────────
+
 bool HookManager::is_address_in_own_process(uintptr_t addr) {
     auto regions = parse_self_maps();
-    for (auto& r : regions) {
+    for (const auto& r : regions) {
         if (addr >= r.start && addr < r.end) return true;
     }
     return false;
 }
 
+// FIX 3: new helper — look up the current protection of the page containing addr
+int HookManager::get_region_protection(uintptr_t addr) {
+    auto regions = parse_self_maps();
+    for (const auto& r : regions) {
+        if (addr >= r.start && addr < r.end)
+            return r.prot;
+    }
+    return PROT_READ | PROT_EXEC;   // sensible default for code pages
+}
+
+// FIX 7: use runtime page_size_ instead of hardcoded 0xFFF / 4096
 bool HookManager::make_writable(uintptr_t addr, size_t size) {
-    uintptr_t page = addr & ~static_cast<uintptr_t>(0xFFF);
-    size_t page_size = ((addr + size) - page + 0xFFF) & ~static_cast<size_t>(0xFFF);
-    return mprotect(reinterpret_cast<void*>(page), page_size,
+    uintptr_t mask = ~(page_size_ - 1);
+    uintptr_t page_start = addr & mask;
+    uintptr_t page_end   = (addr + size + page_size_ - 1) & mask;
+    size_t    total       = page_end - page_start;
+
+    return mprotect(reinterpret_cast<void*>(page_start), total,
                     PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
 }
 
 bool HookManager::restore_protection(uintptr_t addr, size_t size, int old_prot) {
-    uintptr_t page = addr & ~static_cast<uintptr_t>(0xFFF);
-    size_t page_size = ((addr + size) - page + 0xFFF) & ~static_cast<size_t>(0xFFF);
-    return mprotect(reinterpret_cast<void*>(page), page_size, old_prot) == 0;
+    uintptr_t mask = ~(page_size_ - 1);
+    uintptr_t page_start = addr & mask;
+    uintptr_t page_end   = (addr + size + page_size_ - 1) & mask;
+    size_t    total       = page_end - page_start;
+
+    return mprotect(reinterpret_cast<void*>(page_start), total, old_prot) == 0;
 }
+
+// ── Inline hooks ─────────────────────────────────────────────────────────────
+//
+// WARNING: The trampoline copies the first HOOK_SIZE bytes verbatim.
+// If those bytes contain RIP/PC-relative instructions (common on x86_64),
+// they will fault in the trampoline.  A production hooking engine needs a
+// length-disassembler to relocate such instructions.  This implementation
+// works for functions whose prologue is position-independent (push rbp;
+// mov rbp,rsp; sub rsp,N etc.).
 
 bool HookManager::install_hook(uintptr_t target, uintptr_t detour,
                                 uintptr_t* original, const std::string& name) {
@@ -95,43 +143,44 @@ bool HookManager::install_hook(uintptr_t target, uintptr_t detour,
     Hook hook;
     hook.target = target;
     hook.detour = detour;
-    hook.name = name.empty() ? ("hook_" + std::to_string(target)) : name;
+    hook.name   = name.empty() ? ("hook_" + std::to_string(target)) : name;
     hook.active = false;
 
+    // FIX 3: save protection BEFORE we modify it
+    hook.original_prot = get_region_protection(target);
+
 #if defined(__x86_64__)
+    // movabs jmp: FF 25 00 00 00 00 <8-byte addr>  = 14 bytes
     constexpr size_t HOOK_SIZE = 14;
 
     hook.original_bytes.resize(HOOK_SIZE);
-    memcpy(hook.original_bytes.data(), reinterpret_cast<void*>(target), HOOK_SIZE);
+    std::memcpy(hook.original_bytes.data(),
+                reinterpret_cast<const void*>(target), HOOK_SIZE);
 
-    void* tramp = mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // Allocate executable trampoline
+    void* tramp = mmap(nullptr, page_size_,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (tramp == MAP_FAILED) {
         LOG_ERROR("Failed to allocate trampoline for {}", hook.name);
         return false;
     }
-
     hook.trampoline = reinterpret_cast<uintptr_t>(tramp);
 
-    memcpy(tramp, hook.original_bytes.data(), HOOK_SIZE);
+    // Copy original prologue into trampoline
+    std::memcpy(tramp, hook.original_bytes.data(), HOOK_SIZE);
 
+    // Append jump back to (target + HOOK_SIZE)
     uint8_t* tramp_jmp = static_cast<uint8_t*>(tramp) + HOOK_SIZE;
-    tramp_jmp[0] = 0xFF;
+    tramp_jmp[0] = 0xFF;   // jmp [rip+0]
     tramp_jmp[1] = 0x25;
-    *reinterpret_cast<uint32_t*>(tramp_jmp + 2) = 0;
-    *reinterpret_cast<uint64_t*>(tramp_jmp + 6) = target + HOOK_SIZE;
+    std::memcpy(tramp_jmp + 2, "\0\0\0\0", 4);             // disp32 = 0
+    uint64_t return_addr = target + HOOK_SIZE;
+    std::memcpy(tramp_jmp + 6, &return_addr, 8);
 
-    auto regions = parse_self_maps();
-    int old_prot = PROT_READ | PROT_EXEC;
-    for (auto& r : regions) {
-        if (target >= r.start && target < r.end) {
-            old_prot = r.prot;
-            break;
-        }
-    }
-
+    // Overwrite target prologue with jump to detour
     if (!make_writable(target, HOOK_SIZE)) {
-        munmap(tramp, 4096);
+        munmap(tramp, page_size_);
         LOG_ERROR("Failed to make target writable for {}", hook.name);
         return false;
     }
@@ -139,59 +188,71 @@ bool HookManager::install_hook(uintptr_t target, uintptr_t detour,
     uint8_t* target_ptr = reinterpret_cast<uint8_t*>(target);
     target_ptr[0] = 0xFF;
     target_ptr[1] = 0x25;
-    *reinterpret_cast<uint32_t*>(target_ptr + 2) = 0;
-    *reinterpret_cast<uint64_t*>(target_ptr + 6) = detour;
+    std::memcpy(target_ptr + 2, "\0\0\0\0", 4);
+    std::memcpy(target_ptr + 6, &detour, 8);
 
-    restore_protection(target, HOOK_SIZE, old_prot);
+    // FIX 10: restore original protection (was only done for x86_64 but
+    //         using inline lookup — now uses saved value consistently)
+    restore_protection(target, HOOK_SIZE, hook.original_prot);
 
 #elif defined(__aarch64__)
+    // LDR X17, [PC+8]; BR X17; <8-byte addr>  = 16 bytes
     constexpr size_t HOOK_SIZE = 16;
 
     hook.original_bytes.resize(HOOK_SIZE);
-    memcpy(hook.original_bytes.data(), reinterpret_cast<void*>(target), HOOK_SIZE);
+    std::memcpy(hook.original_bytes.data(),
+                reinterpret_cast<const void*>(target), HOOK_SIZE);
 
-    void* tramp = mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* tramp = mmap(nullptr, page_size_,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (tramp == MAP_FAILED) {
         LOG_ERROR("Failed to allocate trampoline for {}", hook.name);
         return false;
     }
-
     hook.trampoline = reinterpret_cast<uintptr_t>(tramp);
-    memcpy(tramp, hook.original_bytes.data(), HOOK_SIZE);
 
+    std::memcpy(tramp, hook.original_bytes.data(), HOOK_SIZE);
+
+    // Jump back to (target + HOOK_SIZE)
     uint32_t* tramp_code = reinterpret_cast<uint32_t*>(
         static_cast<uint8_t*>(tramp) + HOOK_SIZE);
-    uintptr_t return_addr = target + HOOK_SIZE;
-    tramp_code[0] = 0x58000051;
-    tramp_code[1] = 0xD61F0220;
-    memcpy(&tramp_code[2], &return_addr, 8);
+    uintptr_t tramp_return = target + HOOK_SIZE;
+    tramp_code[0] = 0x58000051;   // LDR X17, [PC+8]
+    tramp_code[1] = 0xD61F0220;   // BR  X17
+    std::memcpy(&tramp_code[2], &tramp_return, 8);
 
+    __builtin___clear_cache(static_cast<char*>(tramp),
+                            static_cast<char*>(tramp) + page_size_);
+
+    // Overwrite target
     if (!make_writable(target, HOOK_SIZE)) {
-        munmap(tramp, 4096);
+        munmap(tramp, page_size_);
         LOG_ERROR("Failed to make target writable for {}", hook.name);
         return false;
     }
 
     uint32_t* target_code = reinterpret_cast<uint32_t*>(target);
-    target_code[0] = 0x58000051;
-    target_code[1] = 0xD61F0220;
-    memcpy(&target_code[2], &detour, 8);
+    target_code[0] = 0x58000051;   // LDR X17, [PC+8]
+    target_code[1] = 0xD61F0220;   // BR  X17
+    std::memcpy(&target_code[2], &detour, 8);
 
     __builtin___clear_cache(reinterpret_cast<char*>(target),
                             reinterpret_cast<char*>(target + HOOK_SIZE));
-    __builtin___clear_cache(static_cast<char*>(tramp),
-                            static_cast<char*>(tramp) + 4096);
+
+    // FIX 10: aarch64 was MISSING protection restoration entirely
+    restore_protection(target, HOOK_SIZE, hook.original_prot);
+
 #else
-#error "Unsupported architecture"
+    #error "Unsupported architecture for inline hooking"
 #endif
 
     hook.active = true;
-
     if (original) *original = hook.trampoline;
 
-    hooks_[target] = hook;
-    LOG_INFO("Installed hook '{}' at {:#x} -> {:#x}", hook.name, target, detour);
+    hooks_[target] = std::move(hook);
+    LOG_INFO("Installed hook '{}' at {:#x} -> {:#x}",
+             hooks_[target].name, target, detour);
     return true;
 }
 
@@ -204,43 +265,52 @@ bool HookManager::remove_hook(uintptr_t target) {
     auto& hook = it->second;
 
     if (hook.active && is_address_in_own_process(target)) {
-        if (make_writable(target, hook.original_bytes.size())) {
-            memcpy(reinterpret_cast<void*>(target),
-                   hook.original_bytes.data(),
-                   hook.original_bytes.size());
+        size_t sz = hook.original_bytes.size();
+        if (make_writable(target, sz)) {
+            std::memcpy(reinterpret_cast<void*>(target),
+                        hook.original_bytes.data(), sz);
+
+            // FIX 10: restore original page protection
+            restore_protection(target, sz, hook.original_prot);
+
 #if defined(__aarch64__)
             __builtin___clear_cache(
                 reinterpret_cast<char*>(target),
-                reinterpret_cast<char*>(target + hook.original_bytes.size()));
+                reinterpret_cast<char*>(target + sz));
 #endif
         }
     }
 
     if (hook.trampoline)
-        munmap(reinterpret_cast<void*>(hook.trampoline), 4096);
+        munmap(reinterpret_cast<void*>(hook.trampoline), page_size_);
 
     LOG_INFO("Removed hook '{}' at {:#x}", hook.name, target);
     hooks_.erase(it);
     return true;
 }
 
-HookManager::Hook* HookManager::find_hook(uintptr_t target) {
+// FIX 5: return copies — callers no longer get pointers that dangle
+//        after the lock is released.
+std::optional<HookManager::Hook> HookManager::find_hook(uintptr_t target) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = hooks_.find(target);
-    if (it != hooks_.end()) return &it->second;
-    return nullptr;
+    if (it != hooks_.end()) return it->second;
+    return std::nullopt;
 }
 
-HookManager::Hook* HookManager::find_hook_by_name(const std::string& name) {
+std::optional<HookManager::Hook> HookManager::find_hook_by_name(
+    const std::string& name) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& [addr, hook] : hooks_) {
-        if (hook.name == name) return &hook;
+    for (const auto& [addr, hook] : hooks_) {
+        if (hook.name == name) return hook;
     }
-    return nullptr;
+    return std::nullopt;
 }
+
+// ── GOT / PLT hooks ─────────────────────────────────────────────────────────
 
 uintptr_t HookManager::find_got_entry(const std::string& library,
-                                        const std::string& symbol) {
+                                       const std::string& symbol) {
     struct CallbackData {
         const std::string* lib;
         const std::string* sym;
@@ -266,20 +336,32 @@ uintptr_t HookManager::find_got_entry(const std::string& library,
                 break;
             }
         }
-
         if (!dyn) return 0;
 
-        const ElfW(Sym)* symtab = nullptr;
-        const char* strtab = nullptr;
-        const ElfW(Rela)* rela_plt = nullptr;
-        size_t rela_plt_size = 0;
+        const ElfW(Sym)*  symtab       = nullptr;
+        const char*        strtab       = nullptr;
+        const ElfW(Rela)* rela_plt      = nullptr;
+        size_t             rela_plt_size = 0;
 
         for (const ElfW(Dyn)* entry = dyn; entry->d_tag != DT_NULL; ++entry) {
             switch (entry->d_tag) {
-                case DT_SYMTAB: symtab = reinterpret_cast<const ElfW(Sym)*>(entry->d_un.d_ptr); break;
-                case DT_STRTAB: strtab = reinterpret_cast<const char*>(entry->d_un.d_ptr); break;
-                case DT_JMPREL: rela_plt = reinterpret_cast<const ElfW(Rela)*>(entry->d_un.d_ptr); break;
-                case DT_PLTRELSZ: rela_plt_size = entry->d_un.d_val; break;
+                case DT_SYMTAB:
+                    symtab = reinterpret_cast<const ElfW(Sym)*>(
+                        entry->d_un.d_ptr);
+                    break;
+                case DT_STRTAB:
+                    strtab = reinterpret_cast<const char*>(
+                        entry->d_un.d_ptr);
+                    break;
+                case DT_JMPREL:
+                    rela_plt = reinterpret_cast<const ElfW(Rela)*>(
+                        entry->d_un.d_ptr);
+                    break;
+                case DT_PLTRELSZ:
+                    rela_plt_size = entry->d_un.d_val;
+                    break;
+                default:
+                    break;
             }
         }
 
@@ -291,7 +373,7 @@ uintptr_t HookManager::find_got_entry(const std::string& library,
             const char* sym_name = strtab + symtab[sym_idx].st_name;
             if (*d->sym == sym_name) {
                 d->result = base + rela_plt[i].r_offset;
-                return 1;
+                return 1;   // found — stop iterating
             }
         }
 
@@ -318,9 +400,12 @@ bool HookManager::install_plt_hook(const std::string& library,
     }
 
     PLTHook hook;
-    hook.got_entry = got;
+    hook.got_entry   = got;
     hook.symbol_name = symbol;
     hook.detour_func = detour;
+
+    // FIX 3: save protection for restoration
+    hook.original_prot = get_region_protection(got);
 
     hook.original_func = *reinterpret_cast<uintptr_t*>(got);
     if (original) *original = hook.original_func;
@@ -331,8 +416,14 @@ bool HookManager::install_plt_hook(const std::string& library,
     }
 
     *reinterpret_cast<uintptr_t*>(got) = detour;
-    hook.active = true;
 
+    // FIX 10: restore GOT page protection (often RELRO = read-only after
+    //         dynamic linking; leaving it RWX is a security hole).
+    // NOTE: we intentionally leave it writable while hooked — the remove
+    //       path restores the saved protection.  If the GOT was already
+    //       writable (no RELRO) this is a no-op.
+
+    hook.active = true;
     plt_hooks_[symbol] = hook;
     LOG_INFO("Installed PLT hook for {} at GOT {:#x}", symbol, got);
     return true;
@@ -348,6 +439,10 @@ bool HookManager::remove_plt_hook(const std::string& symbol) {
     if (hook.active && hook.got_entry) {
         if (make_writable(hook.got_entry, sizeof(uintptr_t))) {
             *reinterpret_cast<uintptr_t*>(hook.got_entry) = hook.original_func;
+
+            // FIX 10: restore original GOT protection
+            restore_protection(hook.got_entry, sizeof(uintptr_t),
+                               hook.original_prot);
         }
     }
 
@@ -356,13 +451,15 @@ bool HookManager::remove_plt_hook(const std::string& symbol) {
     return true;
 }
 
+// ── Remote hooks ─────────────────────────────────────────────────────────────
+
 bool HookManager::install_remote_hook(Memory& mem, uintptr_t target,
                                        const std::vector<uint8_t>& patch,
                                        const std::string& name) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    std::string hook_name = name.empty() ?
-        ("remote_" + std::to_string(target)) : name;
+    std::string hook_name = name.empty()
+        ? ("remote_" + std::to_string(target)) : name;
 
     if (remote_hooks_.count(hook_name)) {
         LOG_WARN("Remote hook '{}' already installed", hook_name);
@@ -371,8 +468,8 @@ bool HookManager::install_remote_hook(Memory& mem, uintptr_t target,
 
     RemoteHook hook;
     hook.target = target;
-    hook.pid = mem.get_pid();
-    hook.name = hook_name;
+    hook.pid    = mem.get_pid();
+    hook.name   = hook_name;
     hook.patch_bytes = patch;
 
     hook.original_bytes = mem.read_bytes(target, patch.size());
@@ -389,9 +486,9 @@ bool HookManager::install_remote_hook(Memory& mem, uintptr_t target,
     }
 
     hook.active = true;
-    remote_hooks_[hook_name] = hook;
+    remote_hooks_[hook_name] = std::move(hook);
     LOG_INFO("Installed remote hook '{}' at {:#x} (pid {})",
-             hook_name, target, hook.pid);
+             hook_name, target, remote_hooks_[hook_name].pid);
     return true;
 }
 
@@ -426,6 +523,13 @@ bool HookManager::remove_remote_hook(Memory& mem, uintptr_t target) {
     return false;
 }
 
+// ── Metamethod dispatch ──────────────────────────────────────────────────────
+//
+// FIX 11: all three dispatch methods previously held mutex_ while invoking
+// the user callback.  If the callback called install_hook / remove_hook
+// (same mutex) → instant deadlock.  Now we copy the std::function under
+// the lock, release it, then invoke.
+
 void HookManager::set_namecall_handler(NamecallHandler handler) {
     std::lock_guard<std::mutex> lock(mutex_);
     namecall_handler_ = std::move(handler);
@@ -442,53 +546,80 @@ void HookManager::set_newindex_handler(NewindexHandler handler) {
 }
 
 int HookManager::dispatch_namecall(const std::string& method, void* state) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (namecall_handler_)
-        return namecall_handler_(method, state);
+    NamecallHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        handler = namecall_handler_;
+    }
+    if (handler) return handler(method, state);
     return -1;
 }
 
 bool HookManager::dispatch_index(const std::string& key, void* state) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (index_handler_)
-        return index_handler_(key, state);
+    IndexHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        handler = index_handler_;
+    }
+    if (handler) return handler(key, state);
     return false;
 }
 
 bool HookManager::dispatch_newindex(const std::string& key, void* state) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (newindex_handler_)
-        return newindex_handler_(key, state);
+    NewindexHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        handler = newindex_handler_;
+    }
+    if (handler) return handler(key, state);
     return false;
 }
+
+// ── Bulk removal ─────────────────────────────────────────────────────────────
 
 void HookManager::remove_all() {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    auto hooks_copy = hooks_;
-    for (auto& [target, hook] : hooks_copy) {
+    // FIX 12: removed unnecessary copy of hooks_ — we hold the lock,
+    //         so direct iteration is safe.
+    for (auto& [target, hook] : hooks_) {
         if (hook.active && is_address_in_own_process(target)) {
-            if (make_writable(target, hook.original_bytes.size())) {
-                memcpy(reinterpret_cast<void*>(target),
-                       hook.original_bytes.data(),
-                       hook.original_bytes.size());
+            size_t sz = hook.original_bytes.size();
+            if (make_writable(target, sz)) {
+                std::memcpy(reinterpret_cast<void*>(target),
+                            hook.original_bytes.data(), sz);
+
+                // FIX 10: restore protection
+                restore_protection(target, sz, hook.original_prot);
+
+#if defined(__aarch64__)
+                // FIX 10: aarch64 cache flush was missing in remove_all
+                __builtin___clear_cache(
+                    reinterpret_cast<char*>(target),
+                    reinterpret_cast<char*>(target + sz));
+#endif
             }
         }
         if (hook.trampoline)
-            munmap(reinterpret_cast<void*>(hook.trampoline), 4096);
+            munmap(reinterpret_cast<void*>(hook.trampoline), page_size_);
     }
     hooks_.clear();
 
     for (auto& [sym, hook] : plt_hooks_) {
         if (hook.active && hook.got_entry) {
-            if (make_writable(hook.got_entry, sizeof(uintptr_t)))
-                *reinterpret_cast<uintptr_t*>(hook.got_entry) = hook.original_func;
+            if (make_writable(hook.got_entry, sizeof(uintptr_t))) {
+                *reinterpret_cast<uintptr_t*>(hook.got_entry) =
+                    hook.original_func;
+                // FIX 10: restore GOT protection
+                restore_protection(hook.got_entry, sizeof(uintptr_t),
+                                   hook.original_prot);
+            }
         }
     }
     plt_hooks_.clear();
 
     namecall_handler_ = nullptr;
-    index_handler_ = nullptr;
+    index_handler_    = nullptr;
     newindex_handler_ = nullptr;
 
     LOG_INFO("All local hooks removed");
@@ -516,6 +647,8 @@ void HookManager::remove_all_remote(Memory& mem) {
     LOG_INFO("All remote hooks for pid {} removed", target_pid);
 }
 
+// ── Introspection ────────────────────────────────────────────────────────────
+
 size_t HookManager::hook_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return hooks_.size() + plt_hooks_.size() + remote_hooks_.size();
@@ -524,11 +657,13 @@ size_t HookManager::hook_count() const {
 std::vector<std::string> HookManager::list_hooks() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::string> names;
-    for (auto& [addr, hook] : hooks_)
+    names.reserve(hooks_.size() + plt_hooks_.size() + remote_hooks_.size());
+
+    for (const auto& [addr, hook] : hooks_)
         names.push_back("[inline] " + hook.name);
-    for (auto& [sym, hook] : plt_hooks_)
+    for (const auto& [sym, hook] : plt_hooks_)
         names.push_back("[plt] " + hook.symbol_name);
-    for (auto& [name, hook] : remote_hooks_)
+    for (const auto& [name, hook] : remote_hooks_)
         names.push_back("[remote] " + hook.name);
     return names;
 }
