@@ -19,6 +19,8 @@
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 namespace fs = std::filesystem;
 
@@ -29,6 +31,7 @@ static constexpr size_t REGION_MIN      = 0x1000;
 static constexpr size_t REGION_MAX      = 0x80000000ULL;
 static constexpr int    AUTOSCAN_TICKS  = 30;
 static constexpr int    TICK_MS         = 100;
+static constexpr const char* PAYLOAD_SOCK = "/tmp/oss_executor.sock";
 
 static const std::string DIRECT_TARGETS[] = {
     "RobloxPlayer", "RobloxPlayerBeta", "RobloxPlayerBeta.exe",
@@ -211,7 +214,8 @@ bool Injection::process_alive() const {
 bool Injection::is_attached() const {
     return memory_.is_valid() &&
            state_ == InjectionState::Ready &&
-           process_alive();
+           process_alive() &&
+           payload_loaded_;
 }
 
 void Injection::set_status_callback(StatusCallback cb) {
@@ -888,29 +892,40 @@ bool Injection::inject() {
 
     bool found = locate_luau_vm();
 
-    if (found && payload_loaded_) {
+    if (payload_loaded_) {
         mode_ = InjectionMode::Full;
-        std::ostringstream hex;
-        hex << "0x" << std::hex << vm_scan_.marker_addr;
-        set_state(InjectionState::Ready,
-                  "Injection complete — Luau VM at " + hex.str());
-        LOG_INFO("Mode: Full | marker='{}' @ 0x{:X} | validated={} | "
-                 "region='{}' base=0x{:X}",
-                 vm_scan_.marker_name, vm_scan_.marker_addr,
-                 vm_scan_.validated,
-                 vm_scan_.region_path, vm_scan_.region_base);
-    } else if (found) {
-        mode_ = InjectionMode::Full;
-        set_state(InjectionState::Ready,
-                  "Attached — VM located but no payload injected");
+        if (found) {
+            std::ostringstream hex;
+            hex << "0x" << std::hex << vm_scan_.marker_addr;
+            set_state(InjectionState::Ready,
+                      "Injection complete \u2014 Luau VM at " + hex.str());
+            LOG_INFO("Mode: Full | marker='{}' @ 0x{:X} | validated={} | "
+                     "region='{}' base=0x{:X}",
+                     vm_scan_.marker_name, vm_scan_.marker_addr,
+                     vm_scan_.validated,
+                     vm_scan_.region_path, vm_scan_.region_base);
+        } else {
+            set_state(InjectionState::Ready,
+                      "Payload injected \u2014 hook active");
+            LOG_INFO("Mode: Full (payload hook) | VM markers not found "
+                     "({} regions, {:.1f}MB scanned)",
+                     vm_scan_.regions_scanned,
+                     vm_scan_.bytes_scanned / (1024.0 * 1024.0));
+        }
     } else {
         mode_ = InjectionMode::LocalOnly;
-        set_state(InjectionState::Ready,
-                  "Attached — local execution mode (Luau VM not located)");
-        LOG_WARN("No Luau markers in {} regions ({:.1f}MB). PID: {}",
-                 vm_scan_.regions_scanned,
-                 vm_scan_.bytes_scanned / (1024.0 * 1024.0),
-                 memory_.get_pid());
+        if (found) {
+            set_state(InjectionState::Ready,
+                      "Attached \u2014 VM located, no payload injected");
+            LOG_WARN("VM markers found but payload injection failed");
+        } else {
+            set_state(InjectionState::Ready,
+                      "Attached \u2014 local execution mode");
+            LOG_WARN("No Luau markers in {} regions ({:.1f}MB). PID: {}",
+                     vm_scan_.regions_scanned,
+                     vm_scan_.bytes_scanned / (1024.0 * 1024.0),
+                     memory_.get_pid());
+        }
     }
     return true;
 }
@@ -918,12 +933,36 @@ bool Injection::inject() {
 bool Injection::verify_payload_alive() {
     if (!payload_loaded_ || !process_alive()) return false;
 
+    bool mapped = false;
     auto regions = memory_.get_regions();
     for (const auto& r : regions) {
-        if (r.path.find("liboss_payload") != std::string::npos)
-            return true;
+        if (r.path.find("liboss_payload") != std::string::npos) {
+            mapped = true;
+            break;
+        }
     }
-    return false;
+    if (!mapped) {
+        payload_loaded_ = false;
+        return false;
+    }
+
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, PAYLOAD_SOCK, sizeof(addr.sun_path) - 1);
+    struct timeval tv{};
+    tv.tv_usec = 500000;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    bool reachable = (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
+                                sizeof(addr)) == 0);
+    ::close(fd);
+
+    if (!reachable) {
+        LOG_WARN("Payload mapped but socket unreachable");
+        payload_loaded_ = false;
+    }
+    return reachable;
 }
 
 bool Injection::execute_script(const std::string& source) {
@@ -935,51 +974,68 @@ bool Injection::execute_script(const std::string& source) {
     if (!process_alive()) {
         set_state(InjectionState::Failed, "Target process exited");
         mode_ = InjectionMode::None;
+        payload_loaded_ = false;
         memory_.set_pid(0);
         return false;
     }
 
     if (source.empty()) return true;
 
+    if (!payload_loaded_) {
+        set_state(InjectionState::Ready, "No payload — local execution only");
+        return false;
+    }
+
     set_state(InjectionState::Executing,
               "Executing (" + std::to_string(source.size()) + " bytes)...");
 
-    if (mode_ == InjectionMode::Full && payload_loaded_) {
-        auto regions = memory_.get_regions();
-        uintptr_t write_addr = 0;
-        size_t required = 8 + source.size();
-
-        for (const auto& r : regions) {
-            if (!r.writable() || !r.readable()) continue;
-            if (!r.path.empty() && r.path[0] == '/') continue;
-            if (r.size() >= required + 64) {
-                write_addr = r.start;
-                break;
-            }
-        }
-
-        if (write_addr != 0) {
-            std::vector<uint8_t> payload;
-            uint32_t magic = 0x4F535345;
-            uint32_t len   = static_cast<uint32_t>(source.size());
-            payload.resize(8 + source.size());
-            std::memcpy(payload.data(), &magic, 4);
-            std::memcpy(payload.data() + 4, &len, 4);
-            std::memcpy(payload.data() + 8, source.data(), source.size());
-
-            if (write_to_process(write_addr, payload.data(), payload.size())) {
-                set_state(InjectionState::Ready, "Script dispatched to payload");
-                LOG_INFO("Wrote {} bytes (magic=0x{:X}) to 0x{:X}",
-                         payload.size(), magic, write_addr);
-                return true;
-            }
-            LOG_WARN("Memory write failed at 0x{:X}", write_addr);
-        } else {
-            LOG_WARN("No suitable writable region found for script dispatch");
-        }
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        set_state(InjectionState::Ready, "Socket creation failed");
+        LOG_ERROR("execute_script socket(): {}", strerror(errno));
+        return false;
     }
 
-    set_state(InjectionState::Ready, "Script queued for local execution");
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, PAYLOAD_SOCK, sizeof(addr.sun_path) - 1);
+
+    struct timeval tv{};
+    tv.tv_sec = 2;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        LOG_ERROR("execute_script connect({}): {}", PAYLOAD_SOCK, strerror(errno));
+        ::close(fd);
+        payload_loaded_ = false;
+        set_state(InjectionState::Ready, "Payload socket unreachable");
+        return false;
+    }
+
+    const char* data = source.data();
+    size_t remaining = source.size();
+    bool write_ok = true;
+    while (remaining > 0) {
+        ssize_t n = ::write(fd, data, remaining);
+        if (n <= 0) {
+            LOG_ERROR("execute_script write(): {}", strerror(errno));
+            write_ok = false;
+            break;
+        }
+        data += n;
+        remaining -= static_cast<size_t>(n);
+    }
+
+    ::shutdown(fd, SHUT_WR);
+    ::close(fd);
+
+    if (write_ok) {
+        set_state(InjectionState::Ready, "Script dispatched to payload");
+        LOG_INFO("Sent {} bytes to payload via {}", source.size(), PAYLOAD_SOCK);
+        return true;
+    }
+
+    set_state(InjectionState::Ready, "Script dispatch failed");
     return false;
 }
 
@@ -1016,3 +1072,4 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
