@@ -844,13 +844,11 @@ void LuaEngine::setup_environment() {
 
 void LuaEngine::register_task_lib() {
     static const luaL_Reg funcs[] = {
-        {"spawn",         lua_task_spawn},
-        {"delay",         lua_task_delay},
-        {"defer",         lua_task_defer},
-        {"wait",          lua_task_wait},
-        {"cancel",        lua_task_cancel},
-        {"desynchronize", lua_task_desynchronize},
-        {"synchronize",   lua_task_synchronize},
+        {"spawn",  lua_task_spawn},
+        {"delay",  lua_task_delay},
+        {"defer",  lua_task_defer},
+        {"wait",   lua_task_wait},
+        {"cancel", lua_task_cancel},
         {nullptr, nullptr}
     };
     register_library("task", funcs);
@@ -934,11 +932,6 @@ void LuaEngine::register_custom_libs() {
     };
     register_library("http", http_lib);
 
-    lua_getglobal(L_, "http");
-    lua_getfield(L_, -1, "get");
-    lua_setglobal(L_, "http_get");
-    lua_pop(L_, 1);
-
     register_function("wait",             lua_wait);
     register_function("spawn",            lua_spawn);
     register_function("getclipboard",     lua_getclipboard);
@@ -965,28 +958,7 @@ void LuaEngine::register_custom_libs() {
 
     set_global_string("_EXECUTOR",         "OSS Executor");
     set_global_string("_EXECUTOR_VERSION", "2.0.0");
-    set_global_number("_EXECUTOR_LEVEL",   8);
     set_global_bool  ("_OSS",              true);
-
-    execute_internal(R"(
-        syn = syn or {}
-        syn.request = syn.request or function(opts)
-            if opts.Method == "POST" then
-                return http.post(opts.Url, opts.Body or "", opts.Headers or {})
-            else
-                return http.get(opts.Url, opts.Headers or {})
-            end
-        end
-        request = request or syn.request
-        http_request = http_request or syn.request
-        game = game or {
-            HttpGet = function(_, url)
-                local ok, res = pcall(function() return http.get(url) end)
-                if ok and res then return res.Body or "" end
-                return ""
-            end
-        }
-    )", "=env_setup");
 }
 
 void LuaEngine::sandbox() {
@@ -1441,9 +1413,6 @@ int LuaEngine::lua_task_cancel(lua_State* L) {
     return 0;
 }
 
-int LuaEngine::lua_task_desynchronize(lua_State*) { return 0; }
-int LuaEngine::lua_task_synchronize(lua_State*)   { return 0; }
-
 int LuaEngine::lua_signal_new(lua_State* L) {
     const char* name = luaL_optstring(L, 1, "");
     auto* eng = get_engine(L);
@@ -1619,18 +1588,9 @@ int LuaEngine::lua_print(lua_State* L) {
 
 int LuaEngine::lua_warn_handler(lua_State* L) {
     const char* msg = luaL_checkstring(L, 1);
-
-    if (msg) {
-        const char* phantom = strstr(msg, "Phantom exec");
-        if (phantom) {
-            LOG_DEBUG("[Lua] (mock mode) {}", msg);
-            return 0;
-        }
-    }
-
     auto* eng = get_engine(L);
-    if (eng && eng->output_cb_) eng->output_cb_(std::string("[WARN] ") + msg);
-    LOG_WARN("[Lua] {}", msg);
+    if (eng && eng->output_cb_) eng->output_cb_(std::string("[WARN] ") + (msg ? msg : ""));
+    LOG_WARN("[Lua] {}", msg ? msg : "");
     return 0;
 }
 
