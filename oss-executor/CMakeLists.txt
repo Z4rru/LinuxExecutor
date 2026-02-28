@@ -12,14 +12,12 @@ endif()
 
 option(OSS_BUILD_TESTS "Build unit tests" OFF)
 
-# ── System dependencies ──
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
 find_package(CURL    REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
-# ── Luau (always fetched) ──
 include(FetchContent)
 FetchContent_Declare(Luau
     GIT_REPOSITORY https://github.com/luau-lang/luau.git
@@ -30,7 +28,6 @@ set(LUAU_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LUAU_BUILD_WEB   OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(Luau)
 
-# ── spdlog (find-or-fetch) ──
 find_package(spdlog 1.12 QUIET CONFIG)
 if(NOT spdlog_FOUND)
     FetchContent_Declare(spdlog
@@ -41,7 +38,6 @@ if(NOT spdlog_FOUND)
     FetchContent_MakeAvailable(spdlog)
 endif()
 
-# ── nlohmann_json (find-or-fetch) ──
 find_package(nlohmann_json 3.11 QUIET CONFIG)
 if(NOT nlohmann_json_FOUND)
     FetchContent_Declare(json
@@ -51,7 +47,6 @@ if(NOT nlohmann_json_FOUND)
     FetchContent_MakeAvailable(json)
 endif()
 
-# ── Main executable (explicit sources) ──
 set(SOURCES
     src/main.cpp
     src/core/executor.cpp
@@ -110,16 +105,14 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     -Wall -Wextra -Wpedantic -Wno-unused-parameter
 )
 
-# ── Injection payload shared library ──
 add_library(oss-payload SHARED src/core/payload.cpp)
 
 target_include_directories(oss-payload PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${Luau_SOURCE_DIR}/Compiler/include   # luacode.h  →  luau_compile()
+    ${Luau_SOURCE_DIR}/Compiler/include
     ${Luau_SOURCE_DIR}/Ast/include
-    ${Luau_SOURCE_DIR}/VM/include         # lua.h, lualib.h
+    ${Luau_SOURCE_DIR}/VM/include
     ${Luau_SOURCE_DIR}/Common/include
-    # REMOVED: ${Luau_SOURCE_DIR}/VM/src  ← internal headers, not needed & can break
 )
 
 target_link_libraries(oss-payload PRIVATE
@@ -134,11 +127,9 @@ target_compile_options(oss-payload PRIVATE
 set_target_properties(oss-payload PROPERTIES
     OUTPUT_NAME "oss_payload"
     PREFIX      "lib"
-    # Ensure PIC even if global flag somehow missed this target
     POSITION_INDEPENDENT_CODE ON
 )
 
-# ── Post-build resource copy ──
 if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -146,7 +137,6 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
             $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources)
 endif()
 
-# ── Install ──
 install(TARGETS ${PROJECT_NAME} oss-payload
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib)
@@ -154,4 +144,3 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
-
