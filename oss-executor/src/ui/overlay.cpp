@@ -1,4 +1,3 @@
-// src/ui/overlay.cpp
 #include "overlay.hpp"
 #include <cmath>
 #include <algorithm>
@@ -94,6 +93,16 @@ void Overlay::shutdown() {
         }
         objects_.clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(gui_mutex_);
+        for (auto& [id, elem] : gui_elements_) {
+            if (elem.image_surface) {
+                cairo_surface_destroy(elem.image_surface);
+                elem.image_surface = nullptr;
+            }
+        }
+        gui_elements_.clear();
+    }
     if (window_) { gtk_window_destroy(window_); window_ = nullptr; }
     drawing_area_ = nullptr;
     initialized_ = false;
@@ -123,6 +132,8 @@ bool Overlay::is_visible() const {
     return visible_.load(std::memory_order_acquire);
 }
 
+// ── Drawing Object API ──
+
 int Overlay::create_object(DrawingObject::Type type) {
     std::lock_guard<std::mutex> lock(mutex_);
     int id = next_id_++;
@@ -140,10 +151,7 @@ void Overlay::create_object_with_id(int id, DrawingObject::Type type) {
     obj.id   = id;
     obj.type = type;
     objects_[id] = std::move(obj);
-    // Keep next_id_ ahead of any caller-chosen ID
-    if (id >= next_id_) {
-        next_id_ = id + 1;
-    }
+    if (id >= next_id_) next_id_ = id + 1;
     dirty_.store(true, std::memory_order_release);
 }
 
@@ -151,9 +159,8 @@ void Overlay::remove_object(int id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = objects_.find(id);
     if (it != objects_.end()) {
-        if (it->second.image_surface) {
+        if (it->second.image_surface)
             cairo_surface_destroy(it->second.image_surface);
-        }
         objects_.erase(it);
         dirty_.store(true, std::memory_order_release);
     }
@@ -192,11 +199,170 @@ std::vector<DrawingObject> Overlay::snapshot_objects() const {
     result.reserve(objects_.size());
     for (const auto& [id, obj] : objects_) {
         result.push_back(obj);
-        if (result.back().image_surface) {
+        if (result.back().image_surface)
             cairo_surface_reference(result.back().image_surface);
-        }
     }
     return result;
+}
+
+// ── GUI Element API ──
+
+int Overlay::create_gui_element(const std::string& class_name, const std::string& name) {
+    std::lock_guard<std::mutex> lock(gui_mutex_);
+    int id = gui_next_id_++;
+    GuiElement elem;
+    elem.id = id;
+    elem.class_name = class_name;
+    elem.name = name;
+
+    // Classify
+    if (class_name == "ScreenGui" || class_name == "BillboardGui" || class_name == "SurfaceGui") {
+        elem.is_screen_gui = true;
+        elem.visible = true;
+        elem.enabled = true;
+    } else if (class_name == "Frame" || class_name == "TextLabel" || class_name == "TextButton" ||
+               class_name == "TextBox" || class_name == "ImageLabel" || class_name == "ImageButton" ||
+               class_name == "ScrollingFrame" || class_name == "ViewportFrame" ||
+               class_name == "CanvasGroup") {
+        elem.is_gui_object = true;
+    } else if (class_name == "UICorner" || class_name == "UIStroke" || class_name == "UIGradient" ||
+               class_name == "UIPadding" || class_name == "UIListLayout" || class_name == "UIGridLayout" ||
+               class_name == "UIScale" || class_name == "UIAspectRatioConstraint" ||
+               class_name == "UISizeConstraint" || class_name == "UITextSizeConstraint") {
+        // UI modifiers — not directly rendered but affect parent
+        elem.is_gui_object = false;
+    }
+
+    if (class_name == "TextLabel" || class_name == "TextButton" || class_name == "TextBox") {
+        elem.is_text_class = true;
+    }
+    if (class_name == "ImageLabel" || class_name == "ImageButton") {
+        elem.is_image_class = true;
+    }
+
+    // Defaults per class
+    if (elem.is_gui_object) {
+        elem.bg_r = 1; elem.bg_g = 1; elem.bg_b = 1;
+        elem.bg_transparency = 0;
+        elem.size_x_offset = 100; elem.size_y_offset = 100;
+    }
+    if (class_name == "Frame") {
+        elem.bg_r = 1; elem.bg_g = 1; elem.bg_b = 1;
+    }
+    if (elem.is_text_class) {
+        elem.text_r = 0; elem.text_g = 0; elem.text_b = 0;
+        elem.text_size = 14;
+        elem.bg_transparency = 0;
+    }
+
+    gui_elements_[id] = std::move(elem);
+    gui_dirty_.store(true, std::memory_order_release);
+    dirty_.store(true, std::memory_order_release);
+    return id;
+}
+
+void Overlay::remove_gui_element(int id) {
+    std::lock_guard<std::mutex> lock(gui_mutex_);
+    auto it = gui_elements_.find(id);
+    if (it == gui_elements_.end()) return;
+
+    // Remove from parent's children list
+    if (it->second.parent_id > 0) {
+        auto pit = gui_elements_.find(it->second.parent_id);
+        if (pit != gui_elements_.end()) {
+            auto& cv = pit->second.children_ids;
+            cv.erase(std::remove(cv.begin(), cv.end(), id), cv.end());
+        }
+    }
+
+    // Recursively remove children
+    std::vector<int> to_remove = it->second.children_ids;
+    if (it->second.image_surface)
+        cairo_surface_destroy(it->second.image_surface);
+    gui_elements_.erase(it);
+
+    for (int cid : to_remove) {
+        auto cit = gui_elements_.find(cid);
+        if (cit != gui_elements_.end()) {
+            if (cit->second.image_surface)
+                cairo_surface_destroy(cit->second.image_surface);
+            // Collect grandchildren
+            for (int gcid : cit->second.children_ids)
+                to_remove.push_back(gcid);
+            gui_elements_.erase(cit);
+        }
+    }
+
+    gui_dirty_.store(true, std::memory_order_release);
+    dirty_.store(true, std::memory_order_release);
+}
+
+void Overlay::clear_gui_elements() {
+    std::lock_guard<std::mutex> lock(gui_mutex_);
+    for (auto& [id, elem] : gui_elements_) {
+        if (elem.image_surface) {
+            cairo_surface_destroy(elem.image_surface);
+            elem.image_surface = nullptr;
+        }
+    }
+    gui_elements_.clear();
+    gui_dirty_.store(true, std::memory_order_release);
+    dirty_.store(true, std::memory_order_release);
+}
+
+void Overlay::set_gui_parent(int child_id, int parent_id) {
+    std::lock_guard<std::mutex> lock(gui_mutex_);
+    auto cit = gui_elements_.find(child_id);
+    if (cit == gui_elements_.end()) return;
+
+    // Remove from old parent
+    if (cit->second.parent_id > 0) {
+        auto opit = gui_elements_.find(cit->second.parent_id);
+        if (opit != gui_elements_.end()) {
+            auto& cv = opit->second.children_ids;
+            cv.erase(std::remove(cv.begin(), cv.end(), child_id), cv.end());
+        }
+    }
+
+    cit->second.parent_id = parent_id;
+
+    // Add to new parent
+    if (parent_id > 0) {
+        auto pit = gui_elements_.find(parent_id);
+        if (pit != gui_elements_.end()) {
+            pit->second.children_ids.push_back(child_id);
+
+            // If child is UICorner, apply corner radius to parent
+            if (cit->second.class_name == "UICorner") {
+                // Default UICorner radius is 8px
+                pit->second.corner_radius = 8;
+            }
+            // If child is UIStroke, apply stroke to parent
+            else if (cit->second.class_name == "UIStroke") {
+                pit->second.has_stroke = true;
+                pit->second.stroke_thickness = cit->second.stroke_thickness;
+                pit->second.stroke_r = cit->second.stroke_r;
+                pit->second.stroke_g = cit->second.stroke_g;
+                pit->second.stroke_b = cit->second.stroke_b;
+                pit->second.stroke_transparency = cit->second.stroke_transparency;
+            }
+            // If child is UIPadding, apply padding to parent
+            else if (cit->second.class_name == "UIPadding") {
+                pit->second.pad_top = cit->second.pad_top;
+                pit->second.pad_bottom = cit->second.pad_bottom;
+                pit->second.pad_left = cit->second.pad_left;
+                pit->second.pad_right = cit->second.pad_right;
+            }
+        }
+    }
+
+    gui_dirty_.store(true, std::memory_order_release);
+    dirty_.store(true, std::memory_order_release);
+}
+
+int Overlay::gui_element_count() const {
+    std::lock_guard<std::mutex> lock(gui_mutex_);
+    return static_cast<int>(gui_elements_.size());
 }
 
 void Overlay::set_custom_render(RenderCallback cb, void* ud) {
@@ -222,13 +388,12 @@ gboolean Overlay::tick_callback(gpointer data) {
     self->frame_count_++;
 
     bool needs = self->dirty_.exchange(false, std::memory_order_acq_rel);
-    if (!needs && (self->frame_count_ % 4 == 0)) {
+    if (!needs && (self->frame_count_ % 4 == 0))
         needs = true;
-    }
 
-    if (needs && self->drawing_area_) {
+    if (needs && self->drawing_area_)
         gtk_widget_queue_draw(self->drawing_area_);
-    }
+
     return G_SOURCE_CONTINUE;
 }
 
@@ -243,10 +408,13 @@ void Overlay::render(cairo_t* cr, int width, int height) {
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
-    if (custom_render_) {
+    if (custom_render_)
         custom_render_(cr, width, height, custom_render_ud_);
-    }
 
+    // Render GUI elements first (behind Drawing objects, matching Roblox layering)
+    render_gui(cr, width, height);
+
+    // Render Drawing objects on top
     std::vector<DrawingObject> vis;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -275,6 +443,347 @@ void Overlay::render(cairo_t* cr, int width, int height) {
         cairo_restore(cr);
     }
 }
+
+// ── GUI Rendering ──
+
+void Overlay::render_gui(cairo_t* cr, int width, int height) {
+    // Collect all ScreenGui roots, sorted by DisplayOrder
+    std::vector<const GuiElement*> roots;
+    {
+        std::lock_guard<std::mutex> lock(gui_mutex_);
+
+        // First resolve all layouts
+        for (auto& [id, elem] : gui_elements_) {
+            if (elem.is_screen_gui && elem.enabled && elem.visible) {
+                // Resolve layout for this tree
+                float inset_top = elem.ignore_gui_inset ? 0.0f : 36.0f;
+                resolve_gui_layout(elem, 0, inset_top,
+                    static_cast<float>(width),
+                    static_cast<float>(height) - inset_top);
+            }
+        }
+
+        for (const auto& [id, elem] : gui_elements_) {
+            if (elem.is_screen_gui && elem.enabled && elem.visible)
+                roots.push_back(&elem);
+        }
+
+        std::sort(roots.begin(), roots.end(),
+            [](const GuiElement* a, const GuiElement* b) {
+                return a->display_order < b->display_order;
+            });
+
+        // Render each tree
+        for (const auto* root : roots) {
+            render_gui_children(cr, *root);
+        }
+    }
+}
+
+void Overlay::resolve_gui_layout(GuiElement& elem,
+                                  float parent_x, float parent_y,
+                                  float parent_w, float parent_h) {
+    if (elem.is_screen_gui) {
+        // ScreenGui fills the screen
+        elem.x = parent_x;
+        elem.y = parent_y;
+        elem.w = parent_w;
+        elem.h = parent_h;
+    } else if (elem.is_gui_object) {
+        // Resolve UDim2 Size
+        elem.w = elem.size_x_scale * parent_w + elem.size_x_offset;
+        elem.h = elem.size_y_scale * parent_h + elem.size_y_offset;
+
+        // Resolve UDim2 Position
+        float px = elem.pos_x_scale * parent_w + elem.pos_x_offset;
+        float py = elem.pos_y_scale * parent_h + elem.pos_y_offset;
+
+        // Apply AnchorPoint
+        px -= elem.anchor_x * elem.w;
+        py -= elem.anchor_y * elem.h;
+
+        elem.x = parent_x + px;
+        elem.y = parent_y + py;
+    }
+
+    // Apply padding to children area
+    float child_x = elem.x + elem.pad_left;
+    float child_y = elem.y + elem.pad_top;
+    float child_w = elem.w - elem.pad_left - elem.pad_right;
+    float child_h = elem.h - elem.pad_top - elem.pad_bottom;
+    if (child_w < 0) child_w = 0;
+    if (child_h < 0) child_h = 0;
+
+    // Check for UIListLayout among children
+    bool has_list_layout = false;
+    bool vertical_layout = true;
+    float layout_padding = 0;
+    for (int cid : elem.children_ids) {
+        auto it = gui_elements_.find(cid);
+        if (it != gui_elements_.end() && it->second.class_name == "UIListLayout") {
+            has_list_layout = true;
+            // FillDirection check (simplified)
+            layout_padding = it->second.pad_top; // Reuse pad_top for Padding UDim offset
+            break;
+        }
+    }
+
+    float layout_offset = 0;
+
+    // Collect and sort children by LayoutOrder/ZIndex for layout
+    struct ChildSort { int id; int layout_order; int z_index; };
+    std::vector<ChildSort> sorted_children;
+    for (int cid : elem.children_ids) {
+        auto it = gui_elements_.find(cid);
+        if (it != gui_elements_.end() && it->second.is_gui_object)
+            sorted_children.push_back({cid, it->second.layout_order, it->second.z_index});
+    }
+    if (has_list_layout) {
+        std::sort(sorted_children.begin(), sorted_children.end(),
+            [](const ChildSort& a, const ChildSort& b) {
+                return a.layout_order < b.layout_order;
+            });
+    }
+
+    // Resolve children
+    for (const auto& cs : sorted_children) {
+        auto it = gui_elements_.find(cs.id);
+        if (it == gui_elements_.end()) continue;
+        auto& child = it->second;
+
+        if (has_list_layout && child.is_gui_object) {
+            // Override position for list layout
+            if (vertical_layout) {
+                child.pos_x_scale = 0; child.pos_x_offset = 0;
+                child.pos_y_scale = 0; child.pos_y_offset = layout_offset;
+                resolve_gui_layout(child, child_x, child_y, child_w, child_h);
+                layout_offset += child.h + layout_padding;
+            } else {
+                child.pos_x_offset = layout_offset;
+                child.pos_y_scale = 0; child.pos_y_offset = 0;
+                resolve_gui_layout(child, child_x, child_y, child_w, child_h);
+                layout_offset += child.w + layout_padding;
+            }
+        } else {
+            resolve_gui_layout(child, child_x, child_y, child_w, child_h);
+        }
+    }
+
+    // Also resolve non-gui-object children (UICorner etc don't need layout but
+    // their children might)
+    for (int cid : elem.children_ids) {
+        auto it = gui_elements_.find(cid);
+        if (it != gui_elements_.end() && !it->second.is_gui_object) {
+            // UI modifiers don't need layout resolution
+        }
+    }
+}
+
+void Overlay::render_gui_element(cairo_t* cr, const GuiElement& elem) {
+    if (!elem.visible || !elem.is_gui_object) return;
+
+    float alpha_bg = 1.0f - elem.bg_transparency;
+
+    cairo_save(cr);
+
+    // Clipping
+    if (elem.clips_descendants) {
+        if (elem.corner_radius > 0) {
+            render_gui_rounded_rect(cr, elem.x, elem.y, elem.w, elem.h, elem.corner_radius);
+            cairo_clip(cr);
+        } else {
+            cairo_rectangle(cr, elem.x, elem.y, elem.w, elem.h);
+            cairo_clip(cr);
+        }
+    }
+
+    // Rotation
+    if (std::fabs(elem.rotation) > 0.01f) {
+        float cx = elem.x + elem.w / 2.0f;
+        float cy = elem.y + elem.h / 2.0f;
+        cairo_translate(cr, cx, cy);
+        cairo_rotate(cr, elem.rotation * M_PI / 180.0);
+        cairo_translate(cr, -cx, -cy);
+    }
+
+    // Background
+    if (alpha_bg > 0.001f) {
+        cairo_set_source_rgba(cr, elem.bg_r, elem.bg_g, elem.bg_b, alpha_bg);
+        if (elem.corner_radius > 0) {
+            render_gui_rounded_rect(cr, elem.x, elem.y, elem.w, elem.h, elem.corner_radius);
+            cairo_fill(cr);
+        } else {
+            cairo_rectangle(cr, elem.x, elem.y, elem.w, elem.h);
+            cairo_fill(cr);
+        }
+    }
+
+    // Border
+    if (elem.border_size > 0) {
+        float ba = 1.0f; // Border is always opaque in Roblox
+        cairo_set_source_rgba(cr, elem.border_r, elem.border_g, elem.border_b, ba);
+        cairo_set_line_width(cr, elem.border_size);
+        if (elem.corner_radius > 0) {
+            render_gui_rounded_rect(cr, elem.x, elem.y, elem.w, elem.h, elem.corner_radius);
+            cairo_stroke(cr);
+        } else {
+            cairo_rectangle(cr, elem.x, elem.y, elem.w, elem.h);
+            cairo_stroke(cr);
+        }
+    }
+
+    // UIStroke
+    if (elem.has_stroke && elem.stroke_thickness > 0) {
+        float sa = 1.0f - elem.stroke_transparency;
+        if (sa > 0.001f) {
+            cairo_set_source_rgba(cr, elem.stroke_r, elem.stroke_g, elem.stroke_b, sa);
+            cairo_set_line_width(cr, elem.stroke_thickness);
+            if (elem.corner_radius > 0) {
+                render_gui_rounded_rect(cr, elem.x, elem.y, elem.w, elem.h, elem.corner_radius);
+                cairo_stroke(cr);
+            } else {
+                cairo_rectangle(cr, elem.x, elem.y, elem.w, elem.h);
+                cairo_stroke(cr);
+            }
+        }
+    }
+
+    // Image
+    if (elem.is_image_class && elem.image_surface) {
+        float ia = 1.0f - elem.image_transparency;
+        if (ia > 0.001f) {
+            int iw = cairo_image_surface_get_width(elem.image_surface);
+            int ih = cairo_image_surface_get_height(elem.image_surface);
+            if (iw > 0 && ih > 0) {
+                cairo_save(cr);
+                if (elem.corner_radius > 0) {
+                    render_gui_rounded_rect(cr, elem.x, elem.y, elem.w, elem.h, elem.corner_radius);
+                    cairo_clip(cr);
+                }
+                double sx = elem.w / iw;
+                double sy = elem.h / ih;
+                cairo_translate(cr, elem.x, elem.y);
+                cairo_scale(cr, sx, sy);
+                cairo_set_source_surface(cr, elem.image_surface, 0, 0);
+                cairo_paint_with_alpha(cr, ia);
+                cairo_restore(cr);
+            }
+        }
+    }
+
+    // Text
+    if (elem.is_text_class && !elem.text.empty()) {
+        render_gui_text(cr, elem);
+    }
+
+    // Render children
+    render_gui_children(cr, elem);
+
+    cairo_restore(cr);
+}
+
+void Overlay::render_gui_children(cairo_t* cr, const GuiElement& elem) {
+    // Sort children by ZIndex for rendering
+    struct RenderChild { int id; int z_index; };
+    std::vector<RenderChild> children;
+
+    for (int cid : elem.children_ids) {
+        auto it = gui_elements_.find(cid);
+        if (it != gui_elements_.end() && it->second.is_gui_object)
+            children.push_back({cid, it->second.z_index});
+    }
+
+    std::sort(children.begin(), children.end(),
+        [](const RenderChild& a, const RenderChild& b) {
+            return a.z_index < b.z_index;
+        });
+
+    for (const auto& rc : children) {
+        auto it = gui_elements_.find(rc.id);
+        if (it != gui_elements_.end())
+            render_gui_element(cr, it->second);
+    }
+}
+
+void Overlay::render_gui_text(cairo_t* cr, const GuiElement& elem) {
+    float ta = 1.0f - elem.text_transparency;
+    if (ta <= 0.001f) return;
+
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, elem.text_size);
+
+    cairo_text_extents_t ext;
+    cairo_text_extents(cr, elem.text.c_str(), &ext);
+
+    // Calculate text position based on alignment
+    float tx = elem.x + elem.pad_left;
+    float ty = elem.y + elem.pad_top;
+    float content_w = elem.w - elem.pad_left - elem.pad_right;
+    float content_h = elem.h - elem.pad_top - elem.pad_bottom;
+
+    // X alignment
+    switch (elem.text_x_alignment) {
+        case 0: // Left
+            tx += 2; // Small padding
+            break;
+        case 1: // Center
+            tx += (content_w - static_cast<float>(ext.width)) / 2.0f;
+            break;
+        case 2: // Right
+            tx += content_w - static_cast<float>(ext.width) - 2;
+            break;
+    }
+
+    // Y alignment
+    switch (elem.text_y_alignment) {
+        case 0: // Top
+            ty += elem.text_size;
+            break;
+        case 1: // Center
+            ty += (content_h + elem.text_size) / 2.0f - 2;
+            break;
+        case 2: // Bottom
+            ty += content_h - 2;
+            break;
+    }
+
+    // Text stroke
+    if (elem.text_stroke_transparency < 0.999f) {
+        float sa = 1.0f - elem.text_stroke_transparency;
+        cairo_set_source_rgba(cr, elem.text_stroke_r, elem.text_stroke_g, elem.text_stroke_b, sa);
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                if (dx == 0 && dy == 0) continue;
+                cairo_move_to(cr, tx + dx, ty + dy);
+                cairo_show_text(cr, elem.text.c_str());
+            }
+        }
+    }
+
+    // Clip text to element bounds
+    cairo_save(cr);
+    cairo_rectangle(cr, elem.x, elem.y, elem.w, elem.h);
+    cairo_clip(cr);
+
+    cairo_set_source_rgba(cr, elem.text_r, elem.text_g, elem.text_b, ta);
+    cairo_move_to(cr, tx, ty);
+    cairo_show_text(cr, elem.text.c_str());
+
+    cairo_restore(cr);
+}
+
+void Overlay::render_gui_rounded_rect(cairo_t* cr, float x, float y,
+                                       float w, float h, float r) {
+    r = std::min(r, std::min(w, h) / 2.0f);
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + w - r, y + r,     r, -M_PI / 2.0, 0);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0,            M_PI / 2.0);
+    cairo_arc(cr, x + r,     y + h - r, r, M_PI / 2.0,   M_PI);
+    cairo_arc(cr, x + r,     y + r,     r, M_PI,          3.0 * M_PI / 2.0);
+    cairo_close_path(cr);
+}
+
+// ── Drawing Object Renderers (unchanged) ──
 
 void Overlay::render_line(cairo_t* cr, const DrawingObject& obj) {
     double a = 1.0 - obj.transparency;
