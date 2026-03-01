@@ -876,6 +876,14 @@ uintptr_t Injection::find_remote_symbol(pid_t pid, const std::string& lib_name,
         }
     }
 
+
+    if (proc_info_.via_flatpak || proc_info_.via_sober) {
+        LOG_WARN("ELF lookup failed for '{}' in lib{} — "
+                 "skipping unsafe local fallback (containerized target)",
+                 symbol, lib_name);
+        return 0;
+    }
+
     uintptr_t local_symbol = 0;
     void* handle = dlopen(("lib" + lib_name + ".so.6").c_str(),
                           RTLD_LAZY | RTLD_NOLOAD);
@@ -1036,10 +1044,27 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
 
     uintptr_t rip = orig_regs.rip;
     long orig_code[2];
+    errno = 0;
     orig_code[0] = ptrace(PTRACE_PEEKTEXT, pid,
                           reinterpret_cast<void*>(rip), nullptr);
+    if (orig_code[0] == -1 && errno != 0) {
+        error_ = "PEEKTEXT failed at RIP 0x" +
+                 ([&]{ std::ostringstream o; o << std::hex << rip;
+                       return o.str(); })() +
+                 ": " + std::string(strerror(errno));
+        LOG_ERROR("inject_shellcode: {}", error_);
+        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+        return false;
+    }
+    errno = 0;
     orig_code[1] = ptrace(PTRACE_PEEKTEXT, pid,
                           reinterpret_cast<void*>(rip + 8), nullptr);
+    if (orig_code[1] == -1 && errno != 0) {
+        error_ = "PEEKTEXT failed at RIP+8: " + std::string(strerror(errno));
+        LOG_ERROR("inject_shellcode: {}", error_);
+        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+        return false;
+    }
 
     auto restore_and_detach = [&]() {
         ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
@@ -1232,6 +1257,38 @@ bool Injection::inject() {
 
     std::string payload = find_payload_path();
     if (!payload.empty()) {
+    
+        {
+            std::ifstream scope_file("/proc/sys/kernel/yama/ptrace_scope");
+            if (scope_file.is_open()) {
+                int scope = -1;
+                scope_file >> scope;
+                scope_file.close();
+                if (scope > 0) {
+                    LOG_WARN("yama/ptrace_scope is {} (need 0 for injection)", scope);
+                  
+                    {
+                        std::ofstream fix("/proc/sys/kernel/yama/ptrace_scope",
+                                         std::ios::trunc);
+                        if (fix.is_open()) { fix << "0"; fix.close(); }
+                    }
+                    
+                    std::ifstream recheck("/proc/sys/kernel/yama/ptrace_scope");
+                    if (recheck.is_open()) {
+                        int new_scope = -1;
+                        recheck >> new_scope;
+                        if (new_scope == 0) {
+                            LOG_INFO("Auto-lowered ptrace_scope to 0");
+                        } else {
+                            LOG_WARN("Cannot lower ptrace_scope (need root) — "
+                                     "run: echo 0 | sudo tee "
+                                     "/proc/sys/kernel/yama/ptrace_scope");
+                        }
+                    }
+                }
+            }
+        }
+
         set_state(InjectionState::Injecting,
                   "Injecting payload library into PID " +
                   std::to_string(memory_.get_pid()) + "...");
@@ -1258,6 +1315,13 @@ bool Injection::inject() {
             }
         } else {
             LOG_WARN("Library injection failed ({}), continuing with VM-scan mode", error_);
+        
+            if (proc_info_.via_flatpak || proc_info_.via_sober) {
+                std::string staged = "/proc/" + std::to_string(memory_.get_pid()) +
+                                     "/root/tmp/liboss_payload.so";
+                if (std::remove(staged.c_str()) == 0)
+                    LOG_DEBUG("Cleaned up staged payload: {}", staged);
+            }
         }
     } else {
         LOG_WARN("Payload library not found, using memory-scan mode");
@@ -1461,6 +1525,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
