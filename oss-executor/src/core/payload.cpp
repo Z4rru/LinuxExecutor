@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <vector>
 #include <algorithm>
+#include <elf.h>
 
 static constexpr const char* SOCK_PATH    = "/tmp/oss_executor.sock";
 static constexpr size_t      RECV_BUF     = 1 << 18;
@@ -57,7 +58,7 @@ using fn_resume  = int   (*)(lua_State*, lua_State*, int);
 using fn_newthread = lua_State* (*)(lua_State*);
 using fn_settop  = void  (*)(lua_State*, int);
 using fn_tolstring = const char* (*)(lua_State*, int, size_t*);
-using fn_gettop  = int   (*)(lua_State*, ...);
+using fn_gettop  = int   (*)(lua_State*);
 using fn_sandbox = void  (*)(lua_State*);
 
 struct {
@@ -99,17 +100,35 @@ static void drain_queue(lua_State* L) {
         batch.swap(G.queue);
     }
     for (auto& src : batch) {
+        if (src.empty()) continue;
+
+        const char* bc_data = nullptr;
         size_t bc_sz = 0;
-        char* bc = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
-        if (!bc || bc_sz == 0) {
-            fprintf(stderr, "[payload] compile fail\n");
-            free(bc);
+        char* compiled = nullptr;
+
+        uint8_t first_byte = static_cast<uint8_t>(src[0]);
+        bool is_bytecode = (first_byte >= 1 && first_byte <= 6 && src.size() > 4);
+
+        if (is_bytecode) {
+            bc_data = src.data();
+            bc_sz = src.size();
+        } else if (G.compile) {
+            compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
+            if (!compiled || bc_sz == 0) {
+                fprintf(stderr, "[payload] compile fail\n");
+                free(compiled);
+                continue;
+            }
+            bc_data = compiled;
+        } else {
+            fprintf(stderr, "[payload] no compiler and received source, skipping %zu bytes\n", src.size());
             continue;
         }
+
         lua_State* th = G.newthread(L);
         set_identity(th);
-        int lr = G.load(th, "=oss", bc, bc_sz, 0);
-        free(bc);
+        int lr = G.load(th, "=oss", bc_data, bc_sz, 0);
+        free(compiled);
         if (lr != 0) {
             size_t len = 0;
             const char* e = G.tolstring(th, -1, &len);
@@ -277,7 +296,8 @@ static void restore_hook() {
 static bool find_module() {
     auto regions = get_regions();
     const char* names[] = {"libroblox", "RobloxPlayer", "RobloxPlayerBeta",
-                           "libclient", "Roblox", "Player", nullptr};
+                           "libclient", "Roblox", "Player",
+                           "sober", ".sober-wrapped", nullptr};
     std::ifstream maps("/proc/self/maps");
     std::string line;
     uintptr_t lo = UINTPTR_MAX, hi = 0;
@@ -327,6 +347,7 @@ static bool find_module() {
             if (filepath.find("/libgcc") != std::string::npos) continue;
             if (filepath.find("/librt") != std::string::npos) continue;
             if (filepath.find("/liboss_payload") != std::string::npos) continue;
+            if (filepath.find("/libmimalloc") != std::string::npos) continue;
             best_sz = sz;
             best_file = filepath;
         }
@@ -365,6 +386,202 @@ static bool find_module() {
     return true;
 }
 
+static uintptr_t get_exe_load_offset() {
+    char exe_path[512];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len <= 0) return 0;
+    exe_path[len] = '\0';
+    char* del = strstr(exe_path, " (deleted)");
+    if (del) *del = '\0';
+
+    FILE* ef = fopen(exe_path, "rb");
+    if (!ef) return 0;
+
+    Elf64_Ehdr ehdr;
+    if (fread(&ehdr, sizeof(ehdr), 1, ef) != 1 ||
+        memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+        fclose(ef);
+        return 0;
+    }
+
+    uintptr_t first_vaddr = UINTPTR_MAX;
+    for (int i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+        fseek(ef, static_cast<long>(ehdr.e_phoff + i * ehdr.e_phentsize), SEEK_SET);
+        if (fread(&phdr, sizeof(phdr), 1, ef) != 1) break;
+        if (phdr.p_type == PT_LOAD && phdr.p_vaddr < first_vaddr)
+            first_vaddr = phdr.p_vaddr;
+    }
+    fclose(ef);
+    if (first_vaddr == UINTPTR_MAX) return 0;
+
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find(exe_path) == std::string::npos) continue;
+        uintptr_t lo;
+        unsigned long offset;
+        char perms[5]{};
+        if (sscanf(line.c_str(), "%lx-%*lx %4s %lx", &lo, perms, &offset) == 3 && offset == 0)
+            return lo - first_vaddr;
+    }
+    return 0;
+}
+
+static uintptr_t find_elf_sym(const char* name) {
+    char exe_path[512];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len <= 0) return 0;
+    exe_path[len] = '\0';
+    char* del = strstr(exe_path, " (deleted)");
+    if (del) *del = '\0';
+
+    FILE* ef = fopen(exe_path, "rb");
+    if (!ef) return 0;
+
+    Elf64_Ehdr ehdr;
+    if (fread(&ehdr, sizeof(ehdr), 1, ef) != 1 ||
+        memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+        fclose(ef);
+        return 0;
+    }
+
+    if (ehdr.e_shnum == 0 || ehdr.e_shentsize < sizeof(Elf64_Shdr)) {
+        fclose(ef);
+        return 0;
+    }
+
+    std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
+    fseek(ef, static_cast<long>(ehdr.e_shoff), SEEK_SET);
+    if (fread(shdrs.data(), sizeof(Elf64_Shdr), ehdr.e_shnum, ef) != ehdr.e_shnum) {
+        fclose(ef);
+        return 0;
+    }
+
+    uintptr_t load_off = get_exe_load_offset();
+
+    for (size_t si = 0; si < shdrs.size(); si++) {
+        if (shdrs[si].sh_type != SHT_SYMTAB && shdrs[si].sh_type != SHT_DYNSYM)
+            continue;
+
+        uint32_t str_idx = shdrs[si].sh_link;
+        if (str_idx >= shdrs.size()) continue;
+
+        size_t strsz = shdrs[str_idx].sh_size;
+        if (strsz == 0) continue;
+        std::vector<char> strtab(strsz);
+        fseek(ef, static_cast<long>(shdrs[str_idx].sh_offset), SEEK_SET);
+        if (fread(strtab.data(), 1, strsz, ef) != strsz) continue;
+
+        size_t entsize = shdrs[si].sh_entsize;
+        if (entsize < sizeof(Elf64_Sym)) entsize = sizeof(Elf64_Sym);
+        size_t nsyms = shdrs[si].sh_size / entsize;
+
+        for (size_t j = 0; j < nsyms; j++) {
+            Elf64_Sym sym;
+            fseek(ef, static_cast<long>(shdrs[si].sh_offset + j * entsize), SEEK_SET);
+            if (fread(&sym, sizeof(sym), 1, ef) != 1) break;
+            if (sym.st_name == 0 || sym.st_name >= strsz) continue;
+            if (sym.st_shndx == SHN_UNDEF) continue;
+            if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC) continue;
+            if (strcmp(strtab.data() + sym.st_name, name) == 0) {
+                fclose(ef);
+                return load_off + sym.st_value;
+            }
+        }
+    }
+
+    fclose(ef);
+    return 0;
+}
+
+static uintptr_t scan_for_string(const char* str, size_t slen) {
+    auto regions = get_regions();
+    for (auto& r : regions) {
+        if (!r.r) continue;
+        if (G.mod_base && (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size))
+            continue;
+        for (size_t i = 0; i + slen <= r.size; i++) {
+            if (memcmp((const void*)(r.base + i), str, slen) == 0)
+                return r.base + i;
+        }
+    }
+    for (auto& r : regions) {
+        if (!r.r) continue;
+        if (G.mod_base && r.base >= G.mod_base && r.base < G.mod_base + G.mod_size)
+            continue;
+        for (size_t i = 0; i + slen <= r.size; i++) {
+            if (memcmp((const void*)(r.base + i), str, slen) == 0)
+                return r.base + i;
+        }
+    }
+    return 0;
+}
+
+static uintptr_t find_lea_xref(uintptr_t string_addr) {
+    auto regions = get_regions();
+    for (auto& r : regions) {
+        if (!r.r || !r.x) continue;
+        if (G.mod_base && (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size))
+            continue;
+        const uint8_t* code = (const uint8_t*)r.base;
+        for (size_t i = 0; i + 7 <= r.size; i++) {
+            if (code[i] == 0x8D && (code[i+1] & 0xC7) == 0x05) {
+                int32_t disp;
+                memcpy(&disp, code + i + 2, 4);
+                uintptr_t target = r.base + i + 6 + (uintptr_t)(intptr_t)disp;
+                if (target == string_addr) return r.base + i;
+            }
+            if (code[i] >= 0x40 && code[i] <= 0x4F &&
+                code[i+1] == 0x8D && (code[i+2] & 0xC7) == 0x05) {
+                int32_t disp;
+                memcpy(&disp, code + i + 3, 4);
+                uintptr_t target = r.base + i + 7 + (uintptr_t)(intptr_t)disp;
+                if (target == string_addr) return r.base + i;
+            }
+        }
+    }
+    return 0;
+}
+
+static uintptr_t walk_back_to_func(uintptr_t addr) {
+    if (!addr || addr < 0x1000) return 0;
+    uintptr_t limit = (addr > 4096) ? addr - 4096 : 0x1000;
+    for (uintptr_t p = addr - 1; p >= limit; p--) {
+        const uint8_t* c = (const uint8_t*)p;
+        bool candidate = false;
+
+        if (p + 5 <= addr &&
+            c[0] == 0xF3 && c[1] == 0x0F && c[2] == 0x1E && c[3] == 0xFA && c[4] == 0x55)
+            candidate = true;
+        else if (p + 4 <= addr &&
+                 c[0] == 0x55 && c[1] == 0x48 && c[2] == 0x89 && c[3] == 0xE5)
+            candidate = true;
+        else if (c[0] == 0x55 && p > limit) {
+            uint8_t prev = *((const uint8_t*)(p - 1));
+            if (prev == 0xC3 || prev == 0xCC)
+                candidate = true;
+        }
+
+        if (candidate) {
+            size_t decoded = 0;
+            uintptr_t ip = p;
+            int valid_insns = 0;
+            while (decoded < 32 && ip < addr + 64) {
+                size_t il = insn_len((const uint8_t*)ip);
+                if (il == 0) break;
+                decoded += il;
+                ip += il;
+                valid_insns++;
+            }
+            if (valid_insns >= 3)
+                return p;
+        }
+    }
+    return 0;
+}
+
 static bool resolve_functions() {
     void* h = RTLD_DEFAULT;
     G.compile   = (fn_compile)dlsym(h, "luau_compile");
@@ -376,21 +593,83 @@ static bool resolve_functions() {
     G.tolstring = (fn_tolstring)dlsym(h, "lua_tolstring");
     G.gettop    = (fn_gettop)dlsym(h, "lua_gettop");
     G.sandbox   = (fn_sandbox)dlsym(h, "luaL_sandboxthread");
-    if (G.compile && G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop)
+
+    if (G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop)
         return true;
-    if (!G.mod_base) return false;
-    auto regions = get_regions();
-    for (auto& r : regions) {
-        if (!r.r || !r.x) continue;
-        if (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size) continue;
-        if (!G.resume) {
-            static const uint8_t pat[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56};
-            static const char mask[]   = "xxxxxxxx";
-            uintptr_t a = aob_scan(r.base, r.size, pat, mask, sizeof(pat));
-            if (a) G.resume = (fn_resume)a;
+
+    struct { const char* name; void** ptr; } syms[] = {
+        {"luau_compile",       (void**)&G.compile},
+        {"luau_load",          (void**)&G.load},
+        {"lua_pcall",          (void**)&G.pcall},
+        {"lua_resume",         (void**)&G.resume},
+        {"lua_newthread",      (void**)&G.newthread},
+        {"lua_settop",         (void**)&G.settop},
+        {"lua_tolstring",      (void**)&G.tolstring},
+        {"lua_gettop",         (void**)&G.gettop},
+        {"luaL_sandboxthread", (void**)&G.sandbox},
+    };
+
+    for (auto& s : syms) {
+        if (*s.ptr) continue;
+        uintptr_t addr = find_elf_sym(s.name);
+        if (addr) {
+            *s.ptr = (void*)addr;
+            fprintf(stderr, "[payload] elf-sym: %s at %lx\n", s.name, addr);
         }
     }
-    return G.compile && G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop;
+
+    if (G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop)
+        return true;
+
+    if (!G.resume) {
+        static const char* resume_strings[] = {
+            "cannot resume dead coroutine",
+            "cannot resume running coroutine",
+            "attempt to yield across metamethod/C-call boundary",
+            nullptr
+        };
+        for (int i = 0; resume_strings[i] && !G.resume; i++) {
+            size_t slen = strlen(resume_strings[i]);
+            uintptr_t str_addr = scan_for_string(resume_strings[i], slen);
+            if (!str_addr) continue;
+            fprintf(stderr, "[payload] found string '%s' at %lx\n", resume_strings[i], str_addr);
+            uintptr_t xref = find_lea_xref(str_addr);
+            if (!xref) continue;
+            fprintf(stderr, "[payload] xref at %lx\n", xref);
+            uintptr_t func = walk_back_to_func(xref);
+            if (func) {
+                G.resume = (fn_resume)func;
+                fprintf(stderr, "[payload] string-ref: lua_resume at %lx\n", func);
+            }
+        }
+    }
+
+    if (!G.resume && G.mod_base) {
+        static const uint8_t pat1[] = {0xF3, 0x0F, 0x1E, 0xFA, 0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56};
+        static const char mask1[]   = "xxxxxxxxxxxx";
+        static const uint8_t pat2[] = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56};
+        static const char mask2[]   = "xxxxxxxx";
+        auto regions = get_regions();
+        for (auto& r : regions) {
+            if (!r.r || !r.x) continue;
+            if (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size) continue;
+            if (!G.resume) {
+                uintptr_t a = aob_scan(r.base, r.size, pat1, mask1, sizeof(pat1));
+                if (!a) a = aob_scan(r.base, r.size, pat2, mask2, sizeof(pat2));
+                if (a) {
+                    G.resume = (fn_resume)a;
+                    fprintf(stderr, "[payload] aob: lua_resume at %lx\n", a);
+                }
+            }
+        }
+    }
+
+    fprintf(stderr, "[payload] resolve: compile=%p load=%p resume=%p newthread=%p "
+            "settop=%p tolstring=%p gettop=%p\n",
+            (void*)G.compile, (void*)G.load, (void*)G.resume,
+            (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
+
+    return G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop;
 }
 
 static void* ipc_worker(void*) {
@@ -442,6 +721,8 @@ static void payload_init() {
                 (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
         return;
     }
+    if (!G.compile)
+        fprintf(stderr, "[payload] luau_compile not found, expecting pre-compiled bytecode\n");
     G.alive.store(true, std::memory_order_release);
     pthread_t t;
     pthread_create(&t, nullptr, ipc_worker, nullptr);
