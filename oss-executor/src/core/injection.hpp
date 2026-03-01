@@ -100,6 +100,8 @@ private:
     static std::string read_proc_exe(pid_t pid);
     static bool has_roblox_token(const std::string& s);
     static std::vector<pid_t> descendants(pid_t root);
+    static uintptr_t find_elf_symbol(const std::string& filepath,
+                                      const std::string& symbol);
 
     ProcessInfo gather_info(pid_t pid);
 
@@ -124,10 +126,16 @@ private:
 
     bool inject_shellcode(pid_t pid, const std::string& lib_path,
                           uintptr_t dlopen_addr, uint64_t dlopen_flags);
+    bool inject_shellcode_ptrace(pid_t pid, const std::string& lib_path,
+                                  uintptr_t dlopen_addr, uint64_t dlopen_flags);
+    bool inject_via_procmem(pid_t pid, const std::string& lib_path,
+                             uintptr_t dlopen_addr);
+
+    bool proc_mem_write(pid_t pid, uintptr_t addr, const void* data, size_t len);
+    bool proc_mem_read(pid_t pid, uintptr_t addr, void* buf, size_t len);
 
     std::string prepare_payload_for_injection(pid_t pid, const std::string& host_path);
     std::string resolve_socket_path();
-    static uintptr_t find_elf_symbol(const std::string& filepath, const std::string& symbol);
 
     bool write_to_process(uintptr_t addr, const void* data, size_t len);
     bool read_from_process(uintptr_t addr, void* buf, size_t len);
@@ -150,5 +158,3 @@ private:
 };
 
 }
-
-
