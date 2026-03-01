@@ -135,6 +135,13 @@ set_target_properties(oss_payload PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY  "${CMAKE_BINARY_DIR}"
 )
 
+add_dependencies(${PROJECT_NAME} oss_payload)
+
+add_custom_command(TARGET oss_payload POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+        $<TARGET_FILE:oss_payload>
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>/$<TARGET_FILE_NAME:oss_payload>)
+
 if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -150,3 +157,4 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
