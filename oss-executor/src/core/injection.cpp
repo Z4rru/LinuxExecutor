@@ -25,6 +25,8 @@
 #include <sys/un.h>
 #include <elf.h>
 #include <luacode.h>
+#include <fcntl.h>
+#include <poll.h>
 
 namespace fs = std::filesystem;
 
@@ -373,12 +375,11 @@ bool Injection::write_to_process(uintptr_t addr, const void* data, size_t len) {
     if (written == static_cast<ssize_t>(len)) return true;
 
     std::string path = "/proc/" + std::to_string(pid) + "/mem";
-    std::ofstream f(path, std::ios::binary | std::ios::in | std::ios::out);
-    if (!f.is_open()) return false;
-    f.seekp(static_cast<std::streamoff>(addr));
-    if (!f.good()) return false;
-    f.write(static_cast<const char*>(data), static_cast<std::streamsize>(len));
-    return f.good();
+    int fd = open(path.c_str(), O_RDWR);
+    if (fd < 0) return false;
+    ssize_t r = pwrite(fd, data, len, static_cast<off_t>(addr));
+    close(fd);
+    return r == static_cast<ssize_t>(len);
 }
 
 bool Injection::read_from_process(uintptr_t addr, void* buf, size_t len) {
@@ -876,7 +877,6 @@ uintptr_t Injection::find_remote_symbol(pid_t pid, const std::string& lib_name,
         }
     }
 
-
     if (proc_info_.via_flatpak || proc_info_.via_sober) {
         LOG_WARN("ELF lookup failed for '{}' in lib{} — "
                  "skipping unsafe local fallback (containerized target)",
@@ -960,6 +960,538 @@ std::string Injection::resolve_socket_path() {
     return PAYLOAD_SOCK;
 }
 
+static pid_t get_tracer_pid(pid_t pid) {
+    std::ifstream status("/proc/" + std::to_string(pid) + "/status");
+    if (!status.is_open()) return -1;
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.compare(0, 10, "TracerPid:") == 0) {
+            pid_t tp = 0;
+            sscanf(line.c_str() + 10, "%d", &tp);
+            return tp;
+        }
+    }
+    return 0;
+}
+
+struct ThreadState {
+    uintptr_t rip;
+    uintptr_t rsp;
+};
+
+static bool get_thread_state(pid_t pid, pid_t tid, ThreadState& out) {
+    std::string path = "/proc/" + std::to_string(pid) + "/task/" +
+                       std::to_string(tid) + "/syscall";
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        f.open("/proc/" + std::to_string(pid) + "/syscall");
+        if (!f.is_open()) return false;
+    }
+    std::string line;
+    std::getline(f, line);
+    if (line.empty() || line == "running") return false;
+
+    std::vector<std::string> fields;
+    std::istringstream iss(line);
+    std::string field;
+    while (iss >> field) fields.push_back(field);
+
+    if (fields.size() < 9) return false;
+
+    out.rsp = std::stoull(fields[7], nullptr, 16);
+    out.rip = std::stoull(fields[8], nullptr, 16);
+    return out.rip != 0;
+}
+
+static pid_t pick_injectable_thread(pid_t pid) {
+    std::string task_dir = "/proc/" + std::to_string(pid) + "/task";
+    pid_t best_tid = -1;
+
+    try {
+        for (const auto& entry : fs::directory_iterator(task_dir)) {
+            std::string name = entry.path().filename().string();
+            if (!std::all_of(name.begin(), name.end(), ::isdigit)) continue;
+            pid_t tid = std::stoi(name);
+            ThreadState ts;
+            if (get_thread_state(pid, tid, ts) && ts.rip != 0) {
+                best_tid = tid;
+                break;
+            }
+        }
+    } catch (...) {}
+
+    if (best_tid < 0) best_tid = pid;
+    return best_tid;
+}
+
+struct ExeRegionInfo {
+    uintptr_t text_end;
+    uintptr_t padding_start;
+    size_t    padding_size;
+    uintptr_t base;
+};
+
+static bool find_code_cave(pid_t pid, const std::vector<MemoryRegion>& regions,
+                           size_t needed, ExeRegionInfo& out) {
+    for (size_t i = 0; i + 1 < regions.size(); i++) {
+        const auto& r = regions[i];
+        if (!r.executable() || !r.readable()) continue;
+        if (r.path.empty() || r.path[0] == '[') continue;
+
+        uintptr_t end = r.end;
+        uintptr_t page_end = (end + 0xFFF) & ~0xFFFULL;
+
+        if (page_end > end && (page_end - end) >= needed) {
+            std::vector<uint8_t> probe(needed, 0);
+            struct iovec local = { probe.data(), needed };
+            struct iovec remote = { reinterpret_cast<void*>(end), needed };
+            ssize_t rd = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+            if (rd == static_cast<ssize_t>(needed)) {
+                bool all_zero = true;
+                for (auto b : probe) {
+                    if (b != 0 && b != 0xCC) { all_zero = false; break; }
+                }
+                if (all_zero) {
+                    out.text_end = end;
+                    out.padding_start = end;
+                    out.padding_size = page_end - end;
+                    out.base = r.start;
+                    return true;
+                }
+            }
+        }
+
+        if (i + 1 < regions.size()) {
+            const auto& next = regions[i + 1];
+            uintptr_t gap = next.start - r.end;
+            if (gap >= needed && r.end == ((r.end + 0xFFF) & ~0xFFFULL)) continue;
+        }
+    }
+
+    for (const auto& r : regions) {
+        if (!r.executable() || !r.readable()) continue;
+        if (r.size() < needed + 64) continue;
+
+        size_t scan_size = std::min(r.size(), static_cast<size_t>(0x10000));
+        uintptr_t scan_start = r.end - scan_size;
+        std::vector<uint8_t> buf(scan_size);
+        struct iovec local = { buf.data(), scan_size };
+        struct iovec remote = { reinterpret_cast<void*>(scan_start), scan_size };
+        ssize_t rd = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+        if (rd != static_cast<ssize_t>(scan_size)) continue;
+
+        for (size_t off = scan_size - needed; off > 0; off--) {
+            bool usable = true;
+            for (size_t j = 0; j < needed; j++) {
+                if (buf[off + j] != 0x00 && buf[off + j] != 0xCC &&
+                    buf[off + j] != 0x90) {
+                    usable = false;
+                    break;
+                }
+            }
+            if (usable) {
+                out.text_end = scan_start + off;
+                out.padding_start = scan_start + off;
+                out.padding_size = needed;
+                out.base = r.start;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool Injection::proc_mem_write(pid_t pid, uintptr_t addr,
+                                const void* data, size_t len) {
+    std::string path = "/proc/" + std::to_string(pid) + "/mem";
+    int fd = open(path.c_str(), O_RDWR);
+    if (fd >= 0) {
+        ssize_t w = pwrite(fd, data, len, static_cast<off_t>(addr));
+        close(fd);
+        if (w == static_cast<ssize_t>(len)) return true;
+    }
+
+    struct iovec local = { const_cast<void*>(data), len };
+    struct iovec remote = { reinterpret_cast<void*>(addr), len };
+    ssize_t w = process_vm_writev(pid, &local, 1, &remote, 1, 0);
+    return w == static_cast<ssize_t>(len);
+}
+
+bool Injection::proc_mem_read(pid_t pid, uintptr_t addr,
+                               void* buf, size_t len) {
+    struct iovec local = { buf, len };
+    struct iovec remote = { reinterpret_cast<void*>(addr), len };
+    ssize_t r = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+    if (r == static_cast<ssize_t>(len)) return true;
+
+    std::string path = "/proc/" + std::to_string(pid) + "/mem";
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    ssize_t rd = pread(fd, buf, len, static_cast<off_t>(addr));
+    close(fd);
+    return rd == static_cast<ssize_t>(len);
+}
+
+bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
+                                    uintptr_t dlopen_addr) {
+    LOG_INFO("Attempting /proc/pid/mem injection (ptrace-free) for PID {}", pid);
+
+    pid_t tracer = get_tracer_pid(pid);
+    if (tracer > 0) {
+        LOG_WARN("PID {} is already traced by PID {} — may affect injection", pid, tracer);
+    }
+
+    std::string mem_path = "/proc/" + std::to_string(pid) + "/mem";
+    int test_fd = open(mem_path.c_str(), O_RDWR);
+    if (test_fd < 0) {
+        LOG_ERROR("Cannot open {} for writing: {}", mem_path, strerror(errno));
+        return false;
+    }
+    close(test_fd);
+    LOG_DEBUG("Confirmed /proc/pid/mem is writable");
+
+    auto regions = memory_.get_regions();
+    if (regions.empty()) {
+        LOG_ERROR("No memory regions available");
+        return false;
+    }
+
+    uintptr_t data_addr = 0;
+    for (const auto& r : regions) {
+        if (!r.writable() || !r.readable()) continue;
+        if (r.size() < 4096) continue;
+        if (r.path.find("[stack") != std::string::npos) continue;
+        if (r.path.find("[vvar") != std::string::npos) continue;
+        if (r.path.find("[vdso") != std::string::npos) continue;
+        data_addr = r.end - 4096;
+        LOG_DEBUG("Using data region at 0x{:X} from '{}'", data_addr,
+                  r.path.empty() ? "[anon]" : r.path);
+        break;
+    }
+    if (data_addr == 0) {
+        LOG_ERROR("No suitable writable region found");
+        return false;
+    }
+
+    uint8_t orig_data[4096];
+    if (!proc_mem_read(pid, data_addr, orig_data, sizeof(orig_data))) {
+        LOG_ERROR("Failed to save original data region");
+        return false;
+    }
+
+    size_t path_offset = 0;
+    memset(orig_data + path_offset, 0, lib_path.size() + 1);
+
+    uint8_t path_buf[512] = {};
+    size_t path_len = std::min(lib_path.size(), sizeof(path_buf) - 1);
+    memcpy(path_buf, lib_path.c_str(), path_len);
+    if (!proc_mem_write(pid, data_addr, path_buf, path_len + 1)) {
+        LOG_ERROR("Failed to write library path to data region");
+        return false;
+    }
+
+    size_t flag_offset = 512;
+    uintptr_t flag_addr = data_addr + flag_offset;
+    uint64_t zero = 0;
+    proc_mem_write(pid, flag_addr, &zero, sizeof(zero));
+
+    size_t shellcode_needed = 256;
+    ExeRegionInfo cave;
+    if (!find_code_cave(pid, regions, shellcode_needed, cave)) {
+        LOG_ERROR("No suitable code cave found for shellcode");
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+    LOG_DEBUG("Code cave at 0x{:X} ({} bytes available)", cave.padding_start, cave.padding_size);
+
+    uint8_t orig_cave[256];
+    if (!proc_mem_read(pid, cave.padding_start, orig_cave, shellcode_needed)) {
+        LOG_ERROR("Failed to save original code cave bytes");
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    uintptr_t path_addr = data_addr;
+
+    uint8_t sc[256];
+    int off = 0;
+
+    sc[off++] = 0x50;
+    sc[off++] = 0x51;
+    sc[off++] = 0x52;
+    sc[off++] = 0x53;
+    sc[off++] = 0x56;
+    sc[off++] = 0x57;
+    sc[off++] = 0x41; sc[off++] = 0x50;
+    sc[off++] = 0x41; sc[off++] = 0x51;
+    sc[off++] = 0x41; sc[off++] = 0x52;
+    sc[off++] = 0x41; sc[off++] = 0x53;
+    sc[off++] = 0x41; sc[off++] = 0x54;
+    sc[off++] = 0x41; sc[off++] = 0x55;
+    sc[off++] = 0x41; sc[off++] = 0x56;
+    sc[off++] = 0x41; sc[off++] = 0x57;
+
+    sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xE4; sc[off++] = 0xF0;
+
+    sc[off++] = 0x48; sc[off++] = 0xBF;
+    memcpy(sc + off, &path_addr, 8); off += 8;
+
+    uint64_t dlopen_flags = 0x00000002ULL;
+    sc[off++] = 0x48; sc[off++] = 0xBE;
+    memcpy(sc + off, &dlopen_flags, 8); off += 8;
+
+    sc[off++] = 0x48; sc[off++] = 0xB8;
+    memcpy(sc + off, &dlopen_addr, 8); off += 8;
+
+    sc[off++] = 0xFF; sc[off++] = 0xD0;
+
+    sc[off++] = 0x48; sc[off++] = 0xB9;
+    memcpy(sc + off, &flag_addr, 8); off += 8;
+    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x01;
+
+    int loop_top = off;
+    sc[off++] = 0x48; sc[off++] = 0xB9;
+    memcpy(sc + off, &flag_addr, 8); off += 8;
+    sc[off++] = 0x48; sc[off++] = 0x8B; sc[off++] = 0x09;
+    sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xF9; sc[off++] = 0x01;
+    sc[off++] = 0x74; sc[off++] = 0x06;
+    sc[off++] = 0xF3; sc[off++] = 0x90;
+    int8_t jmp_back = static_cast<int8_t>(loop_top - (off + 2));
+    sc[off++] = 0xEB; sc[off++] = static_cast<uint8_t>(jmp_back);
+
+    sc[off++] = 0x41; sc[off++] = 0x5F;
+    sc[off++] = 0x41; sc[off++] = 0x5E;
+    sc[off++] = 0x41; sc[off++] = 0x5D;
+    sc[off++] = 0x41; sc[off++] = 0x5C;
+    sc[off++] = 0x41; sc[off++] = 0x5B;
+    sc[off++] = 0x41; sc[off++] = 0x5A;
+    sc[off++] = 0x41; sc[off++] = 0x59;
+    sc[off++] = 0x41; sc[off++] = 0x58;
+    sc[off++] = 0x5F;
+    sc[off++] = 0x5E;
+    sc[off++] = 0x5B;
+    sc[off++] = 0x5A;
+    sc[off++] = 0x59;
+    sc[off++] = 0x58;
+    sc[off++] = 0xC3;
+
+    if (static_cast<size_t>(off) > shellcode_needed) {
+        LOG_ERROR("Shellcode too large: {} > {}", off, shellcode_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    if (!proc_mem_write(pid, cave.padding_start, sc, off)) {
+        LOG_ERROR("Failed to write shellcode to code cave");
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+    LOG_DEBUG("Shellcode written: {} bytes at 0x{:X}", off, cave.padding_start);
+
+    if (kill(pid, SIGSTOP) != 0) {
+        LOG_ERROR("SIGSTOP failed: {}", strerror(errno));
+        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+    usleep(50000);
+
+    std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
+    bool stopped = false;
+    for (int i = 0; i < 20; i++) {
+        std::ifstream sf(stat_path);
+        std::string sline;
+        std::getline(sf, sline);
+        auto ce = sline.rfind(')');
+        if (ce != std::string::npos && ce + 2 < sline.size()) {
+            char state = sline[ce + 2];
+            if (state == 'T' || state == 't') { stopped = true; break; }
+        }
+        usleep(10000);
+    }
+
+    if (!stopped) {
+        LOG_ERROR("Process did not stop after SIGSTOP");
+        kill(pid, SIGCONT);
+        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    pid_t tid = pick_injectable_thread(pid);
+    ThreadState ts;
+    if (!get_thread_state(pid, tid, ts)) {
+        LOG_ERROR("Cannot read thread state for TID {}", tid);
+        kill(pid, SIGCONT);
+        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+    LOG_DEBUG("Thread {} state: RIP=0x{:X} RSP=0x{:X}", tid, ts.rip, ts.rsp);
+
+    uint8_t orig_rip_code[16];
+    if (!proc_mem_read(pid, ts.rip, orig_rip_code, sizeof(orig_rip_code))) {
+        LOG_ERROR("Failed to read original code at RIP 0x{:X}", ts.rip);
+        kill(pid, SIGCONT);
+        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    uint8_t trampoline[16];
+    int toff = 0;
+    trampoline[toff++] = 0x48; trampoline[toff++] = 0xB8;
+    memcpy(trampoline + toff, &cave.padding_start, 8); toff += 8;
+
+    uintptr_t return_addr = ts.rip;
+    uintptr_t new_rsp = ts.rsp - 128;
+
+    uint8_t stack_setup[32];
+    int soff = 0;
+    stack_setup[soff++] = 0x48; stack_setup[soff++] = 0x81;
+    stack_setup[soff++] = 0xEC;
+    uint32_t sub_val = 128;
+    memcpy(stack_setup + soff, &sub_val, 4); soff += 4;
+    stack_setup[soff++] = 0x48; stack_setup[soff++] = 0xB9;
+    memcpy(stack_setup + soff, &return_addr, 8); soff += 8;
+    stack_setup[soff++] = 0x51;
+
+    (void)new_rsp;
+    (void)stack_setup;
+    (void)soff;
+
+    trampoline[toff++] = 0x50;
+
+    trampoline[toff++] = 0x48; trampoline[toff++] = 0xB8;
+    uintptr_t cave_addr = cave.padding_start;
+    memcpy(trampoline + toff, &cave_addr, 8); toff += 8;
+
+    toff = 0;
+
+    trampoline[toff++] = 0x68;
+    uint32_t ret_lo = static_cast<uint32_t>(return_addr & 0xFFFFFFFF);
+    memcpy(trampoline + toff, &ret_lo, 4); toff += 4;
+
+    if ((return_addr >> 32) != 0) {
+        trampoline[toff++] = 0xC7; trampoline[toff++] = 0x44;
+        trampoline[toff++] = 0x24; trampoline[toff++] = 0x04;
+        uint32_t ret_hi = static_cast<uint32_t>(return_addr >> 32);
+        memcpy(trampoline + toff, &ret_hi, 4); toff += 4;
+    }
+
+    trampoline[toff++] = 0xE9;
+    int32_t rel32 = static_cast<int32_t>(
+        static_cast<int64_t>(cave.padding_start) -
+        static_cast<int64_t>(ts.rip + toff + 4));
+    memcpy(trampoline + toff, &rel32, 4); toff += 4;
+
+    bool use_rel_jmp = true;
+    int64_t displacement = static_cast<int64_t>(cave.padding_start) -
+                           static_cast<int64_t>(ts.rip + 5);
+    if (displacement < INT32_MIN || displacement > INT32_MAX) {
+        use_rel_jmp = false;
+    }
+
+    toff = 0;
+    memset(trampoline, 0, sizeof(trampoline));
+
+    if (use_rel_jmp) {
+        trampoline[toff++] = 0x68;
+        memcpy(trampoline + toff, &ret_lo, 4); toff += 4;
+        if ((return_addr >> 32) != 0) {
+            trampoline[toff++] = 0xC7; trampoline[toff++] = 0x44;
+            trampoline[toff++] = 0x24; trampoline[toff++] = 0x04;
+            uint32_t ret_hi = static_cast<uint32_t>(return_addr >> 32);
+            memcpy(trampoline + toff, &ret_hi, 4); toff += 4;
+        }
+        trampoline[toff++] = 0xE9;
+        rel32 = static_cast<int32_t>(
+            static_cast<int64_t>(cave.padding_start) -
+            static_cast<int64_t>(ts.rip + toff + 4));
+        memcpy(trampoline + toff, &rel32, 4); toff += 4;
+    } else {
+        trampoline[toff++] = 0x68;
+        memcpy(trampoline + toff, &ret_lo, 4); toff += 4;
+        if ((return_addr >> 32) != 0) {
+            trampoline[toff++] = 0xC7; trampoline[toff++] = 0x44;
+            trampoline[toff++] = 0x24; trampoline[toff++] = 0x04;
+            uint32_t ret_hi = static_cast<uint32_t>(return_addr >> 32);
+            memcpy(trampoline + toff, &ret_hi, 4); toff += 4;
+        }
+        trampoline[toff++] = 0xFF; trampoline[toff++] = 0x25;
+        uint32_t z = 0;
+        memcpy(trampoline + toff, &z, 4); toff += 4;
+        memcpy(trampoline + toff, &cave_addr, 8); toff += 8;
+    }
+
+    if (toff > static_cast<int>(sizeof(orig_rip_code))) {
+        LOG_ERROR("Trampoline too large: {} bytes", toff);
+        kill(pid, SIGCONT);
+        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    if (!proc_mem_write(pid, ts.rip, trampoline, toff)) {
+        LOG_ERROR("Failed to write trampoline at RIP 0x{:X}", ts.rip);
+        kill(pid, SIGCONT);
+        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+    LOG_DEBUG("Trampoline written: {} bytes at 0x{:X}", toff, ts.rip);
+
+    kill(pid, SIGCONT);
+    LOG_DEBUG("Process resumed, waiting for dlopen completion...");
+
+    bool completed = false;
+    for (int i = 0; i < 100; i++) {
+        usleep(50000);
+        uint64_t flag_val = 0;
+        if (proc_mem_read(pid, flag_addr, &flag_val, sizeof(flag_val)) && flag_val != 0) {
+            LOG_INFO("dlopen completed, handle=0x{:X}", flag_val);
+            completed = true;
+            break;
+        }
+        if (kill(pid, 0) != 0) {
+            LOG_ERROR("Process died during injection");
+            return false;
+        }
+    }
+
+    if (!completed) {
+        LOG_ERROR("dlopen did not complete within timeout");
+        kill(pid, SIGSTOP);
+        usleep(50000);
+        proc_mem_write(pid, ts.rip, orig_rip_code, sizeof(orig_rip_code));
+        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        kill(pid, SIGCONT);
+        return false;
+    }
+
+    uint64_t signal_done = 1;
+    proc_mem_write(pid, flag_addr, &signal_done, sizeof(signal_done));
+
+    usleep(50000);
+
+    kill(pid, SIGSTOP);
+    usleep(50000);
+
+    proc_mem_write(pid, ts.rip, orig_rip_code, sizeof(orig_rip_code));
+    proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+
+    uint8_t zero_region[4096] = {};
+    proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+
+    kill(pid, SIGCONT);
+    LOG_INFO("Injection complete, process restored and resumed");
+
+    payload_loaded_ = true;
+    return true;
+}
+
 bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     LOG_INFO("Injecting {} into PID {}", lib_path, pid);
 
@@ -991,11 +1523,42 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     }
 
     uint64_t flags = libc_internal ? 0x80000002ULL : 0x00000002ULL;
-    return inject_shellcode(pid, target_path, dlopen_addr, flags);
+
+    pid_t tracer = get_tracer_pid(pid);
+    if (tracer > 0)
+        LOG_WARN("Target PID {} is already traced by PID {}", pid, tracer);
+
+    bool ptrace_ok = false;
+    errno = 0;
+    if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) == 0) {
+        ptrace_ok = true;
+        LOG_DEBUG("ptrace attach succeeded");
+    } else {
+        int saved_errno = errno;
+        LOG_DEBUG("ptrace attach failed: {} (errno={})", strerror(saved_errno), saved_errno);
+    }
+
+    if (ptrace_ok) {
+        int status;
+        if (waitpid(pid, &status, 0) == -1 || !WIFSTOPPED(status)) {
+            ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+            ptrace_ok = false;
+        }
+    }
+
+    if (ptrace_ok) {
+        LOG_INFO("Using ptrace injection path");
+        bool result = inject_shellcode_ptrace(pid, target_path, dlopen_addr, flags);
+        if (result) return true;
+        LOG_WARN("ptrace injection failed: {}", error_);
+    }
+
+    LOG_INFO("Falling back to /proc/pid/mem injection path");
+    return inject_via_procmem(pid, target_path, dlopen_addr);
 }
 
-bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
-                                  uintptr_t dlopen_addr, uint64_t dlopen_flags) {
+bool Injection::inject_shellcode_ptrace(pid_t pid, const std::string& lib_path,
+                                         uintptr_t dlopen_addr, uint64_t dlopen_flags) {
     auto wait_for_trap = [](pid_t p) -> bool {
         for (int i = 0; i < 200; i++) {
             int st;
@@ -1013,28 +1576,6 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
         return false;
     };
 
-    errno = 0;
-    if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) != 0) {
-        error_ = "ptrace attach failed: " + std::string(strerror(errno));
-        if (errno == EPERM)
-            error_ += " — run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope";
-        LOG_ERROR("inject_shellcode: {}", error_);
-        return false;
-    }
-
-    int status;
-    if (waitpid(pid, &status, 0) == -1) {
-        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
-        error_ = "waitpid failed after attach";
-        return false;
-    }
-
-    if (!WIFSTOPPED(status)) {
-        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
-        error_ = "Process did not stop after ptrace attach";
-        return false;
-    }
-
     struct user_regs_struct orig_regs;
     if (ptrace(PTRACE_GETREGS, pid, nullptr, &orig_regs) != 0) {
         ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
@@ -1048,11 +1589,7 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
     orig_code[0] = ptrace(PTRACE_PEEKTEXT, pid,
                           reinterpret_cast<void*>(rip), nullptr);
     if (orig_code[0] == -1 && errno != 0) {
-        error_ = "PEEKTEXT failed at RIP 0x" +
-                 ([&]{ std::ostringstream o; o << std::hex << rip;
-                       return o.str(); })() +
-                 ": " + std::string(strerror(errno));
-        LOG_ERROR("inject_shellcode: {}", error_);
+        error_ = "PEEKTEXT failed at RIP";
         ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
         return false;
     }
@@ -1060,8 +1597,7 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
     orig_code[1] = ptrace(PTRACE_PEEKTEXT, pid,
                           reinterpret_cast<void*>(rip + 8), nullptr);
     if (orig_code[1] == -1 && errno != 0) {
-        error_ = "PEEKTEXT failed at RIP+8: " + std::string(strerror(errno));
-        LOG_ERROR("inject_shellcode: {}", error_);
+        error_ = "PEEKTEXT failed at RIP+8";
         ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
         return false;
     }
@@ -1107,10 +1643,7 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
 
     if (mem_addr == 0 || static_cast<int64_t>(mem_addr) < 0) {
         restore_and_detach();
-        error_ = "Remote mmap failed (returned 0x" +
-                 ([&]{ std::ostringstream o; o << std::hex << mem_addr;
-                       return o.str(); })() + ")";
-        LOG_ERROR("{}", error_);
+        error_ = "Remote mmap failed";
         return false;
     }
     LOG_DEBUG("Allocated 0x{:x} in target", mem_addr);
@@ -1166,7 +1699,6 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
     if (!wait_for_trap(pid)) {
         restore_and_detach();
         error_ = "Shellcode execution did not complete";
-        LOG_ERROR("{}", error_);
         return false;
     }
 
@@ -1193,12 +1725,16 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
 
     if (dlopen_result == 0) {
         error_ = "dlopen returned NULL — library load failed in target";
-        LOG_ERROR("{}", error_);
         return false;
     }
 
     payload_loaded_ = true;
     return true;
+}
+
+bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
+                                  uintptr_t dlopen_addr, uint64_t dlopen_flags) {
+    return inject_shellcode_ptrace(pid, lib_path, dlopen_addr, dlopen_flags);
 }
 
 bool Injection::attach() {
@@ -1215,7 +1751,7 @@ bool Injection::attach() {
     auto regions = memory_.get_regions();
     if (regions.empty()) {
         set_state(InjectionState::Failed,
-                  "Cannot read process memory — run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope");
+                  "Cannot read process memory — check permissions");
         LOG_ERROR("0 readable regions for PID {}", memory_.get_pid());
         return false;
     }
@@ -1257,7 +1793,6 @@ bool Injection::inject() {
 
     std::string payload = find_payload_path();
     if (!payload.empty()) {
-    
         {
             std::ifstream scope_file("/proc/sys/kernel/yama/ptrace_scope");
             if (scope_file.is_open()) {
@@ -1265,10 +1800,9 @@ bool Injection::inject() {
                 scope_file >> scope;
                 scope_file.close();
                 if (scope > 0) {
-                    LOG_WARN("yama/ptrace_scope is {} (need 0 for injection)", scope);
+                    LOG_WARN("yama/ptrace_scope is {} (need 0 for ptrace path)", scope);
                     bool fixed = false;
 
-                    // Attempt 1: direct write (works if already root)
                     {
                         std::ofstream fix("/proc/sys/kernel/yama/ptrace_scope",
                                          std::ios::trunc);
@@ -1281,7 +1815,6 @@ bool Injection::inject() {
                         if (v == 0) { LOG_INFO("Auto-lowered ptrace_scope to 0"); fixed = true; }
                     }
 
-                    // Attempt 2: pkexec GUI password prompt
                     if (!fixed) {
                         LOG_INFO("Requesting elevated privileges to lower ptrace_scope...");
                         pid_t pk = fork();
@@ -1307,8 +1840,7 @@ bool Injection::inject() {
                     }
 
                     if (!fixed) {
-                        LOG_ERROR("Cannot lower ptrace_scope — injection will fail. "
-                                  "Run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope");
+                        LOG_WARN("Cannot lower ptrace_scope — will use /proc/pid/mem fallback");
                     }
                 }
             }
@@ -1340,7 +1872,7 @@ bool Injection::inject() {
             }
         } else {
             LOG_WARN("Library injection failed ({}), continuing with VM-scan mode", error_);
-        
+
             if (proc_info_.via_flatpak || proc_info_.via_sober) {
                 std::string staged = "/proc/" + std::to_string(memory_.get_pid()) +
                                      "/root/tmp/liboss_payload.so";
@@ -1550,11 +2082,3 @@ void Injection::stop_auto_scan() {
 }
 
 }
-
-
-
-
-
-
-
-
