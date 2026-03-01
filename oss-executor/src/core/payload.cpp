@@ -161,25 +161,79 @@ static uint8_t* alloc_near(uintptr_t target, size_t sz) {
     return nullptr;
 }
 
+static size_t modrm_len(const uint8_t* p, size_t start) {
+    size_t i = start;
+    uint8_t modrm = p[i++];
+    uint8_t mod = (modrm >> 6) & 3;
+    uint8_t rm  = modrm & 7;
+    if (mod != 3 && rm == 4) {
+        uint8_t sib = p[i++];
+        if (mod == 0 && (sib & 7) == 5) i += 4;
+    }
+    if      (mod == 0 && rm == 5) i += 4;
+    else if (mod == 1)            i += 1;
+    else if (mod == 2)            i += 4;
+    return i;
+}
+
 static size_t insn_len(const uint8_t* p) {
-    if (p[0] == 0x55) return 1;
-    if (p[0] == 0x53) return 1;
-    if (p[0] == 0x41 && (p[1] >= 0x54 && p[1] <= 0x57)) return 2;
-    if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0xe5) return 3;
-    if (p[0] == 0x48 && p[1] == 0x83 && p[2] == 0xec) return 4;
-    if (p[0] == 0x48 && p[1] == 0x81 && p[2] == 0xec) return 7;
-    if (p[0] == 0x48 && p[1] == 0x8b) return 3;
-    if (p[0] == 0x48 && p[1] == 0x89) return 3;
-    if (p[0] == 0x89) return 2;
-    if (p[0] == 0x8b) return 2;
-    if (p[0] == 0x31 || p[0] == 0x33) return 2;
-    if (p[0] == 0x90) return 1;
-    if (p[0] == 0xf3 && p[1] == 0x0f && p[2] == 0x1e && p[3] == 0xfa) return 4;
-    if (p[0] == 0x50 || p[0] == 0x51 || p[0] == 0x52 || p[0] == 0x56 || p[0] == 0x57) return 1;
-    if (p[0] == 0x48 && p[1] == 0x8d) return (p[2] & 0xC0) == 0x80 ? 7 : 3;
-    if (p[0] == 0x4c && p[1] == 0x8b) return 3;
-    if (p[0] == 0x4c && p[1] == 0x89) return 3;
-    if (p[0] == 0x49 && (p[1] == 0x89 || p[1] == 0x8b)) return 3;
+    if (p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA) return 4;
+
+    size_t i = 0;
+    while (i < 4 && (p[i] == 0x66 || p[i] == 0x67 || p[i] == 0xF2 || p[i] == 0xF3))
+        i++;
+
+    bool rex_w = false;
+    if (p[i] >= 0x40 && p[i] <= 0x4F) {
+        rex_w = (p[i] & 0x08) != 0;
+        i++;
+    }
+
+    uint8_t op = p[i++];
+
+    if ((op >= 0x50 && op <= 0x5F) || op == 0x90 || op == 0xC3 ||
+        op == 0xCC || op == 0xC9 || op == 0x9C || op == 0x9D ||
+        op == 0xF4 || op == 0xCB)
+        return i;
+    if (op == 0xC2) return i + 2;
+    if (op >= 0xB0 && op <= 0xB7) return i + 1;
+    if (op >= 0xB8 && op <= 0xBF) return i + (rex_w ? 8 : 4);
+    if (op == 0xE8 || op == 0xE9) return i + 4;
+    if (op == 0xEB || (op >= 0x70 && op <= 0x7F)) return i + 1;
+    if (op == 0x68) return i + 4;
+    if (op == 0x6A) return i + 1;
+    if (op == 0x04 || op == 0x0C || op == 0x14 || op == 0x1C ||
+        op == 0x24 || op == 0x2C || op == 0x34 || op == 0x3C || op == 0xA8)
+        return i + 1;
+    if (op == 0x05 || op == 0x0D || op == 0x15 || op == 0x1D ||
+        op == 0x25 || op == 0x2D || op == 0x35 || op == 0x3D || op == 0xA9)
+        return i + 4;
+    if (op == 0x80 || op == 0x82 || op == 0x83 || op == 0xC0 || op == 0xC1)
+        return modrm_len(p, i) + 1;
+    if (op == 0x81 || op == 0xC7) return modrm_len(p, i) + 4;
+    if (op == 0xC6) return modrm_len(p, i) + 1;
+    if (op == 0x69) return modrm_len(p, i) + 4;
+    if (op == 0x6B) return modrm_len(p, i) + 1;
+    if (op == 0xF6) {
+        uint8_t m = p[i];
+        size_t r = modrm_len(p, i);
+        return ((m & 0x38) == 0) ? r + 1 : r;
+    }
+    if (op == 0xF7) {
+        uint8_t m = p[i];
+        size_t r = modrm_len(p, i);
+        return ((m & 0x38) == 0) ? r + 4 : r;
+    }
+    if (op == 0x0F) {
+        uint8_t op2 = p[i++];
+        if (op2 >= 0x80 && op2 <= 0x8F) return i + 4;
+        return modrm_len(p, i);
+    }
+    if ((op & 0xC4) == 0x00 || (op & 0xFE) == 0x84 || (op & 0xFC) == 0x88 ||
+        op == 0x8D || op == 0x63 || (op >= 0xD0 && op <= 0xD3) ||
+        op == 0xFE || op == 0xFF || op == 0x8F)
+        return modrm_len(p, i);
+
     return 0;
 }
 
@@ -221,23 +275,76 @@ static void restore_hook() {
 
 static bool find_module() {
     auto regions = get_regions();
-    const char* names[] = {"libroblox", "RobloxPlayer", "libclient", nullptr};
+    const char* names[] = {"libroblox", "RobloxPlayer", "RobloxPlayerBeta",
+                           "libclient", "Roblox", "Player", nullptr};
     std::ifstream maps("/proc/self/maps");
     std::string line;
     uintptr_t lo = UINTPTR_MAX, hi = 0;
     bool found = false;
     while (std::getline(maps, line)) {
+        std::string lower = line;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
         for (int i = 0; names[i]; ++i) {
-            if (line.find(names[i]) != std::string::npos) {
+            std::string nl = names[i];
+            std::transform(nl.begin(), nl.end(), nl.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            if (lower.find(nl) != std::string::npos) {
                 uintptr_t a, b;
                 if (sscanf(line.c_str(), "%lx-%lx", &a, &b) == 2) {
                     if (a < lo) lo = a;
                     if (b > hi) hi = b;
                     found = true;
                 }
+                break;
             }
         }
     }
+
+    if (!found) {
+        std::ifstream maps2("/proc/self/maps");
+        std::string best_file;
+        size_t best_sz = 0;
+        while (std::getline(maps2, line)) {
+            uintptr_t a, b;
+            char perms[5]{};
+            if (sscanf(line.c_str(), "%lx-%lx %4s", &a, &b, perms) != 3) continue;
+            if (perms[0] != 'r' || perms[2] != 'x') continue;
+            size_t sz = b - a;
+            if (sz <= best_sz || sz < 0x100000) continue;
+            auto slash = line.find('/');
+            if (slash == std::string::npos) continue;
+            std::string filepath = line.substr(slash);
+            auto end = filepath.find_last_not_of(" \n\r\t");
+            if (end != std::string::npos) filepath = filepath.substr(0, end + 1);
+            if (filepath.find("/ld-linux") != std::string::npos) continue;
+            if (filepath.find("/libc.so") != std::string::npos) continue;
+            if (filepath.find("/libpthread") != std::string::npos) continue;
+            if (filepath.find("/libm.so") != std::string::npos) continue;
+            if (filepath.find("/libdl") != std::string::npos) continue;
+            if (filepath.find("/libstdc++") != std::string::npos) continue;
+            if (filepath.find("/libgcc") != std::string::npos) continue;
+            if (filepath.find("/librt") != std::string::npos) continue;
+            if (filepath.find("/liboss_payload") != std::string::npos) continue;
+            best_sz = sz;
+            best_file = filepath;
+        }
+
+        if (!best_file.empty()) {
+            std::ifstream maps3("/proc/self/maps");
+            while (std::getline(maps3, line)) {
+                if (line.find(best_file) != std::string::npos) {
+                    uintptr_t a, b;
+                    if (sscanf(line.c_str(), "%lx-%lx", &a, &b) == 2) {
+                        if (a < lo) lo = a;
+                        if (b > hi) hi = b;
+                        found = true;
+                    }
+                }
+            }
+        }
+    }
+
     if (!found) {
         uintptr_t best_base = 0; size_t best_sz = 0;
         for (auto& r : regions) {
@@ -249,6 +356,7 @@ static bool find_module() {
         }
         if (best_sz > 0x100000) { lo = best_base; hi = best_base + best_sz; found = true; }
     }
+
     if (!found) return false;
     G.mod_base = lo;
     G.mod_size = hi - lo;
