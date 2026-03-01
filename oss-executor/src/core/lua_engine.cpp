@@ -213,8 +213,14 @@ void* LuaEngine::lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
 void LuaEngine::lua_interrupt(lua_State* L, int gc) {
     if (gc >= 0) return;
     auto* eng = get_engine(L);
-    if (eng && !eng->is_running())
+    if (!eng) return;
+    if (!eng->is_running()) {
+        lua_getfield(L, LUA_REGISTRYINDEX, "_oss_internal_exec");
+        bool internal = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+        if (internal) return;
         luaL_error(L, "Script execution cancelled");
+    }
 }
 
 LuaEngine::LuaEngine() = default;
@@ -266,12 +272,13 @@ bool LuaEngine::init() {
     LOG_DEBUG("LuaEngine: Registering signal library...");
     register_signal_lib();
     LOG_DEBUG("LuaEngine: Setting up environment API...");
+    running_.store(true, std::memory_order_release);
+
     Environment::instance().setup(L_);
     LOG_DEBUG("LuaEngine: Applying sandbox...");
     sandbox();
 
     ready_.store(true, std::memory_order_release);
-    running_ = true;
     LOG_INFO("LuaEngine: VM initialized successfully");
     return true;
 }
@@ -1989,3 +1996,4 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
