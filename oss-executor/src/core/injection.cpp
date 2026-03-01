@@ -20,7 +20,10 @@
 #include <sys/user.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/un.h>
+#include <elf.h>
 
 namespace fs = std::filesystem;
 
@@ -89,6 +92,104 @@ static bool is_valid_target(pid_t pid, const std::string& comm,
     if (is_self_process_name(cmdline))   return false;
     if (is_self_process_name(exe_path))  return false;
     return true;
+}
+
+static uintptr_t find_elf_symbol_impl(const std::string& filepath, const std::string& symbol) {
+    std::ifstream f(filepath, std::ios::binary);
+    if (!f.is_open()) return 0;
+
+    Elf64_Ehdr ehdr;
+    f.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr));
+    if (!f.good() || memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) return 0;
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) return 0;
+
+    std::vector<Elf64_Phdr> phdrs(ehdr.e_phnum);
+    f.seekg(static_cast<std::streamoff>(ehdr.e_phoff));
+    f.read(reinterpret_cast<char*>(phdrs.data()),
+           static_cast<std::streamsize>(ehdr.e_phnum * sizeof(Elf64_Phdr)));
+    if (!f.good()) return 0;
+
+    uintptr_t load_base = UINTPTR_MAX;
+    for (auto& ph : phdrs)
+        if (ph.p_type == PT_LOAD && ph.p_vaddr < load_base)
+            load_base = ph.p_vaddr;
+    if (load_base == UINTPTR_MAX) load_base = 0;
+
+    Elf64_Phdr* dyn_phdr = nullptr;
+    for (auto& ph : phdrs)
+        if (ph.p_type == PT_DYNAMIC) { dyn_phdr = &ph; break; }
+    if (!dyn_phdr) return 0;
+
+    size_t dyn_count = dyn_phdr->p_filesz / sizeof(Elf64_Dyn);
+    std::vector<Elf64_Dyn> dyns(dyn_count);
+    f.seekg(static_cast<std::streamoff>(dyn_phdr->p_offset));
+    f.read(reinterpret_cast<char*>(dyns.data()),
+           static_cast<std::streamsize>(dyn_phdr->p_filesz));
+    if (!f.good()) return 0;
+
+    uintptr_t symtab_va = 0, strtab_va = 0, hash_va = 0;
+    size_t strsz = 0, syment = sizeof(Elf64_Sym);
+
+    for (auto& d : dyns) {
+        switch (d.d_tag) {
+            case DT_SYMTAB:  symtab_va = d.d_un.d_ptr; break;
+            case DT_STRTAB:  strtab_va = d.d_un.d_ptr; break;
+            case DT_STRSZ:   strsz     = d.d_un.d_val; break;
+            case DT_SYMENT:  syment    = d.d_un.d_val; break;
+            case DT_HASH:    hash_va   = d.d_un.d_ptr; break;
+            default: break;
+        }
+    }
+    if (!symtab_va || !strtab_va || !strsz) return 0;
+
+    auto va_to_foff = [&](uintptr_t va) -> int64_t {
+        for (auto& ph : phdrs) {
+            if (ph.p_type != PT_LOAD) continue;
+            if (va >= ph.p_vaddr && va < ph.p_vaddr + ph.p_filesz)
+                return static_cast<int64_t>(ph.p_offset + (va - ph.p_vaddr));
+        }
+        return -1;
+    };
+
+    int64_t strtab_off = va_to_foff(strtab_va);
+    int64_t symtab_off = va_to_foff(symtab_va);
+    if (strtab_off < 0 || symtab_off < 0) return 0;
+
+    std::vector<char> strtab(strsz);
+    f.seekg(static_cast<std::streamoff>(strtab_off));
+    f.read(strtab.data(), static_cast<std::streamsize>(strsz));
+    if (!f.good()) return 0;
+
+    size_t nsyms = 0;
+    if (hash_va != 0) {
+        int64_t hash_off = va_to_foff(hash_va);
+        if (hash_off >= 0) {
+            uint32_t hdr[2];
+            f.seekg(static_cast<std::streamoff>(hash_off));
+            f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+            if (f.good()) nsyms = hdr[1];
+        }
+    }
+    if (nsyms == 0) nsyms = 32768;
+
+    for (size_t i = 0; i < nsyms; i++) {
+        Elf64_Sym sym;
+        f.seekg(static_cast<std::streamoff>(symtab_off +
+                static_cast<int64_t>(i * syment)));
+        f.read(reinterpret_cast<char*>(&sym), sizeof(sym));
+        if (!f.good()) break;
+        if (sym.st_name == 0 || sym.st_name >= strsz) continue;
+        if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC) continue;
+        if (sym.st_shndx == SHN_UNDEF) continue;
+        if (symbol == (strtab.data() + sym.st_name))
+            return sym.st_value - load_base;
+    }
+    return 0;
+}
+
+uintptr_t Injection::find_elf_symbol(const std::string& filepath,
+                                      const std::string& symbol) {
+    return find_elf_symbol_impl(filepath, symbol);
 }
 
 Injection& Injection::instance() {
@@ -666,11 +767,15 @@ std::string Injection::find_payload_path() {
         fs::path exe_dir = fs::path(self_path).parent_path();
         search_paths.push_back((exe_dir / "liboss_payload.so").string());
         search_paths.push_back((exe_dir / "lib" / "liboss_payload.so").string());
+        search_paths.push_back((exe_dir / ".." / "lib" / "oss-executor" / "liboss_payload.so").string());
+        search_paths.push_back((exe_dir / ".." / "build" / "liboss_payload.so").string());
     }
 
     search_paths.push_back("./liboss_payload.so");
     search_paths.push_back("./build/liboss_payload.so");
+    search_paths.push_back("../build/liboss_payload.so");
     search_paths.push_back("../lib/liboss_payload.so");
+    search_paths.push_back("../lib/oss-executor/liboss_payload.so");
     search_paths.push_back("/usr/lib/oss-executor/liboss_payload.so");
     search_paths.push_back("/usr/local/lib/oss-executor/liboss_payload.so");
 
@@ -692,6 +797,54 @@ uintptr_t Injection::find_libc_function(pid_t pid, const std::string& func_name)
 
 uintptr_t Injection::find_remote_symbol(pid_t pid, const std::string& lib_name,
                                          const std::string& symbol) {
+    std::string basename_so6 = "lib" + lib_name + ".so.6";
+    std::string basename_so  = "lib" + lib_name + ".so";
+
+    std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
+    if (!maps.is_open()) return 0;
+
+    uintptr_t remote_base = 0;
+    std::string lib_file;
+    std::string line;
+    while (std::getline(maps, line)) {
+        bool match = (line.find(basename_so6) != std::string::npos ||
+                      line.find(basename_so) != std::string::npos);
+        if (!match) continue;
+
+        unsigned long lo;
+        unsigned long file_offset;
+        char perms[5]{};
+        if (sscanf(line.c_str(), "%lx-%*lx %4s %lx", &lo, perms, &file_offset) < 3)
+            continue;
+
+        if (file_offset == 0 && remote_base == 0) {
+            remote_base = lo;
+            auto slash = line.find('/');
+            if (slash != std::string::npos) {
+                lib_file = line.substr(slash);
+                auto end = lib_file.find_last_not_of(" \n\r\t");
+                if (end != std::string::npos) lib_file = lib_file.substr(0, end + 1);
+            }
+        }
+    }
+    if (remote_base == 0) return 0;
+
+    if (!lib_file.empty()) {
+        std::string ns_path = "/proc/" + std::to_string(pid) + "/root" + lib_file;
+        struct stat st;
+        std::string elf_path;
+        if (::stat(ns_path.c_str(), &st) == 0)
+            elf_path = ns_path;
+        else if (::stat(lib_file.c_str(), &st) == 0)
+            elf_path = lib_file;
+
+        if (!elf_path.empty()) {
+            uintptr_t sym_offset = find_elf_symbol(elf_path, symbol);
+            if (sym_offset != 0)
+                return remote_base + sym_offset;
+        }
+    }
+
     uintptr_t local_symbol = 0;
     void* handle = dlopen(("lib" + lib_name + ".so.6").c_str(),
                           RTLD_LAZY | RTLD_NOLOAD);
@@ -714,23 +867,58 @@ uintptr_t Injection::find_remote_symbol(pid_t pid, const std::string& lib_name,
         local_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
     if (local_base == 0) return 0;
 
-    uintptr_t offset = local_symbol - local_base;
-    std::string lib_basename = info.dli_fname
-        ? fs::path(info.dli_fname).filename().string() : "";
+    return remote_base + (local_symbol - local_base);
+}
 
-    std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
-    if (!maps.is_open()) return 0;
+std::string Injection::prepare_payload_for_injection(pid_t pid,
+                                                      const std::string& host_path) {
+    if (!proc_info_.via_flatpak && !proc_info_.via_sober)
+        return host_path;
 
-    std::string line;
-    while (std::getline(maps, line)) {
-        if (line.find(lib_basename) != std::string::npos &&
-            line.find("r-xp") != std::string::npos) {
-            unsigned long remote_base;
-            if (sscanf(line.c_str(), "%lx-", &remote_base) == 1)
-                return remote_base + offset;
+    std::string ns_tmp = "/proc/" + std::to_string(pid) + "/root/tmp";
+    std::string ns_dest = ns_tmp + "/liboss_payload.so";
+    std::string sandbox_path = "/tmp/liboss_payload.so";
+
+    try {
+        struct stat st;
+        if (::stat(ns_tmp.c_str(), &st) != 0) {
+            LOG_WARN("Cannot access target /tmp via {}, using host path", ns_tmp);
+            return host_path;
+        }
+
+        std::ifstream src(host_path, std::ios::binary);
+        if (!src.is_open()) return host_path;
+
+        std::ofstream dst(ns_dest, std::ios::binary | std::ios::trunc);
+        if (!dst.is_open()) {
+            LOG_WARN("Cannot write to {}, using host path", ns_dest);
+            return host_path;
+        }
+
+        dst << src.rdbuf();
+        dst.close();
+        ::chmod(ns_dest.c_str(), 0755);
+
+        LOG_INFO("Payload staged in target namespace: {}", sandbox_path);
+        return sandbox_path;
+    } catch (...) {
+        LOG_WARN("Failed to stage payload in target namespace, using host path");
+        return host_path;
+    }
+}
+
+std::string Injection::resolve_socket_path() {
+    if (proc_info_.via_flatpak || proc_info_.via_sober) {
+        pid_t pid = memory_.get_pid();
+        if (pid > 0) {
+            std::string ns_sock = "/proc/" + std::to_string(pid)
+                                + "/root" + PAYLOAD_SOCK;
+            struct stat st;
+            if (::stat(ns_sock.c_str(), &st) == 0)
+                return ns_sock;
         }
     }
-    return 0;
+    return PAYLOAD_SOCK;
 }
 
 bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
@@ -742,26 +930,55 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
         return false;
     }
 
-    uintptr_t remote_dlopen = find_remote_symbol(pid, "c", "__libc_dlopen_mode");
-    if (remote_dlopen == 0)
-        remote_dlopen = find_remote_symbol(pid, "dl", "dlopen");
-    if (remote_dlopen == 0) {
+    std::string target_path = prepare_payload_for_injection(pid, lib_path);
+
+    bool libc_internal = false;
+    uintptr_t dlopen_addr = find_remote_symbol(pid, "c", "__libc_dlopen_mode");
+    if (dlopen_addr != 0) {
+        libc_internal = true;
+        LOG_DEBUG("Remote __libc_dlopen_mode at 0x{:x}", dlopen_addr);
+    } else {
+        dlopen_addr = find_remote_symbol(pid, "dl", "dlopen");
+        if (dlopen_addr == 0)
+            dlopen_addr = find_remote_symbol(pid, "c", "dlopen");
+        if (dlopen_addr != 0)
+            LOG_DEBUG("Remote dlopen at 0x{:x}", dlopen_addr);
+    }
+
+    if (dlopen_addr == 0) {
         error_ = "Could not find dlopen in target process";
         LOG_ERROR("inject_library: {}", error_);
         return false;
     }
-    LOG_DEBUG("Remote dlopen at 0x{:x}", remote_dlopen);
 
-    return inject_shellcode(pid, lib_path);
+    uint64_t flags = libc_internal ? 0x80000002ULL : 0x00000002ULL;
+    return inject_shellcode(pid, target_path, dlopen_addr, flags);
 }
 
-bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
+bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path,
+                                  uintptr_t dlopen_addr, uint64_t dlopen_flags) {
+    auto wait_for_trap = [](pid_t p) -> bool {
+        for (int i = 0; i < 200; i++) {
+            int st;
+            int wr = waitpid(p, &st, 0);
+            if (wr == -1) return false;
+            if (WIFSTOPPED(st)) {
+                int sig = WSTOPSIG(st);
+                if (sig == SIGTRAP) return true;
+                ptrace(PTRACE_CONT, p, nullptr,
+                       reinterpret_cast<void*>(static_cast<uintptr_t>(sig)));
+                continue;
+            }
+            if (WIFEXITED(st) || WIFSIGNALED(st)) return false;
+        }
+        return false;
+    };
+
     errno = 0;
     if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) != 0) {
         error_ = "ptrace attach failed: " + std::string(strerror(errno));
-        if (errno == EPERM) {
+        if (errno == EPERM)
             error_ += " — run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope";
-        }
         LOG_ERROR("inject_shellcode: {}", error_);
         return false;
     }
@@ -786,37 +1003,12 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
         return false;
     }
 
-    size_t alloc_size = 4096;
-
-    struct user_regs_struct mmap_regs = orig_regs;
-    mmap_regs.rax = 9;
-    mmap_regs.rdi = 0;
-    mmap_regs.rsi = alloc_size;
-    mmap_regs.rdx = PROT_READ | PROT_WRITE | PROT_EXEC;
-    mmap_regs.r10 = MAP_PRIVATE | MAP_ANONYMOUS;
-    mmap_regs.r8  = static_cast<uintptr_t>(-1);
-    mmap_regs.r9  = 0;
-
     uintptr_t rip = orig_regs.rip;
     long orig_code[2];
     orig_code[0] = ptrace(PTRACE_PEEKTEXT, pid,
                           reinterpret_cast<void*>(rip), nullptr);
     orig_code[1] = ptrace(PTRACE_PEEKTEXT, pid,
                           reinterpret_cast<void*>(rip + 8), nullptr);
-
-    uint8_t syscall_trap[] = { 0x0F, 0x05, 0xCC };
-    long insn = orig_code[0];
-    memcpy(&insn, syscall_trap, 3);
-    ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
-           reinterpret_cast<void*>(insn));
-
-    ptrace(PTRACE_SETREGS, pid, nullptr, &mmap_regs);
-    ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-    waitpid(pid, &status, 0);
-
-    struct user_regs_struct result_regs;
-    ptrace(PTRACE_GETREGS, pid, nullptr, &result_regs);
-    uintptr_t mem_addr = result_regs.rax;
 
     auto restore_and_detach = [&]() {
         ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
@@ -827,11 +1019,41 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
         ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
     };
 
-    if (mem_addr == 0 || mem_addr > 0x7FFFFFFFFFFF ||
-        mem_addr == static_cast<uintptr_t>(-1)) {
+    uint8_t syscall_trap[] = { 0x0F, 0x05, 0xCC };
+    long insn = orig_code[0];
+    memcpy(&insn, syscall_trap, 3);
+    ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
+           reinterpret_cast<void*>(insn));
+
+    size_t alloc_size = 4096;
+    struct user_regs_struct mmap_regs = orig_regs;
+    mmap_regs.rax = 9;
+    mmap_regs.rdi = 0;
+    mmap_regs.rsi = alloc_size;
+    mmap_regs.rdx = PROT_READ | PROT_WRITE | PROT_EXEC;
+    mmap_regs.r10 = MAP_PRIVATE | MAP_ANONYMOUS;
+    mmap_regs.r8  = static_cast<uintptr_t>(-1);
+    mmap_regs.r9  = 0;
+    mmap_regs.rip = rip;
+
+    ptrace(PTRACE_SETREGS, pid, nullptr, &mmap_regs);
+    ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+
+    if (!wait_for_trap(pid)) {
+        restore_and_detach();
+        error_ = "mmap syscall did not complete";
+        return false;
+    }
+
+    struct user_regs_struct result_regs;
+    ptrace(PTRACE_GETREGS, pid, nullptr, &result_regs);
+    uintptr_t mem_addr = result_regs.rax;
+
+    if (mem_addr == 0 || static_cast<int64_t>(mem_addr) < 0) {
         restore_and_detach();
         error_ = "Remote mmap failed (returned 0x" +
-                 ([&]{ std::ostringstream o; o << std::hex << mem_addr; return o.str(); })() + ")";
+                 ([&]{ std::ostringstream o; o << std::hex << mem_addr;
+                       return o.str(); })() + ")";
         LOG_ERROR("{}", error_);
         return false;
     }
@@ -852,16 +1074,6 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
         }
     }
 
-    uintptr_t dlopen_addr = find_remote_symbol(pid, "c", "__libc_dlopen_mode");
-    if (dlopen_addr == 0)
-        dlopen_addr = find_remote_symbol(pid, "dl", "dlopen");
-    if (dlopen_addr == 0) {
-        restore_and_detach();
-        error_ = "Cannot find dlopen in target";
-        return false;
-    }
-    LOG_DEBUG("dlopen resolved at 0x{:x} in target", dlopen_addr);
-
     uint8_t shellcode[64] = {};
     int sc_off = 0;
 
@@ -870,37 +1082,35 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
     memcpy(shellcode + sc_off, &path_addr, 8); sc_off += 8;
 
     shellcode[sc_off++] = 0x48; shellcode[sc_off++] = 0xBE;
-    uint64_t rtld_flags = 0x80000002;
-    memcpy(shellcode + sc_off, &rtld_flags, 8); sc_off += 8;
+    memcpy(shellcode + sc_off, &dlopen_flags, 8); sc_off += 8;
 
     shellcode[sc_off++] = 0x48; shellcode[sc_off++] = 0xB8;
     memcpy(shellcode + sc_off, &dlopen_addr, 8); sc_off += 8;
 
     shellcode[sc_off++] = 0xFF; shellcode[sc_off++] = 0xD0;
-
     shellcode[sc_off++] = 0xCC;
 
-    for (int i = 0; i < sc_off; i += sizeof(long)) {
+    for (int i = 0; i < sc_off; i += static_cast<int>(sizeof(long))) {
         long word = 0;
         memcpy(&word, shellcode + i,
                std::min(static_cast<size_t>(sizeof(long)),
                         static_cast<size_t>(sc_off - i)));
         ptrace(PTRACE_POKETEXT, pid,
-               reinterpret_cast<void*>(mem_addr + i),
+               reinterpret_cast<void*>(mem_addr + static_cast<uintptr_t>(i)),
                reinterpret_cast<void*>(word));
     }
 
     struct user_regs_struct sc_regs = orig_regs;
     sc_regs.rip = mem_addr;
-    sc_regs.rsp = (sc_regs.rsp & ~0xFULL) - 8;
+    sc_regs.rsp = (sc_regs.rsp - 256) & ~0xFULL;
 
     ptrace(PTRACE_SETREGS, pid, nullptr, &sc_regs);
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
 
-    int wait_result = waitpid(pid, &status, 0);
-    if (wait_result == -1) {
+    if (!wait_for_trap(pid)) {
         restore_and_detach();
-        error_ = "waitpid failed during shellcode execution";
+        error_ = "Shellcode execution did not complete";
+        LOG_ERROR("{}", error_);
         return false;
     }
 
@@ -912,12 +1122,11 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lib_path) {
     munmap_regs.rax = 11;
     munmap_regs.rdi = mem_addr;
     munmap_regs.rsi = alloc_size;
+    munmap_regs.rip = rip;
 
-    ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
-           reinterpret_cast<void*>(insn));
     ptrace(PTRACE_SETREGS, pid, nullptr, &munmap_regs);
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-    waitpid(pid, &status, 0);
+    wait_for_trap(pid);
 
     ptrace(PTRACE_POKETEXT, pid, reinterpret_cast<void*>(rip),
            reinterpret_cast<void*>(orig_code[0]));
@@ -1079,11 +1288,12 @@ bool Injection::verify_payload_alive() {
         return false;
     }
 
+    std::string sock = resolve_socket_path();
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return false;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, PAYLOAD_SOCK, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock.c_str(), sizeof(addr.sun_path) - 1);
     struct timeval tv{};
     tv.tv_usec = 500000;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -1092,7 +1302,7 @@ bool Injection::verify_payload_alive() {
     ::close(fd);
 
     if (!reachable) {
-        LOG_WARN("Payload mapped but socket unreachable");
+        LOG_WARN("Payload mapped but socket unreachable at {}", sock);
         payload_loaded_ = false;
     }
     return reachable;
@@ -1122,6 +1332,8 @@ bool Injection::execute_script(const std::string& source) {
     set_state(InjectionState::Executing,
               "Executing (" + std::to_string(source.size()) + " bytes)...");
 
+    std::string sock = resolve_socket_path();
+
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         set_state(InjectionState::Ready, "Socket creation failed");
@@ -1131,14 +1343,14 @@ bool Injection::execute_script(const std::string& source) {
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, PAYLOAD_SOCK, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock.c_str(), sizeof(addr.sun_path) - 1);
 
     struct timeval tv{};
     tv.tv_sec = 2;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        LOG_ERROR("execute_script connect({}): {}", PAYLOAD_SOCK, strerror(errno));
+        LOG_ERROR("execute_script connect({}): {}", sock, strerror(errno));
         ::close(fd);
         payload_loaded_ = false;
         set_state(InjectionState::Ready, "Payload socket unreachable");
@@ -1164,7 +1376,7 @@ bool Injection::execute_script(const std::string& source) {
 
     if (write_ok) {
         set_state(InjectionState::Ready, "Script dispatched to payload");
-        LOG_INFO("Sent {} bytes to payload via {}", source.size(), PAYLOAD_SOCK);
+        LOG_INFO("Sent {} bytes to payload via {}", source.size(), sock);
         return true;
     }
 
@@ -1205,6 +1417,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
