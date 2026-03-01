@@ -289,13 +289,135 @@ void Injection::adopt_target(pid_t pid, const std::string& via) {
              proc_info_.via_wine, proc_info_.via_sober, proc_info_.via_flatpak);
 }
 
+pid_t Injection::find_roblox_child(pid_t wrapper_pid) {
+    auto children = descendants(wrapper_pid);
+    if (children.empty()) {
+        LOG_DEBUG("No descendants found for wrapper PID {}", wrapper_pid);
+        return -1;
+    }
+
+    for (auto cpid : children) {
+        if (is_self_process(cpid)) continue;
+        std::string ccomm = read_proc_comm(cpid);
+        std::string ccmd  = read_proc_cmdline(cpid);
+        if (has_roblox_token(ccomm) || has_roblox_token(ccmd)) {
+            LOG_DEBUG("Found Roblox child PID {} ('{}') via token match", cpid, ccomm);
+            return cpid;
+        }
+    }
+
+    for (auto cpid : children) {
+        if (is_self_process(cpid)) continue;
+        try {
+            std::ifstream maps("/proc/" + std::to_string(cpid) + "/maps");
+            std::string line;
+            bool has_roblox = false;
+            size_t total_size = 0;
+            while (std::getline(maps, line)) {
+                uintptr_t lo, hi;
+                if (sscanf(line.c_str(), "%lx-%lx", &lo, &hi) == 2)
+                    total_size += (hi - lo);
+                std::string lower = line;
+                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                if (lower.find("roblox") != std::string::npos)
+                    has_roblox = true;
+            }
+            if (has_roblox && total_size > 50 * 1024 * 1024) {
+                LOG_DEBUG("Found Roblox child PID {} via maps ({:.0f}MB)",
+                          cpid, total_size / (1024.0 * 1024.0));
+                return cpid;
+            }
+        } catch (...) {}
+    }
+
+    pid_t best = -1;
+    size_t best_sz = 0;
+    for (auto cpid : children) {
+        if (is_self_process(cpid)) continue;
+        try {
+            std::ifstream statm("/proc/" + std::to_string(cpid) + "/statm");
+            size_t pages = 0;
+            if (statm >> pages) {
+                size_t bytes = pages * 4096;
+                if (bytes > best_sz) {
+                    best_sz = bytes;
+                    best = cpid;
+                }
+            }
+        } catch (...) {}
+    }
+
+    if (best > 0 && best_sz > 100 * 1024 * 1024) {
+        LOG_DEBUG("Using largest child PID {} ({:.0f}MB)",
+                  best, best_sz / (1024.0 * 1024.0));
+        return best;
+    }
+
+    try {
+        for (const auto& entry : fs::directory_iterator("/proc")) {
+            if (!entry.is_directory()) continue;
+            std::string d = entry.path().filename().string();
+            if (!std::all_of(d.begin(), d.end(), ::isdigit)) continue;
+            pid_t cpid = std::stoi(d);
+            if (cpid <= 1 || is_self_process(cpid)) continue;
+            try {
+                std::ifstream env(entry.path() / "environ", std::ios::binary);
+                if (!env.is_open()) continue;
+                std::string envs((std::istreambuf_iterator<char>(env)),
+                                  std::istreambuf_iterator<char>());
+                std::string lower = envs;
+                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                if (lower.find("sober") == std::string::npos &&
+                    lower.find("vinegar") == std::string::npos)
+                    continue;
+                std::ifstream statm(entry.path() / "statm");
+                size_t pages = 0;
+                if (statm >> pages && pages * 4096 > 100 * 1024 * 1024) {
+                    LOG_DEBUG("Found Roblox via environ scan PID {} ({:.0f}MB)",
+                              cpid, (pages * 4096) / (1024.0 * 1024.0));
+                    return cpid;
+                }
+            } catch (...) {}
+        }
+    } catch (...) {}
+
+    return -1;
+}
+
 bool Injection::scan_direct() {
     for (const auto& t : DIRECT_TARGETS) {
-        auto pid = Memory::find_process(t);
-        if (pid.has_value()) {
-            pid_t p = pid.value();
+        auto pids = Memory::find_all_processes(t);
+        for (auto p : pids) {
             if (is_self_process(p)) continue;
             if (is_self_process_name(read_proc_comm(p))) continue;
+
+            std::string exe  = read_proc_exe(p);
+            std::string comm = read_proc_comm(p);
+
+            if (comm == "bwrap" || exe.find("/bwrap") != std::string::npos) {
+                pid_t child = find_roblox_child(p);
+                if (child > 0) {
+                    adopt_target(child,
+                        "Sober child (wrapper PID " + std::to_string(p) + ")");
+                    if (memory_.is_valid()) {
+                        proc_info_.via_sober = true;
+                        return true;
+                    }
+                }
+                continue;
+            }
+
+            size_t vm_pages = 0;
+            try {
+                std::ifstream statm("/proc/" + std::to_string(p) + "/statm");
+                statm >> vm_pages;
+            } catch (...) {}
+            if (vm_pages > 0 && vm_pages * 4096 < 20 * 1024 * 1024) {
+                LOG_DEBUG("Skipping PID {} ('{}') — {:.1f}MB, likely wrapper",
+                          p, comm, (vm_pages * 4096) / (1024.0 * 1024.0));
+                continue;
+            }
+
             adopt_target(p, "direct '" + t + "'");
             if (memory_.is_valid()) return true;
         }
@@ -347,33 +469,18 @@ bool Injection::scan_flatpak() {
         std::string bl = bc;
         std::transform(bl.begin(), bl.end(), bl.begin(), ::tolower);
         if (bl.find("sober") == std::string::npos &&
-            bl.find("vinegar") == std::string::npos) continue;
+            bl.find("vinegar") == std::string::npos &&
+            bl.find("roblox") == std::string::npos)
+            continue;
 
-        for (auto cpid : descendants(bpid)) {
-            if (is_self_process(cpid)) continue;
-            if (has_roblox_token(read_proc_cmdline(cpid))) {
-                adopt_target(cpid, "via Sober/Flatpak cmdline");
-                if (memory_.is_valid()) {
-                    proc_info_.via_sober   = true;
-                    proc_info_.via_flatpak = true;
-                    return true;
-                }
-            }
-        }
-        for (auto cpid : descendants(bpid)) {
-            if (is_self_process(cpid)) continue;
-            Memory mem(cpid);
-            for (const auto& r : mem.get_regions()) {
-                std::string lp = r.path;
-                std::transform(lp.begin(), lp.end(), lp.begin(), ::tolower);
-                if (lp.find("roblox") != std::string::npos) {
-                    adopt_target(cpid, "via Sober/Flatpak memory");
-                    if (memory_.is_valid()) {
-                        proc_info_.via_sober   = true;
-                        proc_info_.via_flatpak = true;
-                        return true;
-                    }
-                }
+        pid_t child = find_roblox_child(bpid);
+        if (child > 0) {
+            adopt_target(child,
+                "via Sober/Flatpak (wrapper PID " + std::to_string(bpid) + ")");
+            if (memory_.is_valid()) {
+                proc_info_.via_sober   = true;
+                proc_info_.via_flatpak = true;
+                return true;
             }
         }
     }
@@ -405,10 +512,10 @@ bool Injection::scan_brute() {
 
 bool Injection::scan_for_roblox() {
     set_state(InjectionState::Scanning, "Scanning for Roblox...");
+    if (scan_flatpak())      return true;
     if (scan_direct())       return true;
     if (scan_wine_cmdline()) return true;
     if (scan_wine_regions()) return true;
-    if (scan_flatpak())      return true;
     if (scan_brute())        return true;
     set_state(InjectionState::Idle, "Roblox not found");
     return false;
@@ -1072,4 +1179,5 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
