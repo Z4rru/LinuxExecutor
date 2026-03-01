@@ -197,12 +197,38 @@ ProcessInfo Injection::gather_info(pid_t pid) {
         return hay.find(needle) != std::string::npos;
     };
 
-    info.via_wine    = contains(info.exe_path, "wine") ||
-                       contains(info.name, "wine");
-    info.via_sober   = contains(info.cmdline, "sober") ||
-                       contains(info.cmdline, "Sober");
-    info.via_flatpak = contains(info.cmdline, "flatpak") ||
-                       contains(info.exe_path, "flatpak");
+    auto contains_lower = [](const std::string& hay, const std::string& needle) {
+        std::string h = hay;
+        std::string n = needle;
+        std::transform(h.begin(), h.end(), h.begin(), ::tolower);
+        std::transform(n.begin(), n.end(), n.begin(), ::tolower);
+        return h.find(n) != std::string::npos;
+    };
+
+    info.via_wine = contains_lower(info.exe_path, "wine") ||
+                    contains_lower(info.name, "wine") ||
+                    contains_lower(info.cmdline, "wine");
+
+    info.via_sober = contains_lower(info.exe_path, "sober") ||
+                     contains_lower(info.cmdline, "sober") ||
+                     contains_lower(info.name, "sober") ||
+                     contains_lower(info.exe_path, "vinegar") ||
+                     contains_lower(info.cmdline, "vinegar");
+
+    info.via_flatpak = contains(info.exe_path, "/app/") ||
+                       contains(info.exe_path, "flatpak") ||
+                       contains(info.cmdline, "flatpak");
+
+    if (!info.via_sober && info.parent_pid > 1) {
+        std::string parent_cmd = read_proc_cmdline(info.parent_pid);
+        std::string parent_exe = read_proc_exe(info.parent_pid);
+        if (contains_lower(parent_cmd, "sober") ||
+            contains_lower(parent_exe, "sober") ||
+            contains_lower(parent_cmd, "vinegar")) {
+            info.via_sober = true;
+        }
+    }
+
     return info;
 }
 
@@ -1179,5 +1205,6 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
