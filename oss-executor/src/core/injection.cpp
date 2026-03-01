@@ -24,6 +24,7 @@
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <elf.h>
+#include <luacode.h>
 
 namespace fs = std::filesystem;
 
@@ -767,8 +768,19 @@ std::string Injection::find_payload_path() {
         fs::path exe_dir = fs::path(self_path).parent_path();
         search_paths.push_back((exe_dir / "liboss_payload.so").string());
         search_paths.push_back((exe_dir / "lib" / "liboss_payload.so").string());
+        search_paths.push_back((exe_dir / "lib" / "oss-executor" / "liboss_payload.so").string());
+        search_paths.push_back((exe_dir / ".." / "lib" / "liboss_payload.so").string());
         search_paths.push_back((exe_dir / ".." / "lib" / "oss-executor" / "liboss_payload.so").string());
         search_paths.push_back((exe_dir / ".." / "build" / "liboss_payload.so").string());
+    }
+
+    char cwd_buf[512];
+    if (getcwd(cwd_buf, sizeof(cwd_buf))) {
+        fs::path cwd(cwd_buf);
+        search_paths.push_back((cwd / "liboss_payload.so").string());
+        search_paths.push_back((cwd / "build" / "liboss_payload.so").string());
+        search_paths.push_back((cwd / "cmake-build-debug" / "liboss_payload.so").string());
+        search_paths.push_back((cwd / "cmake-build-release" / "liboss_payload.so").string());
     }
 
     search_paths.push_back("./liboss_payload.so");
@@ -778,16 +790,35 @@ std::string Injection::find_payload_path() {
     search_paths.push_back("../lib/oss-executor/liboss_payload.so");
     search_paths.push_back("/usr/lib/oss-executor/liboss_payload.so");
     search_paths.push_back("/usr/local/lib/oss-executor/liboss_payload.so");
+    search_paths.push_back("/usr/lib64/oss-executor/liboss_payload.so");
 
     const char* home = getenv("HOME");
     if (home) {
         search_paths.push_back(std::string(home) + "/.oss-executor/liboss_payload.so");
         search_paths.push_back(std::string(home) + "/.local/lib/oss-executor/liboss_payload.so");
+        search_paths.push_back(std::string(home) + "/.local/share/oss-executor/liboss_payload.so");
     }
 
-    for (const auto& path : search_paths)
-        if (fs::exists(path))
+    const char* xdg_data = getenv("XDG_DATA_HOME");
+    if (xdg_data)
+        search_paths.push_back(std::string(xdg_data) + "/oss-executor/liboss_payload.so");
+
+    const char* appdir = getenv("APPDIR");
+    if (appdir) {
+        search_paths.push_back(std::string(appdir) + "/usr/lib/liboss_payload.so");
+        search_paths.push_back(std::string(appdir) + "/usr/lib/oss-executor/liboss_payload.so");
+    }
+
+    for (const auto& path : search_paths) {
+        if (fs::exists(path)) {
+            LOG_INFO("Payload found at: {}", fs::absolute(path).string());
             return fs::absolute(path).string();
+        }
+    }
+
+    LOG_WARN("Payload not found. Searched {} paths:", search_paths.size());
+    for (const auto& path : search_paths)
+        LOG_DEBUG("  checked: {}", path);
     return "";
 }
 
@@ -1325,12 +1356,25 @@ bool Injection::execute_script(const std::string& source) {
     if (source.empty()) return true;
 
     if (!payload_loaded_) {
-        set_state(InjectionState::Ready, "No payload — local execution only");
+        set_state(InjectionState::Ready, "No payload \u2014 local execution only");
         return false;
     }
 
     set_state(InjectionState::Executing,
               "Executing (" + std::to_string(source.size()) + " bytes)...");
+
+    std::string data_to_send;
+    size_t bc_size = 0;
+    char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_size);
+    if (bc && bc_size > 0 && static_cast<uint8_t>(bc[0]) != 0) {
+        data_to_send.assign(bc, bc_size);
+        LOG_DEBUG("Pre-compiled {} bytes source to {} bytes bytecode",
+                  source.size(), bc_size);
+    } else {
+        data_to_send = source;
+        LOG_DEBUG("Pre-compilation skipped, sending {} bytes source", source.size());
+    }
+    free(bc);
 
     std::string sock = resolve_socket_path();
 
@@ -1357,8 +1401,8 @@ bool Injection::execute_script(const std::string& source) {
         return false;
     }
 
-    const char* data = source.data();
-    size_t remaining = source.size();
+    const char* data = data_to_send.data();
+    size_t remaining = data_to_send.size();
     bool write_ok = true;
     while (remaining > 0) {
         ssize_t n = ::write(fd, data, remaining);
@@ -1376,7 +1420,7 @@ bool Injection::execute_script(const std::string& source) {
 
     if (write_ok) {
         set_state(InjectionState::Ready, "Script dispatched to payload");
-        LOG_INFO("Sent {} bytes to payload via {}", source.size(), sock);
+        LOG_INFO("Sent {} bytes to payload via {}", data_to_send.size(), sock);
         return true;
     }
 
@@ -1417,6 +1461,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
