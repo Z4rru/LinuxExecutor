@@ -111,6 +111,7 @@ private:
     bool scan_wine_regions();
     bool scan_flatpak();
     bool scan_brute();
+    pid_t find_roblox_child(pid_t wrapper_pid);
 
     bool should_scan_region(const MemoryRegion& r) const;
     bool cross_validate(uintptr_t rstart, size_t rsize);
@@ -144,3 +145,4 @@ private:
 };
 
 }
+
