@@ -14,6 +14,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
+#include <algorithm>
 
 static constexpr const char* SOCK_PATH    = "/tmp/oss_executor.sock";
 static constexpr size_t      RECV_BUF     = 1 << 18;
