@@ -122,7 +122,12 @@ private:
     uintptr_t find_remote_symbol(pid_t pid, const std::string& lib_name,
                                   const std::string& symbol);
 
-    bool inject_shellcode(pid_t pid, const std::string& lib_path);
+    bool inject_shellcode(pid_t pid, const std::string& lib_path,
+                          uintptr_t dlopen_addr, uint64_t dlopen_flags);
+
+    std::string prepare_payload_for_injection(pid_t pid, const std::string& host_path);
+    std::string resolve_socket_path();
+    static uintptr_t find_elf_symbol(const std::string& filepath, const std::string& symbol);
 
     bool write_to_process(uintptr_t addr, const void* data, size_t len);
     bool read_from_process(uintptr_t addr, void* buf, size_t len);
@@ -145,4 +150,5 @@ private:
 };
 
 }
+
 
