@@ -966,7 +966,10 @@ LuauStateInfo Memory::scan_for_lua_state_direct(
         if (r.writable() && r.is_private() && r.size() >= 65536) {
             if (r.path.empty() || r.path == "[heap]" ||
                 r.path.find("RobloxPlayer") != std::string::npos ||
-                r.path.find("libroblox") != std::string::npos) {
+                r.path.find("libroblox") != std::string::npos ||
+                r.path.find("roblox") != std::string::npos ||
+                r.path.find("Roblox") != std::string::npos ||
+                r.path.find("sober") != std::string::npos) {
                 heap_regions.push_back(r);
             }
         }
@@ -1000,11 +1003,19 @@ LuauStateInfo Memory::scan_for_lua_state_direct(
             total_scanned_ += rsize;
 
             for (size_t i = 0; i + 128 <= rsize; i += 8) {
-                uint8_t tt     = buf[i];
-                uint8_t marked = buf[i + 1];
-                uint8_t status = buf[i + 4];
 
-                if (tt != 8 || marked >= 8 || status != 0) continue;
+                bool layout1 = (buf[i] == 8 && buf[i + 1] < 8 && buf[i + 4] <= 6);
+
+                bool layout2 = false;
+                if (i + 136 <= rsize) {
+                    uintptr_t nptr = *reinterpret_cast<uintptr_t*>(&buf[i]);
+                    layout2 = (nptr == 0 ||
+                              (nptr >= 0x10000 && nptr <= 0x7fffffffffff)) &&
+                              buf[i + 8] == 8 && buf[i + 9] < 8 &&
+                              (buf[i + 12] <= 6 || buf[i + 10] <= 6);
+                }
+
+                if (!layout1 && !layout2) continue;
 
                 uintptr_t candidate_addr = region.start + off + i;
 
@@ -1014,9 +1025,13 @@ LuauStateInfo Memory::scan_for_lua_state_direct(
                     info.valid          = true;
                     info.confidence     = 70;
 
-                    for (int gs_off : {16, 24, 32}) {
+                    int gs_offsets_l1[] = {16, 24, 32, 40};
+                    int gs_offsets_l2[] = {24, 32, 40, 48};
+                    int* gs_table = layout2 ? gs_offsets_l2 : gs_offsets_l1;
+
+                    for (int idx = 0; idx < 4; idx++) {
                         uintptr_t gs = read_value<uintptr_t>(
-                            candidate_addr + gs_off);
+                            candidate_addr + gs_table[idx]);
                         if (validate_global_state(gs)) {
                             info.global_state_addr = gs;
                             info.confidence = 80;
@@ -1127,23 +1142,35 @@ LuauStateInfo Memory::scan_for_string_table(
 bool Memory::validate_lua_state(uintptr_t addr) {
     if (addr < 0x10000 || addr > 0x7fffffffffff) return false;
 
-    uint8_t header[64];
+    uint8_t header[80];
     if (!read_raw(addr, header, sizeof(header))) return false;
 
-    if (header[0] != 8) return false;
-    if (header[1] >= 8) return false;
-    if (header[4] > 6) return false;
+    auto check_ptrs = [](const uint8_t* base, int offset, int count) -> int {
+        const uintptr_t* ptrs = reinterpret_cast<const uintptr_t*>(base + offset);
+        int valid = 0;
+        for (int i = 0; i < count; i++)
+            if (ptrs[i] >= 0x10000 && ptrs[i] <= 0x7fffffffffff) valid++;
+        return valid;
+    };
 
-    uintptr_t* ptrs = reinterpret_cast<uintptr_t*>(header + 8);
-
-    int valid_ptrs = 0;
-    for (int i = 0; i < 6; i++) {
-        uintptr_t p = ptrs[i];
-        if (p >= 0x10000 && p <= 0x7fffffffffff)
-            valid_ptrs++;
+    if (header[0] == 8 && header[1] < 8 && header[4] <= 6) {
+        if (check_ptrs(header, 8, 6) >= 3) return true;
     }
 
-    return valid_ptrs >= 3;
+    uintptr_t next_ptr = *reinterpret_cast<uintptr_t*>(header);
+    if ((next_ptr == 0 || (next_ptr >= 0x10000 && next_ptr <= 0x7fffffffffff)) &&
+        header[8] == 8 && header[9] < 8 && header[12] <= 6) {
+        if (check_ptrs(header, 16, 6) >= 3) return true;
+    }
+
+    if ((next_ptr == 0 || (next_ptr >= 0x10000 && next_ptr <= 0x7fffffffffff)) &&
+        header[8] == 8 && header[9] < 8) {
+        if (header[10] <= 6 || header[12] <= 6) {
+            if (check_ptrs(header, 16, 8) >= 4) return true;
+        }
+    }
+
+    return false;
 }
 
 bool Memory::validate_global_state(uintptr_t addr) {
