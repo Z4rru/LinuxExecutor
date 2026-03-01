@@ -105,9 +105,9 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     -Wall -Wextra -Wpedantic -Wno-unused-parameter
 )
 
-add_library(oss-payload SHARED src/core/payload.cpp)
+add_library(oss_payload SHARED src/core/payload.cpp)
 
-target_include_directories(oss-payload PRIVATE
+target_include_directories(oss_payload PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${Luau_SOURCE_DIR}/Compiler/include
     ${Luau_SOURCE_DIR}/Ast/include
@@ -115,19 +115,24 @@ target_include_directories(oss-payload PRIVATE
     ${Luau_SOURCE_DIR}/Common/include
 )
 
-target_link_libraries(oss-payload PRIVATE
-    Luau.Compiler Luau.Ast Luau.VM
-    Threads::Threads ${CMAKE_DL_LIBS}
+target_link_libraries(oss_payload PRIVATE
+    Luau.Compiler
+    Luau.Ast
+    Luau.VM
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
 )
 
-target_compile_options(oss-payload PRIVATE
+target_compile_options(oss_payload PRIVATE
     -Wall -Wextra -Wno-unused-parameter
+    -O2 -fno-exceptions
 )
 
-set_target_properties(oss-payload PROPERTIES
-    OUTPUT_NAME "oss_payload"
-    PREFIX      "lib"
+set_target_properties(oss_payload PROPERTIES
+    OUTPUT_NAME               "oss_payload"
+    PREFIX                    "lib"
     POSITION_INDEPENDENT_CODE ON
+    LIBRARY_OUTPUT_DIRECTORY  "${CMAKE_BINARY_DIR}"
 )
 
 if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
@@ -137,9 +142,10 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
             $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources)
 endif()
 
-install(TARGETS ${PROJECT_NAME} oss-payload
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib)
+install(TARGETS ${PROJECT_NAME}
+    RUNTIME DESTINATION bin)
+install(TARGETS oss_payload
+    LIBRARY DESTINATION lib/oss-executor)
 install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
