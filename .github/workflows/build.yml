@@ -53,6 +53,7 @@ jobs:
 
           # ── FIX 1: lowercase binary name ──
           cp oss-executor/build/oss-executor package/oss-executor/
+          cp oss-executor/build/liboss_payload.so package/oss-executor/ 2>/dev/null || true
           cp -r oss-executor/scripts  package/oss-executor/ 2>/dev/null || true
           cp -r oss-executor/themes   package/oss-executor/ 2>/dev/null || true
           cp -r oss-executor/resources package/oss-executor/ 2>/dev/null || true
@@ -74,6 +75,8 @@ jobs:
           cp -r resources ~/.oss-executor/ 2>/dev/null || true
           cp config.json ~/.oss-executor/ 2>/dev/null || true
           # ── FIX 3: install the lowercase binary ──
+          sudo mkdir -p /usr/local/lib/oss-executor
+          sudo cp liboss_payload.so /usr/local/lib/oss-executor/ 2>/dev/null || true
           sudo cp oss-executor /usr/local/bin/oss-executor
           echo "Installed! Run with: oss-executor"
           INSTALL_EOF
@@ -188,6 +191,9 @@ jobs:
 
           # ── FIX 4: lowercase binary name ──
           cp oss-executor/build/oss-executor AppDir/usr/bin/
+          mkdir -p AppDir/usr/lib/oss-executor
+          cp oss-executor/build/liboss_payload.so AppDir/usr/lib/oss-executor/ 2>/dev/null || true
+          cp oss-executor/build/liboss_payload.so AppDir/usr/lib/ 2>/dev/null || true
           cp -r oss-executor/scripts oss-executor/themes \
                 oss-executor/resources oss-executor/config.json \
                 AppDir/usr/share/oss-executor/ 2>/dev/null || true
