@@ -1266,24 +1266,49 @@ bool Injection::inject() {
                 scope_file.close();
                 if (scope > 0) {
                     LOG_WARN("yama/ptrace_scope is {} (need 0 for injection)", scope);
-                  
+                    bool fixed = false;
+
+                    // Attempt 1: direct write (works if already root)
                     {
                         std::ofstream fix("/proc/sys/kernel/yama/ptrace_scope",
                                          std::ios::trunc);
                         if (fix.is_open()) { fix << "0"; fix.close(); }
                     }
-                    
-                    std::ifstream recheck("/proc/sys/kernel/yama/ptrace_scope");
-                    if (recheck.is_open()) {
-                        int new_scope = -1;
-                        recheck >> new_scope;
-                        if (new_scope == 0) {
-                            LOG_INFO("Auto-lowered ptrace_scope to 0");
-                        } else {
-                            LOG_WARN("Cannot lower ptrace_scope (need root) — "
-                                     "run: echo 0 | sudo tee "
-                                     "/proc/sys/kernel/yama/ptrace_scope");
+                    {
+                        std::ifstream rc("/proc/sys/kernel/yama/ptrace_scope");
+                        int v = -1;
+                        if (rc.is_open()) rc >> v;
+                        if (v == 0) { LOG_INFO("Auto-lowered ptrace_scope to 0"); fixed = true; }
+                    }
+
+                    // Attempt 2: pkexec GUI password prompt
+                    if (!fixed) {
+                        LOG_INFO("Requesting elevated privileges to lower ptrace_scope...");
+                        pid_t pk = fork();
+                        if (pk == 0) {
+                            const char* argv[] = {
+                                "pkexec", "sh", "-c",
+                                "echo 0 > /proc/sys/kernel/yama/ptrace_scope",
+                                nullptr
+                            };
+                            execvp("pkexec", const_cast<char* const*>(argv));
+                            _exit(127);
+                        } else if (pk > 0) {
+                            int st = 0;
+                            waitpid(pk, &st, 0);
+                            std::ifstream rc("/proc/sys/kernel/yama/ptrace_scope");
+                            int v = -1;
+                            if (rc.is_open()) rc >> v;
+                            if (v == 0) {
+                                LOG_INFO("ptrace_scope lowered to 0 via pkexec");
+                                fixed = true;
+                            }
                         }
+                    }
+
+                    if (!fixed) {
+                        LOG_ERROR("Cannot lower ptrace_scope — injection will fail. "
+                                  "Run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope");
                     }
                 }
             }
@@ -1525,6 +1550,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
