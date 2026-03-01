@@ -423,7 +423,7 @@ static uintptr_t get_exe_load_offset() {
         uintptr_t lo;
         unsigned long offset;
         char perms[5]{};
-        if (sscanf(line.c_str(), "%lx-%*lx %4s %lx", &lo, perms, &offset) == 3 && offset == 0)
+        if (sscanf(line.c_str(), "%lx-%*x %4s %lx", &lo, perms, &offset) == 3 && offset == 0)
             return lo - first_vaddr;
     }
     return 0;
