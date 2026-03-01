@@ -845,7 +845,7 @@ uintptr_t Injection::find_remote_symbol(pid_t pid, const std::string& lib_name,
         unsigned long lo;
         unsigned long file_offset;
         char perms[5]{};
-        if (sscanf(line.c_str(), "%lx-%*lx %4s %lx", &lo, perms, &file_offset) < 3)
+        if (sscanf(line.c_str(), "%lx-%*x %4s %lx", &lo, perms, &file_offset) < 3)
             continue;
 
         if (file_offset == 0 && remote_base == 0) {
@@ -1461,6 +1461,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
