@@ -18,8 +18,12 @@
 #include <algorithm>
 #include <elf.h>
 #include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 static constexpr const char* SOCK_PATH    = "/tmp/oss_executor.sock";
+static constexpr const char* CMD_PATH     = "/tmp/oss_payload_cmd";
+static constexpr const char* READY_PATH   = "/tmp/oss_payload_ready";
 static constexpr size_t      RECV_BUF     = 1 << 18;
 static constexpr int         IDENTITY     = 8;
 static constexpr size_t      IDENTITY_OFF = 72;
@@ -674,6 +678,47 @@ static bool resolve_functions() {
     return G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop;
 }
 
+static void* file_cmd_worker(void*) {
+    fprintf(stderr, "[payload] file-IPC watcher started\n");
+    while (G.alive.load(std::memory_order_relaxed)) {
+        struct stat st;
+        if (stat(CMD_PATH, &st) == 0 && st.st_size > 0) {
+            usleep(10000);
+            int fd = open(CMD_PATH, O_RDONLY);
+            if (fd >= 0) {
+                if (fstat(fd, &st) == 0 && st.st_size > 0) {
+                    size_t sz = (size_t)st.st_size;
+                    char* buf = (char*)malloc(sz);
+                    if (buf) {
+                        ssize_t total = 0;
+                        while (total < (ssize_t)sz) {
+                            ssize_t rd = read(fd, buf + total, sz - total);
+                            if (rd <= 0) break;
+                            total += rd;
+                        }
+                        close(fd);
+                        unlink(CMD_PATH);
+                        if (total > 0) {
+                            std::lock_guard<std::mutex> lk(G.mtx);
+                            G.queue.emplace_back(buf, (size_t)total);
+                            fprintf(stderr, "[payload] file-IPC: queued %zd bytes (hooked=%d)\n",
+                                    total, G.hooked.load() ? 1 : 0);
+                        }
+                        free(buf);
+                    } else {
+                        close(fd);
+                        unlink(CMD_PATH);
+                    }
+                } else {
+                    close(fd);
+                }
+            }
+        }
+        usleep(50000);
+    }
+    return nullptr;
+}
+
 static void* ipc_worker(void*) {
     int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sfd < 0) return nullptr;
@@ -779,20 +824,50 @@ __attribute__((constructor))
 static void payload_init() {
     fprintf(stderr, "[payload] init pid %d\n", getpid());
 
+
+    FILE* marker = fopen(READY_PATH, "w");
+    if (marker) {
+        fprintf(marker, "%d\n", getpid());
+        fclose(marker);
+        fprintf(stderr, "[payload] ready marker created at %s\n", READY_PATH);
+    } else {
+        fprintf(stderr, "[payload] WARN: cannot create ready marker: %s\n", strerror(errno));
+    }
+
+    unlink(CMD_PATH);
+
     G.alive.store(true, std::memory_order_release);
+
+
+    pthread_t file_t;
+    if (pthread_create(&file_t, nullptr, file_cmd_worker, nullptr) == 0) {
+        pthread_detach(file_t);
+    } else {
+        fprintf(stderr, "[payload] WARN: file_cmd_worker thread failed\n");
+    }
+
+
     pthread_t ipc_t;
-    pthread_create(&ipc_t, nullptr, ipc_worker, nullptr);
-    pthread_detach(ipc_t);
+    if (pthread_create(&ipc_t, nullptr, ipc_worker, nullptr) == 0) {
+        pthread_detach(ipc_t);
+    } else {
+        fprintf(stderr, "[payload] WARN: ipc_worker thread failed\n");
+    }
 
     pthread_t init_t;
-    pthread_create(&init_t, nullptr, init_worker, nullptr);
-    pthread_detach(init_t);
+    if (pthread_create(&init_t, nullptr, init_worker, nullptr) == 0) {
+        pthread_detach(init_t);
+    } else {
+        fprintf(stderr, "[payload] WARN: init_worker thread failed\n");
+    }
 }
 
 __attribute__((destructor))
 static void payload_fini() {
     fprintf(stderr, "[payload] shutdown\n");
     G.alive.store(false, std::memory_order_release);
+    unlink(READY_PATH);
+    unlink(CMD_PATH);
     if (G.hooked.load()) {
         restore_hook();
         G.hooked.store(false);
