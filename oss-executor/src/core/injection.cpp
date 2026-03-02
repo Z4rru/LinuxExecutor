@@ -2589,7 +2589,7 @@ bool Injection::execute_script(const std::string& source) {
 
     if (write_ok) {
         set_state(InjectionState::Ready, "Script dispatched to payload");
-        LOG_INFO("Sent {} bytes to payload via {}", data_to_send.size(), sock);
+        LOG_INFO("Sent {} bytes to payload via @oss_executor", data_to_send.size());
         return true;
     }
 
@@ -2630,6 +2630,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
