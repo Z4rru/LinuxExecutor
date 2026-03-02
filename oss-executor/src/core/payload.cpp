@@ -678,9 +678,11 @@ static void* ipc_worker(void*) {
     if (sfd < 0) return nullptr;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
-    unlink(SOCK_PATH);
-    if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+    const char* abs_name = "oss_executor";
+    size_t abs_nlen = strlen(abs_name);
+    memcpy(addr.sun_path + 1, abs_name, abs_nlen);
+    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + abs_nlen;
+    if (bind(sfd, (struct sockaddr*)&addr, addr_len) < 0 ||
         listen(sfd, 4) < 0) { close(sfd); return nullptr; }
     fprintf(stderr, "[payload] ipc listening\n");
     auto* buf = (char*)malloc(RECV_BUF);
@@ -704,7 +706,6 @@ static void* ipc_worker(void*) {
     }
     free(buf);
     close(sfd);
-    unlink(SOCK_PATH);
     return nullptr;
 }
 
@@ -750,8 +751,11 @@ static void payload_fini() {
     if (fd >= 0) {
         struct sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
-        connect(fd, (struct sockaddr*)&addr, sizeof(addr));
+        const char* abs_name = "oss_executor";
+        size_t abs_nlen = strlen(abs_name);
+        memcpy(addr.sun_path + 1, abs_name, abs_nlen);
+        socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + abs_nlen;
+        connect(fd, (struct sockaddr*)&addr, addr_len);
         close(fd);
     }
     usleep(50000);
