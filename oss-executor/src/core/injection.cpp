@@ -1668,6 +1668,128 @@ void Injection::stop_elevated_helper() {
     unlink("/tmp/.oss_mem_helper.py");
 }
 
+    bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
+                                    uintptr_t dlopen_addr, uint64_t dlopen_flags) {
+    LOG_INFO("inject_via_procmem: PID {} lib={}", pid, lib_path);
+
+    ProcessDetails pd = get_process_details(pid);
+    pid_t tracer = pd.tracer_pid;
+    bool tracer_frozen = false;
+
+    if (tracer > 0) {
+        LOG_WARN("PID {} is traced by PID {} — freezing tracer first", pid, tracer);
+        tracer_frozen = freeze_tracer(tracer);
+        if (!tracer_frozen) {
+            LOG_WARN("Could not freeze tracer — falling back to inline hook");
+            return inject_via_inline_hook(pid, lib_path, dlopen_addr, dlopen_flags);
+        }
+    }
+
+    auto cleanup_tracer = [&]() {
+        if (tracer_frozen) thaw_tracer(tracer);
+    };
+
+    auto regions = memory_.get_regions();
+    if (regions.empty()) {
+        error_ = "No memory regions available";
+        LOG_ERROR("{}", error_);
+        cleanup_tracer();
+        return false;
+    }
+
+    uintptr_t data_addr = 0;
+    for (const auto& r : regions) {
+        if (!r.writable() || !r.readable()) continue;
+        if (r.size() < 4096) continue;
+        if (r.path.find("[stack") != std::string::npos) continue;
+        if (r.path.find("[vvar")  != std::string::npos) continue;
+        if (r.path.find("[vdso")  != std::string::npos) continue;
+        data_addr = r.end - 4096;
+        LOG_DEBUG("Data region at 0x{:X} from '{}'", data_addr,
+                  r.path.empty() ? "[anon]" : r.path);
+        break;
+    }
+    if (data_addr == 0) {
+        error_ = "No suitable writable region found";
+        LOG_ERROR("{}", error_);
+        cleanup_tracer();
+        return false;
+    }
+
+    uint8_t orig_data[4096];
+    if (!proc_mem_read(pid, data_addr, orig_data, sizeof(orig_data))) {
+        error_ = "Failed to save original data region";
+        LOG_ERROR("{}", error_);
+        cleanup_tracer();
+        return false;
+    }
+
+    uintptr_t path_addr   = data_addr;
+    uintptr_t result_addr = data_addr + 512;
+    uintptr_t done_addr   = data_addr + 520;
+
+    uint8_t path_buf[512] = {};
+    size_t path_len = std::min(lib_path.size(), sizeof(path_buf) - 1);
+    memcpy(path_buf, lib_path.c_str(), path_len);
+    if (!proc_mem_write(pid, data_addr, path_buf, path_len + 1)) {
+        error_ = "Failed to write library path to target";
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
+        return false;
+    }
+
+    uint64_t zero = 0;
+    proc_mem_write(pid, result_addr, &zero, sizeof(zero));
+    proc_mem_write(pid, done_addr,   &zero, sizeof(zero));
+
+    size_t shellcode_needed = 256;
+    ExeRegionInfo cave;
+    if (!find_code_cave(pid, regions, shellcode_needed, cave)) {
+        error_ = "No suitable code cave found for shellcode";
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
+        return false;
+    }
+    LOG_DEBUG("Code cave at 0x{:X} ({} bytes)", cave.padding_start, cave.padding_size);
+
+    uint8_t orig_cave[256];
+    if (!proc_mem_read(pid, cave.padding_start, orig_cave, shellcode_needed)) {
+        error_ = "Failed to save code cave bytes";
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
+        return false;
+    }
+
+    if (kill(pid, SIGSTOP) != 0) {
+        error_ = std::string("SIGSTOP failed: ") + strerror(errno);
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
+        return false;
+    }
+
+    bool stopped = false;
+    for (int i = 0; i < 50; i++) {
+        usleep(10000);
+        ProcessDetails tpd = get_process_details(pid);
+        if (tpd.state == 'T' || tpd.state == 't') {
+            stopped = true;
+            LOG_DEBUG("Target stopped (state='{}')", tpd.state);
+            break;
+        }
+    }
+
+    if (!stopped) {
+        LOG_WARN("Target didn't stop even with frozen tracer — trying inline hook");
+        kill(pid, SIGCONT);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
+        return inject_via_inline_hook(pid, lib_path, dlopen_addr, dlopen_flags);
+    }
+
     pid_t tid = pick_injectable_thread(pid);
     ThreadState ts;
     if (!get_thread_state(pid, tid, ts)) {
@@ -1690,17 +1812,14 @@ void Injection::stop_elevated_helper() {
         return false;
     }
 
- 
     uintptr_t return_addr = ts.rip;
     uint8_t sc[256];
     memset(sc, 0, sizeof(sc));
     int off = 0;
 
-   
     sc[off++] = 0x48; sc[off++] = 0x81; sc[off++] = 0xEC;
     sc[off++] = 0x80; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
 
- 
     sc[off++] = 0x9C;
     sc[off++] = 0x50; sc[off++] = 0x51; sc[off++] = 0x52; sc[off++] = 0x53;
     sc[off++] = 0x55; sc[off++] = 0x56; sc[off++] = 0x57;
@@ -1713,28 +1832,23 @@ void Injection::stop_elevated_helper() {
     sc[off++] = 0x41; sc[off++] = 0x56;
     sc[off++] = 0x41; sc[off++] = 0x57;
 
-
     sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xE5;
     sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xE4; sc[off++] = 0xF0;
 
     sc[off++] = 0x48; sc[off++] = 0xBF;
     memcpy(sc + off, &path_addr, 8); off += 8;
 
-
     sc[off++] = 0x48; sc[off++] = 0xBE;
     memcpy(sc + off, &dlopen_flags, 8); off += 8;
-
 
     sc[off++] = 0x48; sc[off++] = 0xB8;
     memcpy(sc + off, &dlopen_addr, 8); off += 8;
     sc[off++] = 0xFF; sc[off++] = 0xD0;
 
-  
     sc[off++] = 0x48; sc[off++] = 0xB9;
     memcpy(sc + off, &result_addr, 8); off += 8;
     sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x01;
 
- 
     int spin_top = off;
     sc[off++] = 0x48; sc[off++] = 0xB9;
     memcpy(sc + off, &done_addr, 8); off += 8;
@@ -1745,10 +1859,8 @@ void Injection::stop_elevated_helper() {
     int8_t spin_disp = static_cast<int8_t>(spin_top - (off + 2));
     sc[off++] = 0xEB; sc[off++] = static_cast<uint8_t>(spin_disp);
 
- 
     sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xEC;
 
- 
     sc[off++] = 0x41; sc[off++] = 0x5F;
     sc[off++] = 0x41; sc[off++] = 0x5E;
     sc[off++] = 0x41; sc[off++] = 0x5D;
@@ -1761,10 +1873,8 @@ void Injection::stop_elevated_helper() {
     sc[off++] = 0x5A; sc[off++] = 0x59; sc[off++] = 0x58;
     sc[off++] = 0x9D;
 
-
     sc[off++] = 0x48; sc[off++] = 0x81; sc[off++] = 0xC4;
     sc[off++] = 0x80; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
-
 
     sc[off++] = 0xFF; sc[off++] = 0x25;
     sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
@@ -1780,7 +1890,6 @@ void Injection::stop_elevated_helper() {
         return false;
     }
 
-
     if (!proc_mem_write(pid, cave.padding_start, sc, off)) {
         error_ = "Failed to write shellcode to cave";
         LOG_ERROR("{}", error_);
@@ -1791,7 +1900,6 @@ void Injection::stop_elevated_helper() {
     }
     LOG_DEBUG("Shellcode written: {} bytes at 0x{:X}", off, cave.padding_start);
 
- 
     uint8_t trampoline[16];
     memset(trampoline, 0, sizeof(trampoline));
     int toff = 0;
@@ -1842,7 +1950,6 @@ void Injection::stop_elevated_helper() {
     kill(pid, SIGCONT);
     LOG_DEBUG("Process resumed, waiting for dlopen...");
 
-
     bool completed = false;
     for (int i = 0; i < 100; i++) {
         usleep(50000);
@@ -1864,7 +1971,6 @@ void Injection::stop_elevated_helper() {
         error_ = "dlopen did not complete within timeout";
         LOG_ERROR("{}", error_);
 
-   
         if (tracer > 0) tracer_frozen = freeze_tracer(tracer);
         kill(pid, SIGSTOP);
         usleep(50000);
@@ -1878,7 +1984,6 @@ void Injection::stop_elevated_helper() {
         return inject_via_inline_hook(pid, lib_path, dlopen_addr, dlopen_flags);
     }
 
-
     if (tracer > 0) tracer_frozen = freeze_tracer(tracer);
     kill(pid, SIGSTOP);
     usleep(50000);
@@ -1888,7 +1993,6 @@ void Injection::stop_elevated_helper() {
     uint64_t done_signal = 1;
     proc_mem_write(pid, done_addr, &done_signal, sizeof(done_signal));
 
-  
     if (tracer_frozen) {
         thaw_tracer(tracer);
         tracer_frozen = false;
@@ -1897,7 +2001,6 @@ void Injection::stop_elevated_helper() {
     kill(pid, SIGCONT);
     usleep(200000);
 
- 
     if (tracer > 0) tracer_frozen = freeze_tracer(tracer);
     kill(pid, SIGSTOP);
     usleep(50000);
@@ -2508,6 +2611,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
