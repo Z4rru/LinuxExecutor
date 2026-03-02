@@ -39,7 +39,7 @@ static constexpr const char* CMD_PATH     = "/tmp/oss_payload_cmd";
 static constexpr const char* READY_PATH   = "/tmp/oss_payload_ready";
 static constexpr size_t      RECV_BUF     = 1 << 18;
 static constexpr int         IDENTITY     = 8;
-static constexpr size_t      IDENTITY_OFF = 72;
+static size_t                IDENTITY_OFF = 0;  
 static constexpr size_t      MAX_STOLEN   = 32;
 
 struct MemRegion { uintptr_t base; size_t size; bool r; bool x; };
@@ -128,9 +128,39 @@ struct {
 static thread_local bool g_in = false;
 
 static void set_identity(lua_State* L) {
-    auto* extra = *reinterpret_cast<uint8_t**>(L);
-    if (extra)
-        *reinterpret_cast<int*>(extra + IDENTITY_OFF) = IDENTITY;
+    uint8_t* extra = *reinterpret_cast<uint8_t**>(L);
+    if (!extra) return;
+
+    if (IDENTITY_OFF == 0) {
+  
+        static const size_t known[] = {72, 48, 80, 88, 56, 64, 96, 104, 24, 32, 40};
+        for (size_t off : known) {
+            int val;
+            if (safe_read((uintptr_t)(extra + off), &val, sizeof(val)) &&
+                val >= 0 && val <= 7) {
+                IDENTITY_OFF = off;
+                plog("[payload] identity offset: %zu (current identity=%d)\n", off, val);
+                break;
+            }
+        }
+  
+        if (IDENTITY_OFF == 0) {
+            for (size_t off = 16; off < 160; off += 4) {
+                int val;
+                if (!safe_read((uintptr_t)(extra + off), &val, sizeof(val))) continue;
+                if (val >= 0 && val <= 7) {
+                    IDENTITY_OFF = off;
+                    plog("[payload] identity offset (scan): %zu (current=%d)\n", off, val);
+                    break;
+                }
+            }
+        }
+        if (IDENTITY_OFF == 0) {
+            IDENTITY_OFF = 72;
+            plog("[payload] identity offset: defaulting to 72\n");
+        }
+    }
+    *reinterpret_cast<int*>(extra + IDENTITY_OFF) = IDENTITY;
 }
 
 static void drain_queue(lua_State* L) {
@@ -148,15 +178,20 @@ static void drain_queue(lua_State* L) {
         char* compiled = nullptr;
 
         uint8_t first_byte = static_cast<uint8_t>(src[0]);
-        bool is_bytecode = (first_byte >= 1 && first_byte <= 6 && src.size() > 4);
+        bool is_bytecode = (first_byte >= 1 && first_byte <= 9 && src.size() > 4);
 
         if (is_bytecode) {
             bc_data = src.data();
             bc_sz = src.size();
         } else if (G.compile) {
+           
+            compiled = nullptr;
+            bc_sz = 0;
             compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
-            if (!compiled || bc_sz == 0) {
-                plog("[payload] compile fail\n");
+            if (!compiled || bc_sz == 0 ||
+                (bc_sz > 0 && ((uint8_t)compiled[0] < 1 || (uint8_t)compiled[0] > 9))) {
+                plog("[payload] compile failed or produced invalid bytecode (sz=%zu first=0x%02X)\n",
+                     bc_sz, compiled ? (uint8_t)compiled[0] : 0);
                 free(compiled);
                 continue;
             }
@@ -167,6 +202,14 @@ static void drain_queue(lua_State* L) {
         }
 
         lua_State* th = G.newthread(L);
+
+       
+        if (G.sandbox) {
+            G.sandbox(th);
+        } else {
+            plog("[payload] WARN: luaL_sandboxthread not found, script will lack game globals\n");
+        }
+
         set_identity(th);
         int lr = G.load(th, "=oss", bc_data, bc_sz, 0);
         free(compiled);
@@ -679,7 +722,11 @@ static uintptr_t get_exe_load_offset() {
     return 0;
 }
 
+static uintptr_t find_elf_sym_in_file(const char* filepath, const char* name,
+                                       uintptr_t load_bias);
+
 static uintptr_t find_elf_sym(const char* name) {
+
     char exe_path[512];
     ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (len <= 0) return 0;
@@ -687,7 +734,50 @@ static uintptr_t find_elf_sym(const char* name) {
     char* del = strstr(exe_path, " (deleted)");
     if (del) *del = '\0';
 
-    FILE* ef = fopen(exe_path, "rb");
+    uintptr_t load_off = get_exe_load_offset();
+    uintptr_t result = find_elf_sym_in_file(exe_path, name, load_off);
+    if (result) return result;
+
+
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    std::vector<std::string> searched;
+    searched.push_back(exe_path);
+    while (std::getline(maps, line)) {
+        auto slash = line.find('/');
+        if (slash == std::string::npos) continue;
+        std::string filepath = line.substr(slash);
+        auto end = filepath.find_last_not_of(" \n\r\t");
+        if (end != std::string::npos) filepath = filepath.substr(0, end + 1);
+        if (filepath.find("/ld-linux") != std::string::npos) continue;
+        if (filepath.find("/libc.so") != std::string::npos) continue;
+        if (filepath.find("/libpthread") != std::string::npos) continue;
+        if (filepath.find("/libstdc++") != std::string::npos) continue;
+        if (filepath.find("/libgcc") != std::string::npos) continue;
+        if (filepath.find("/liboss_payload") != std::string::npos) continue;
+        if (std::find(searched.begin(), searched.end(), filepath) != searched.end())
+            continue;
+        searched.push_back(filepath);
+
+       
+        uintptr_t lib_base = 0;
+        unsigned long file_off = 0;
+        char perms[5]{};
+        if (sscanf(line.c_str(), "%lx-%*x %4s %lx", &lib_base, perms, &file_off) == 3 &&
+            file_off == 0) {
+            result = find_elf_sym_in_file(filepath.c_str(), name, lib_base);
+            if (result) {
+                plog("[payload] elf-sym: found %s in %s at %lx\n", name, filepath.c_str(), result);
+                return result;
+            }
+        }
+    }
+    return 0;
+}
+
+static uintptr_t find_elf_sym_in_file(const char* filepath, const char* name,
+                                       uintptr_t load_bias) {
+    FILE* ef = fopen(filepath, "rb");
     if (!ef) return 0;
 
     Elf64_Ehdr ehdr;
@@ -709,7 +799,7 @@ static uintptr_t find_elf_sym(const char* name) {
         return 0;
     }
 
-    uintptr_t load_off = get_exe_load_offset();
+    uintptr_t load_off = load_bias;
 
     for (size_t si = 0; si < shdrs.size(); si++) {
         if (shdrs[si].sh_type != SHT_SYMTAB && shdrs[si].sh_type != SHT_DYNSYM)
@@ -971,6 +1061,30 @@ static bool resolve_functions() {
                     G.settop = (fn_settop)func;
                     plog("[payload] string-ref: lua_settop at %lx\n", func);
                 }
+            }
+        }
+    }
+
+        if (!G.compile) {
+        
+        static const char* comp_strings[] = {
+            "exceeded constant limit",
+            "exceeded closure limit",
+            "exceeded local register limit",
+            "exceeded upvalue limit",
+            nullptr
+        };
+        for (int i = 0; comp_strings[i] && !G.compile; i++) {
+            size_t slen = strlen(comp_strings[i]);
+            uintptr_t str_addr = scan_for_string(comp_strings[i], slen);
+            if (!str_addr) continue;
+            plog("[payload] found compile string '%s' at %lx\n", comp_strings[i], str_addr);
+            uintptr_t xref = find_lea_xref(str_addr);
+            if (!xref) continue;
+            uintptr_t func = walk_back_to_func(xref);
+            if (func) {
+                G.compile = (fn_compile)func;
+                plog("[payload] string-ref: luau_compile candidate at %lx\n", func);
             }
         }
     }
