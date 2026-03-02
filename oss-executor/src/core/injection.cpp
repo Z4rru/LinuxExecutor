@@ -1462,7 +1462,6 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     LOG_INFO("Injecting {} into PID {}", lib_path, pid);
 
     std::string target_path = prepare_payload_for_injection(pid, lib_path);
-    LOG_INFO("Payload staged in target namespace: {}", target_path);
 
     uintptr_t dlopen_addr = 0;
     bool libc_internal = false;
@@ -1476,6 +1475,9 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
 
     if (dlopen_addr == 0)
         dlopen_addr = find_remote_symbol(pid, "dl", "dlopen");
+
+    if (dlopen_addr == 0)
+        dlopen_addr = find_remote_symbol(pid, "c", "dlopen");
 
     if (dlopen_addr == 0) {
         error_ = "Cannot find dlopen in target process";
@@ -1498,9 +1500,7 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
         LOG_DEBUG("ptrace attach succeeded");
     } else {
         int saved_errno = errno;
-        error_ = "ptrace attach failed: " + std::string(strerror(saved_errno)) +
-                 " \u2014 run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope";
-        LOG_ERROR("inject_shellcode: {}", error_);
+        LOG_DEBUG("ptrace attach failed: {} (errno={})", strerror(saved_errno), saved_errno);
     }
 
     if (ptrace_ok) {
@@ -2047,3 +2047,4 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
