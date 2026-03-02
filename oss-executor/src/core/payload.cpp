@@ -800,9 +800,10 @@ static void* file_cmd_worker(void*) {
                                 try_direct_execute(script);
                                 write_status("executed_direct");
                             } else {
-                     
-                             
-                                G.queue.emplace_back(std::move(script));
+                                {
+                                    std::lock_guard<std::mutex> lk(G.mtx);
+                                    G.queue.emplace_back(std::move(script));
+                                }
                                 plog("[payload] file-IPC: queued (no captured_L yet)\n");
                                 write_status("queued");
                                 stale_count = 0;
