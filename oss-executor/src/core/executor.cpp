@@ -100,6 +100,22 @@ void Executor::shutdown() {
 }
 
 bool Executor::send_to_payload(const std::string& source) {
+  
+    std::string sock_path = PAYLOAD_SOCK;
+    auto& inj = Injection::instance();
+    const auto& pinfo = inj.process_info();
+    if (pinfo.via_flatpak || pinfo.via_sober) {
+        pid_t pid = inj.target_pid();
+        if (pid > 0) {
+            std::string ns_sock = "/proc/" + std::to_string(pid)
+                                + "/root" + PAYLOAD_SOCK;
+            if (access(ns_sock.c_str(), F_OK) == 0) {
+                sock_path = ns_sock;
+                LOG_DEBUG("Using namespace socket: {}", sock_path);
+            }
+        }
+    }
+
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         LOG_ERROR("payload socket(): {}", strerror(errno));
@@ -108,14 +124,14 @@ bool Executor::send_to_payload(const std::string& source) {
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, PAYLOAD_SOCK, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
 
     struct timeval tv{};
     tv.tv_sec = 2;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        LOG_ERROR("payload connect({}): {}", PAYLOAD_SOCK, strerror(errno));
+        LOG_ERROR("payload connect({}): {}", sock_path, strerror(errno));
         ::close(fd);
         return false;
     }
@@ -135,7 +151,7 @@ bool Executor::send_to_payload(const std::string& source) {
 
     ::shutdown(fd, SHUT_WR);
     ::close(fd);
-    LOG_INFO("Sent {} bytes to payload via {}", source.size(), PAYLOAD_SOCK);
+    LOG_INFO("Sent {} bytes to payload via {}", source.size(), sock_path);
     return true;
 }
 
@@ -394,3 +410,4 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
