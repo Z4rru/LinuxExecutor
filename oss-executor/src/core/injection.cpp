@@ -2484,24 +2484,27 @@ bool Injection::verify_payload_alive() {
         return false;
     }
 
+    std::string sock_path = PAYLOAD_SOCK;
+    if (proc_info_.via_flatpak || proc_info_.via_sober) {
+        pid_t pid = memory_.get_pid();
+        if (pid > 0)
+            sock_path = "/proc/" + std::to_string(pid) + "/root" + PAYLOAD_SOCK;
+    }
+
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return false;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    const char* abs_name = "oss_executor";
-    size_t abs_nlen = strlen(abs_name);
-    memcpy(addr.sun_path + 1, abs_name, abs_nlen);
-    socklen_t addr_len = static_cast<socklen_t>(
-        offsetof(struct sockaddr_un, sun_path) + 1 + abs_nlen);
+    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
     struct timeval tv{};
     tv.tv_usec = 500000;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     bool reachable = (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
-                                addr_len) == 0);
+                                sizeof(addr)) == 0);
     ::close(fd);
 
     if (!reachable) {
-        LOG_WARN("Payload mapped but abstract socket @oss_executor unreachable");
+        LOG_WARN("Payload mapped but socket unreachable at {}", sock_path);
     }
     return reachable;
 }
@@ -2543,6 +2546,13 @@ bool Injection::execute_script(const std::string& source) {
     }
     free(bc);
 
+    std::string sock_path = PAYLOAD_SOCK;
+    if (proc_info_.via_flatpak || proc_info_.via_sober) {
+        pid_t pid = memory_.get_pid();
+        if (pid > 0)
+            sock_path = "/proc/" + std::to_string(pid) + "/root" + PAYLOAD_SOCK;
+    }
+
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         set_state(InjectionState::Ready, "Socket creation failed");
@@ -2552,18 +2562,14 @@ bool Injection::execute_script(const std::string& source) {
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    const char* abs_name = "oss_executor";
-    size_t abs_nlen = strlen(abs_name);
-    memcpy(addr.sun_path + 1, abs_name, abs_nlen);
-    socklen_t addr_len = static_cast<socklen_t>(
-        offsetof(struct sockaddr_un, sun_path) + 1 + abs_nlen);
+    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
 
     struct timeval tv{};
     tv.tv_sec = 2;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) {
-        LOG_ERROR("execute_script connect(@oss_executor): {}", strerror(errno));
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        LOG_ERROR("execute_script connect({}): {}", sock_path, strerror(errno));
         ::close(fd);
         payload_loaded_ = false;
         set_state(InjectionState::Ready, "Payload socket unreachable");
@@ -2630,6 +2636,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
