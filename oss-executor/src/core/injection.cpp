@@ -2484,21 +2484,24 @@ bool Injection::verify_payload_alive() {
         return false;
     }
 
-    std::string sock = resolve_socket_path();
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return false;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock.c_str(), sizeof(addr.sun_path) - 1);
+    const char* abs_name = "oss_executor";
+    size_t abs_nlen = strlen(abs_name);
+    memcpy(addr.sun_path + 1, abs_name, abs_nlen);
+    socklen_t addr_len = static_cast<socklen_t>(
+        offsetof(struct sockaddr_un, sun_path) + 1 + abs_nlen);
     struct timeval tv{};
     tv.tv_usec = 500000;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     bool reachable = (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
-                                sizeof(addr)) == 0);
+                                addr_len) == 0);
     ::close(fd);
 
     if (!reachable) {
-        LOG_WARN("Payload mapped but socket unreachable at {}", sock);
+        LOG_WARN("Payload mapped but abstract socket @oss_executor unreachable");
     }
     return reachable;
 }
@@ -2540,8 +2543,6 @@ bool Injection::execute_script(const std::string& source) {
     }
     free(bc);
 
-    std::string sock = resolve_socket_path();
-
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         set_state(InjectionState::Ready, "Socket creation failed");
@@ -2551,14 +2552,18 @@ bool Injection::execute_script(const std::string& source) {
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock.c_str(), sizeof(addr.sun_path) - 1);
+    const char* abs_name = "oss_executor";
+    size_t abs_nlen = strlen(abs_name);
+    memcpy(addr.sun_path + 1, abs_name, abs_nlen);
+    socklen_t addr_len = static_cast<socklen_t>(
+        offsetof(struct sockaddr_un, sun_path) + 1 + abs_nlen);
 
     struct timeval tv{};
     tv.tv_sec = 2;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        LOG_ERROR("execute_script connect({}): {}", sock, strerror(errno));
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) {
+        LOG_ERROR("execute_script connect(@oss_executor): {}", strerror(errno));
         ::close(fd);
         payload_loaded_ = false;
         set_state(InjectionState::Ready, "Payload socket unreachable");
@@ -2625,6 +2630,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
