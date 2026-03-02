@@ -25,10 +25,6 @@
 static void plog(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    va_list ap2;
-    va_copy(ap2, ap);
-    vplog( fmt, ap2);
-    va_end(ap2);
     FILE* f = fopen("/tmp/oss_payload.log", "a");
     if (f) {
         vfprintf(f, fmt, ap);
@@ -118,7 +114,7 @@ static void set_identity(lua_State* L) {
 static void drain_queue(lua_State* L) {
     std::deque<std::string> batch;
     {
-        std::lock_guard<std::mutex> lk(G.mtx);
+     
         batch.swap(G.queue);
     }
     for (auto& src : batch) {
@@ -805,7 +801,7 @@ static void* file_cmd_worker(void*) {
                                 write_status("executed_direct");
                             } else {
                      
-                                std::lock_guard<std::mutex> lk(G.mtx);
+                             
                                 G.queue.emplace_back(std::move(script));
                                 plog("[payload] file-IPC: queued (no captured_L yet)\n");
                                 write_status("queued");
@@ -825,17 +821,6 @@ static void* file_cmd_worker(void*) {
 
       
         {
-            std::lock_guard<std::mutex> lk(G.mtx);
-            if (!G.queue.empty()) {
-                stale_count++;
-                if (stale_count == 40) {
-                    plog("[payload] WARNING: %zu scripts queued for 2s without drain. "
-                         "hooked=%d captured_L=%p\n",
-                         G.queue.size(), G.hooked.load() ? 1 : 0, G.captured_L);
-                    write_status("stale");
-                }
-                        
-        if (G.captured_L) {
             std::deque<std::string> batch;
             {
                 std::lock_guard<std::mutex> lk(G.mtx);
@@ -847,7 +832,7 @@ static void* file_cmd_worker(void*) {
                              G.queue.size(), G.hooked.load() ? 1 : 0, G.captured_L);
                         write_status("stale");
                     }
-                    if (stale_count >= 60) {
+                    if (stale_count >= 60 && G.captured_L) {
                         plog("[payload] attempting stale queue drain from file thread\n");
                         batch.swap(G.queue);
                         stale_count = 0;
@@ -856,6 +841,13 @@ static void* file_cmd_worker(void*) {
                     stale_count = 0;
                 }
             }
+            for (auto& s : batch) {
+                try_direct_execute(s);
+            }
+            if (!batch.empty()) {
+                write_status("drained_fallback");
+            }
+        }
             for (auto& s : batch) {
                 try_direct_execute(s);
             }
