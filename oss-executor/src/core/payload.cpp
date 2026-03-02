@@ -114,7 +114,7 @@ static void set_identity(lua_State* L) {
 static void drain_queue(lua_State* L) {
     std::deque<std::string> batch;
     {
-     
+        std::lock_guard<std::mutex> lk(G.mtx);
         batch.swap(G.queue);
     }
     for (auto& src : batch) {
