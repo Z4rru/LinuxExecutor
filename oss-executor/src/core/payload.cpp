@@ -18,8 +18,24 @@
 #include <algorithm>
 #include <elf.h>
 #include <cerrno>
+#include <cstdarg>
 #include <fcntl.h>
 #include <sys/stat.h>
+
+static void plog(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    vplog( fmt, ap2);
+    va_end(ap2);
+    FILE* f = fopen("/tmp/oss_payload.log", "a");
+    if (f) {
+        vfprintf(f, fmt, ap);
+        fclose(f);
+    }
+    va_end(ap);
+}
 
 static constexpr const char* SOCK_PATH    = "/tmp/oss_executor.sock";
 static constexpr const char* CMD_PATH     = "/tmp/oss_payload_cmd";
@@ -121,13 +137,13 @@ static void drain_queue(lua_State* L) {
         } else if (G.compile) {
             compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
             if (!compiled || bc_sz == 0) {
-                fprintf(stderr, "[payload] compile fail\n");
+                plog( "[payload] compile fail\n");
                 free(compiled);
                 continue;
             }
             bc_data = compiled;
         } else {
-            fprintf(stderr, "[payload] no compiler and received source, skipping %zu bytes\n", src.size());
+            plog( "[payload] no compiler and received source, skipping %zu bytes\n", src.size());
             continue;
         }
 
@@ -138,7 +154,7 @@ static void drain_queue(lua_State* L) {
         if (lr != 0) {
             size_t len = 0;
             const char* e = G.tolstring(th, -1, &len);
-            fprintf(stderr, "[payload] load: %.*s\n", (int)len, e);
+            plog( "[payload] load: %.*s\n", (int)len, e);
             G.settop(L, G.gettop(L) - 1);
             continue;
         }
@@ -146,7 +162,7 @@ static void drain_queue(lua_State* L) {
         if (rr != 0 && rr != 1) {
             size_t len = 0;
             const char* e = G.tolstring(th, -1, &len);
-            fprintf(stderr, "[payload] run: %.*s\n", (int)len, e);
+            plog( "[payload] run: %.*s\n", (int)len, e);
         }
         G.settop(L, G.gettop(L) - 1);
     }
@@ -158,7 +174,7 @@ static int resume_detour(lua_State* L, lua_State* from, int nargs) {
     g_in = true;
     if (!G.captured_L) {
         G.captured_L = L;
-        fprintf(stderr, "[payload] captured lua_State %p\n", L);
+        plog( "[payload] captured lua_State %p\n", L);
     }
     if (!G.queue.empty())
         drain_queue(G.captured_L);
@@ -388,7 +404,7 @@ static bool find_module() {
     if (!found) return false;
     G.mod_base = lo;
     G.mod_size = hi - lo;
-    fprintf(stderr, "[payload] module %lx-%lx (%zu MB)\n", lo, hi, G.mod_size >> 20);
+    plog( "[payload] module %lx-%lx (%zu MB)\n", lo, hi, G.mod_size >> 20);
     return true;
 }
 
@@ -620,7 +636,7 @@ static bool resolve_functions() {
         uintptr_t addr = find_elf_sym(s.name);
         if (addr) {
             *s.ptr = (void*)addr;
-            fprintf(stderr, "[payload] elf-sym: %s at %lx\n", s.name, addr);
+            plog( "[payload] elf-sym: %s at %lx\n", s.name, addr);
         }
     }
 
@@ -638,14 +654,14 @@ static bool resolve_functions() {
             size_t slen = strlen(resume_strings[i]);
             uintptr_t str_addr = scan_for_string(resume_strings[i], slen);
             if (!str_addr) continue;
-            fprintf(stderr, "[payload] found string '%s' at %lx\n", resume_strings[i], str_addr);
+            plog( "[payload] found string '%s' at %lx\n", resume_strings[i], str_addr);
             uintptr_t xref = find_lea_xref(str_addr);
             if (!xref) continue;
-            fprintf(stderr, "[payload] xref at %lx\n", xref);
+            plog( "[payload] xref at %lx\n", xref);
             uintptr_t func = walk_back_to_func(xref);
             if (func) {
                 G.resume = (fn_resume)func;
-                fprintf(stderr, "[payload] string-ref: lua_resume at %lx\n", func);
+                plog( "[payload] string-ref: lua_resume at %lx\n", func);
             }
         }
     }
@@ -664,13 +680,13 @@ static bool resolve_functions() {
                 if (!a) a = aob_scan(r.base, r.size, pat2, mask2, sizeof(pat2));
                 if (a) {
                     G.resume = (fn_resume)a;
-                    fprintf(stderr, "[payload] aob: lua_resume at %lx\n", a);
+                    plog( "[payload] aob: lua_resume at %lx\n", a);
                 }
             }
         }
     }
 
-    fprintf(stderr, "[payload] resolve: compile=%p load=%p resume=%p newthread=%p "
+    plog( "[payload] resolve: compile=%p load=%p resume=%p newthread=%p "
             "settop=%p tolstring=%p gettop=%p\n",
             (void*)G.compile, (void*)G.load, (void*)G.resume,
             (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
@@ -678,8 +694,85 @@ static bool resolve_functions() {
     return G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop;
 }
 
+static void write_status(const char* status) {
+    FILE* f = fopen("/tmp/oss_payload_status", "w");
+    if (f) {
+        fprintf(f, "hooked=%d captured_L=%p queue=%zu compile=%p load=%p "
+                "resume=%p newthread=%p settop=%p gettop=%p tolstring=%p status=%s\n",
+                G.hooked.load() ? 1 : 0, G.captured_L,
+                G.queue.size(),
+                (void*)G.compile, (void*)G.load, (void*)G.resume,
+                (void*)G.newthread, (void*)G.settop, (void*)G.gettop,
+                (void*)G.tolstring, status);
+        fclose(f);
+    }
+}
+
+static void try_direct_execute(const std::string& src) {
+    if (!G.captured_L) {
+        plog("[payload] direct-exec: no captured_L, cannot execute\n");
+        return;
+    }
+    if (!G.load || !G.newthread || !G.settop || !G.gettop || !G.tolstring) {
+        plog("[payload] direct-exec: missing functions\n");
+        return;
+    }
+    if (!G.original_resume) {
+        plog("[payload] direct-exec: no original_resume\n");
+        return;
+    }
+
+    const char* bc_data = nullptr;
+    size_t bc_sz = 0;
+    char* compiled = nullptr;
+
+    uint8_t first_byte = static_cast<uint8_t>(src[0]);
+    bool is_bytecode = (first_byte >= 1 && first_byte <= 6 && src.size() > 4);
+
+    if (is_bytecode) {
+        bc_data = src.data();
+        bc_sz = src.size();
+    } else if (G.compile) {
+        compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
+        if (!compiled || bc_sz == 0) {
+            plog("[payload] direct-exec: compile failed\n");
+            free(compiled);
+            return;
+        }
+        bc_data = compiled;
+    } else {
+        plog("[payload] direct-exec: no compiler, cannot run source\n");
+        return;
+    }
+
+    lua_State* th = G.newthread(G.captured_L);
+    set_identity(th);
+    int lr = G.load(th, "=oss", bc_data, bc_sz, 0);
+    free(compiled);
+    if (lr != 0) {
+        size_t len = 0;
+        const char* e = G.tolstring(th, -1, &len);
+        plog("[payload] direct-exec load error: %.*s\n", (int)len, e);
+        G.settop(G.captured_L, G.gettop(G.captured_L) - 1);
+        return;
+    }
+
+    fn_resume resume_fn = G.original_resume ? G.original_resume : G.resume;
+    int rr = resume_fn(th, nullptr, 0);
+    if (rr != 0 && rr != 1) {
+        size_t len = 0;
+        const char* e = G.tolstring(th, -1, &len);
+        plog("[payload] direct-exec run error: %.*s\n", (int)len, e);
+    } else {
+        plog("[payload] direct-exec: script executed successfully (result=%d)\n", rr);
+    }
+    G.settop(G.captured_L, G.gettop(G.captured_L) - 1);
+}
+
 static void* file_cmd_worker(void*) {
-    fprintf(stderr, "[payload] file-IPC watcher started\n");
+    plog("[payload] file-IPC watcher started\n");
+    int stale_count = 0;
+
     while (G.alive.load(std::memory_order_relaxed)) {
         struct stat st;
         if (stat(CMD_PATH, &st) == 0 && st.st_size > 0) {
@@ -698,11 +791,26 @@ static void* file_cmd_worker(void*) {
                         }
                         close(fd);
                         unlink(CMD_PATH);
+
                         if (total > 0) {
-                            std::lock_guard<std::mutex> lk(G.mtx);
-                            G.queue.emplace_back(buf, (size_t)total);
-                            fprintf(stderr, "[payload] file-IPC: queued %zd bytes (hooked=%d)\n",
-                                    total, G.hooked.load() ? 1 : 0);
+                            std::string script(buf, (size_t)total);
+                            plog("[payload] file-IPC: read %zd bytes, hooked=%d captured_L=%p\n",
+                                 total, G.hooked.load() ? 1 : 0, G.captured_L);
+                            write_status("received");
+
+                          
+                            if (G.captured_L) {
+                                plog("[payload] file-IPC: attempting direct execution\n");
+                                try_direct_execute(script);
+                                write_status("executed_direct");
+                            } else {
+                     
+                                std::lock_guard<std::mutex> lk(G.mtx);
+                                G.queue.emplace_back(std::move(script));
+                                plog("[payload] file-IPC: queued (no captured_L yet)\n");
+                                write_status("queued");
+                                stale_count = 0;
+                            }
                         }
                         free(buf);
                     } else {
@@ -714,6 +822,52 @@ static void* file_cmd_worker(void*) {
                 }
             }
         }
+
+      
+        {
+            std::lock_guard<std::mutex> lk(G.mtx);
+            if (!G.queue.empty()) {
+                stale_count++;
+                if (stale_count == 40) {
+                    plog("[payload] WARNING: %zu scripts queued for 2s without drain. "
+                         "hooked=%d captured_L=%p\n",
+                         G.queue.size(), G.hooked.load() ? 1 : 0, G.captured_L);
+                    write_status("stale");
+                }
+                        
+        if (G.captured_L) {
+            std::deque<std::string> batch;
+            {
+                std::lock_guard<std::mutex> lk(G.mtx);
+                if (!G.queue.empty()) {
+                    stale_count++;
+                    if (stale_count == 40) {
+                        plog("[payload] WARNING: %zu scripts queued for 2s without drain. "
+                             "hooked=%d captured_L=%p\n",
+                             G.queue.size(), G.hooked.load() ? 1 : 0, G.captured_L);
+                        write_status("stale");
+                    }
+                    if (stale_count >= 60) {
+                        plog("[payload] attempting stale queue drain from file thread\n");
+                        batch.swap(G.queue);
+                        stale_count = 0;
+                    }
+                } else {
+                    stale_count = 0;
+                }
+            }
+            for (auto& s : batch) {
+                try_direct_execute(s);
+            }
+            if (!batch.empty()) {
+                write_status("drained_fallback");
+            }
+        }
+            } else {
+                stale_count = 0;
+            }
+        }
+
         usleep(50000);
     }
     return nullptr;
@@ -727,16 +881,16 @@ static void* ipc_worker(void*) {
     strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
     unlink(SOCK_PATH);
     if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "[payload] bind(%s) failed: %s\n", SOCK_PATH, strerror(errno));
+        plog( "[payload] bind(%s) failed: %s\n", SOCK_PATH, strerror(errno));
         close(sfd);
         return nullptr;
     }
     if (listen(sfd, 4) < 0) {
-        fprintf(stderr, "[payload] listen failed: %s\n", strerror(errno));
+        plog( "[payload] listen failed: %s\n", strerror(errno));
         close(sfd);
         return nullptr;
     }
-    fprintf(stderr, "[payload] ipc listening\n");
+    plog( "[payload] ipc listening\n");
     auto* buf = (char*)malloc(RECV_BUF);
     if (!buf) { close(sfd); return nullptr; }
     while (G.alive.load(std::memory_order_relaxed)) {
@@ -753,7 +907,7 @@ static void* ipc_worker(void*) {
         if (total > 0) {
             std::lock_guard<std::mutex> lk(G.mtx);
             G.queue.emplace_back(buf, total);
-            fprintf(stderr, "[payload] queued %zu bytes (hooked=%d captured_L=%p)\n",
+            plog( "[payload] queued %zu bytes (hooked=%d captured_L=%p)\n",
                     total, G.hooked.load() ? 1 : 0, G.captured_L);
         }
     }
@@ -766,9 +920,9 @@ static void* ipc_worker(void*) {
 static void* init_worker(void*) {
     usleep(500000);
 
-    fprintf(stderr, "[payload] init_worker: resolving module...\n");
+    plog( "[payload] init_worker: resolving module...\n");
     if (!find_module()) {
-        fprintf(stderr, "[payload] WARN: roblox module not found, retrying with relaxed scan...\n");
+        plog( "[payload] WARN: roblox module not found, retrying with relaxed scan...\n");
         auto regions = get_regions();
         uintptr_t lo = UINTPTR_MAX, hi = 0;
         for (auto& r : regions) {
@@ -780,10 +934,10 @@ static void* init_worker(void*) {
         if (hi > lo) {
             G.mod_base = lo;
             G.mod_size = hi - lo;
-            fprintf(stderr, "[payload] fallback module range %lx-%lx (%zu MB)\n",
+            plog( "[payload] fallback module range %lx-%lx (%zu MB)\n",
                     lo, hi, G.mod_size >> 20);
         } else {
-            fprintf(stderr, "[payload] FATAL: no executable regions found\n");
+            plog( "[payload] FATAL: no executable regions found\n");
             return nullptr;
         }
     }
@@ -794,12 +948,12 @@ static void* init_worker(void*) {
             resolved = true;
             break;
         }
-        fprintf(stderr, "[payload] resolve attempt %d/5 failed, retrying...\n", attempt + 1);
+        plog( "[payload] resolve attempt %d/5 failed, retrying...\n", attempt + 1);
         usleep(1000000);
     }
 
     if (!resolved) {
-        fprintf(stderr, "[payload] FATAL: could not resolve luau functions after retries"
+        plog( "[payload] FATAL: could not resolve luau functions after retries"
                 " (compile=%p load=%p resume=%p newthread=%p settop=%p tolstring=%p gettop=%p)\n",
                 (void*)G.compile, (void*)G.load, (void*)G.resume,
                 (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
@@ -807,31 +961,35 @@ static void* init_worker(void*) {
     }
 
     if (!G.compile)
-        fprintf(stderr, "[payload] luau_compile not found, expecting pre-compiled bytecode\n");
+        plog( "[payload] luau_compile not found, expecting pre-compiled bytecode\n");
 
     uint8_t* tramp = nullptr;
     if (!install_hook((uintptr_t)G.resume, (void*)resume_detour, tramp)) {
-        fprintf(stderr, "[payload] FATAL: hook install failed\n");
+        plog( "[payload] FATAL: hook install failed\n");
         return nullptr;
     }
     G.trampoline = tramp;
     G.hooked.store(true, std::memory_order_release);
-    fprintf(stderr, "[payload] armed — waiting for scripts\n");
+    plog( "[payload] armed — waiting for scripts\n");
     return nullptr;
 }
 
 __attribute__((constructor))
 static void payload_init() {
-    fprintf(stderr, "[payload] init pid %d\n", getpid());
+    
+    unlink("/tmp/oss_payload.log");
+    unlink("/tmp/oss_payload_status");
 
+    plog("[payload] init pid %d\n", getpid());
 
+ 
     FILE* marker = fopen(READY_PATH, "w");
     if (marker) {
         fprintf(marker, "%d\n", getpid());
         fclose(marker);
-        fprintf(stderr, "[payload] ready marker created at %s\n", READY_PATH);
+        plog( "[payload] ready marker created at %s\n", READY_PATH);
     } else {
-        fprintf(stderr, "[payload] WARN: cannot create ready marker: %s\n", strerror(errno));
+        plog( "[payload] WARN: cannot create ready marker: %s\n", strerror(errno));
     }
 
     unlink(CMD_PATH);
@@ -843,7 +1001,7 @@ static void payload_init() {
     if (pthread_create(&file_t, nullptr, file_cmd_worker, nullptr) == 0) {
         pthread_detach(file_t);
     } else {
-        fprintf(stderr, "[payload] WARN: file_cmd_worker thread failed\n");
+        plog( "[payload] WARN: file_cmd_worker thread failed\n");
     }
 
 
@@ -851,20 +1009,20 @@ static void payload_init() {
     if (pthread_create(&ipc_t, nullptr, ipc_worker, nullptr) == 0) {
         pthread_detach(ipc_t);
     } else {
-        fprintf(stderr, "[payload] WARN: ipc_worker thread failed\n");
+        plog( "[payload] WARN: ipc_worker thread failed\n");
     }
 
     pthread_t init_t;
     if (pthread_create(&init_t, nullptr, init_worker, nullptr) == 0) {
         pthread_detach(init_t);
     } else {
-        fprintf(stderr, "[payload] WARN: init_worker thread failed\n");
+        plog( "[payload] WARN: init_worker thread failed\n");
     }
 }
 
 __attribute__((destructor))
 static void payload_fini() {
-    fprintf(stderr, "[payload] shutdown\n");
+    plog( "[payload] shutdown\n");
     G.alive.store(false, std::memory_order_release);
     unlink(READY_PATH);
     unlink(CMD_PATH);
