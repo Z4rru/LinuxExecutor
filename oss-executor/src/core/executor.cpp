@@ -10,6 +10,8 @@
 #include <sstream>
 #include <cstddef>
 #include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <cstring>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -101,17 +103,67 @@ void Executor::shutdown() {
 }
 
 bool Executor::send_to_payload(const std::string& source) {
-
-    std::string sock_path = PAYLOAD_SOCK;
     auto& inj = Injection::instance();
     const auto& pinfo = inj.process_info();
-    if (pinfo.via_flatpak || pinfo.via_sober) {
-        pid_t pid = inj.target_pid();
-        if (pid > 0) {
-            sock_path = "/proc/" + std::to_string(pid) + "/root" + PAYLOAD_SOCK;
-            LOG_DEBUG("Using namespace socket path: {}", sock_path);
+    pid_t pid = inj.target_pid();
+
+    std::string prefix;
+    if ((pinfo.via_flatpak || pinfo.via_sober) && pid > 0)
+        prefix = "/proc/" + std::to_string(pid) + "/root";
+
+  
+    {
+        std::string cmd_path = prefix + "/tmp/oss_payload_cmd";
+        std::string tmp_path = cmd_path + ".tmp";
+
+        int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            const char* data = source.data();
+            size_t remaining = source.size();
+            bool write_ok = true;
+            while (remaining > 0) {
+                ssize_t n = ::write(fd, data, remaining);
+                if (n <= 0) { write_ok = false; break; }
+                data += n;
+                remaining -= static_cast<size_t>(n);
+            }
+            ::close(fd);
+
+            if (write_ok) {
+                if (::rename(tmp_path.c_str(), cmd_path.c_str()) == 0) {
+                    LOG_INFO("Sent {} bytes to payload via file IPC ({})",
+                             source.size(), cmd_path);
+                    return true;
+                }
+                LOG_WARN("rename failed: {}, trying direct write", strerror(errno));
+                ::unlink(tmp_path.c_str());
+
+                fd = ::open(cmd_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd >= 0) {
+                    data = source.data();
+                    remaining = source.size();
+                    write_ok = true;
+                    while (remaining > 0) {
+                        ssize_t n = ::write(fd, data, remaining);
+                        if (n <= 0) { write_ok = false; break; }
+                        data += n;
+                        remaining -= static_cast<size_t>(n);
+                    }
+                    ::close(fd);
+                    if (write_ok) {
+                        LOG_INFO("Sent {} bytes to payload via file IPC direct ({})",
+                                 source.size(), cmd_path);
+                        return true;
+                    }
+                }
+            }
+            ::unlink(tmp_path.c_str());
         }
+        LOG_WARN("File IPC failed ({}): {}, trying socket", cmd_path, strerror(errno));
     }
+
+
+    std::string sock_path = prefix + "/tmp/oss_executor.sock";
 
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -148,7 +200,7 @@ bool Executor::send_to_payload(const std::string& source) {
 
     ::shutdown(fd, SHUT_WR);
     ::close(fd);
-    LOG_INFO("Sent {} bytes to payload via {}", source.size(), sock_path);
+    LOG_INFO("Sent {} bytes to payload via socket ({})", source.size(), sock_path);
     return true;
 }
 
@@ -407,6 +459,7 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
 
 
 
