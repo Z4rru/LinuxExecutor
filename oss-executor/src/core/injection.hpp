@@ -91,7 +91,7 @@ public:
 
 private:
     Injection() = default;
-    ~Injection() { stop_auto_scan(); }
+    ~Injection() { stop_auto_scan(); stop_elevated_helper(); }
     Injection(const Injection&)            = delete;
     Injection& operator=(const Injection&) = delete;
 
@@ -133,6 +133,9 @@ private:
 
     bool proc_mem_write(pid_t pid, uintptr_t addr, const void* data, size_t len);
     bool proc_mem_read(pid_t pid, uintptr_t addr, void* buf, size_t len);
+    bool start_elevated_helper();
+    bool elevated_mem_write(pid_t pid, uintptr_t addr, const void* data, size_t len);
+    void stop_elevated_helper();
 
     std::string prepare_payload_for_injection(pid_t pid, const std::string& host_path);
     std::string resolve_socket_path();
@@ -155,6 +158,12 @@ private:
 
     std::thread         scan_thread_;
     std::atomic<bool>   scanning_{false};
+
+    pid_t               elevated_pid_ = -1;
+    int                 elevated_in_fd_ = -1;
+    int                 elevated_out_fd_ = -1;
+};
 };
 
 }
+
