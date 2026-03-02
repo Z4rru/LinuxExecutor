@@ -1115,7 +1115,9 @@ bool Injection::proc_mem_write(pid_t pid, uintptr_t addr,
     struct iovec local = { const_cast<void*>(data), len };
     struct iovec remote = { reinterpret_cast<void*>(addr), len };
     ssize_t w = process_vm_writev(pid, &local, 1, &remote, 1, 0);
-    return w == static_cast<ssize_t>(len);
+    if (w == static_cast<ssize_t>(len)) return true;
+
+    return elevated_mem_write(pid, addr, data, len);
 }
 
 bool Injection::proc_mem_read(pid_t pid, uintptr_t addr,
@@ -1133,25 +1135,151 @@ bool Injection::proc_mem_read(pid_t pid, uintptr_t addr,
     return rd == static_cast<ssize_t>(len);
 }
 
+bool Injection::start_elevated_helper() {
+    if (elevated_pid_ > 0) return true;
+
+    std::string script = "/tmp/.oss_mem_helper.py";
+    {
+        std::ofstream sf(script, std::ios::trunc);
+        sf << "import os,sys\n"
+              "sys.stdout.write('R\\n')\n"
+              "sys.stdout.flush()\n"
+              "while True:\n"
+              "  l=sys.stdin.readline()\n"
+              "  if not l:break\n"
+              "  p=l.strip().split(' ',3)\n"
+              "  if p[0]=='W':\n"
+              "    try:\n"
+              "      f=os.open('/proc/'+p[1]+'/mem',os.O_RDWR)\n"
+              "      os.pwrite(f,bytes.fromhex(p[3]),int(p[2]))\n"
+              "      os.close(f)\n"
+              "      sys.stdout.write('K\\n')\n"
+              "    except Exception as e:\n"
+              "      sys.stdout.write('E '+str(e)+'\\n')\n"
+              "    sys.stdout.flush()\n"
+              "  elif p[0]=='Q':break\n";
+    }
+    chmod(script.c_str(), 0644);
+
+    int to_child[2], from_child[2];
+    if (pipe(to_child) < 0) {
+        unlink(script.c_str());
+        return false;
+    }
+    if (pipe(from_child) < 0) {
+        close(to_child[0]); close(to_child[1]);
+        unlink(script.c_str());
+        return false;
+    }
+
+    LOG_INFO("Requesting elevated privileges for memory write access...");
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(to_child[1]);
+        close(from_child[0]);
+        dup2(to_child[0], STDIN_FILENO);
+        dup2(from_child[1], STDOUT_FILENO);
+        close(to_child[0]);
+        close(from_child[1]);
+        execlp("pkexec", "pkexec", "/usr/bin/python3", "-u", script.c_str(), nullptr);
+        _exit(127);
+    }
+    if (child < 0) {
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        unlink(script.c_str());
+        return false;
+    }
+
+    close(to_child[0]);
+    close(from_child[1]);
+
+    elevated_pid_ = child;
+    elevated_in_fd_ = to_child[1];
+    elevated_out_fd_ = from_child[0];
+
+    struct pollfd pfd = { elevated_out_fd_, POLLIN, 0 };
+    if (poll(&pfd, 1, 30000) <= 0) {
+        LOG_ERROR("Elevated helper timeout or auth cancelled");
+        stop_elevated_helper();
+        return false;
+    }
+
+    char buf[16] = {};
+    ssize_t n = read(elevated_out_fd_, buf, sizeof(buf) - 1);
+    if (n <= 0 || buf[0] != 'R') {
+        LOG_ERROR("Elevated helper failed to initialize");
+        stop_elevated_helper();
+        return false;
+    }
+
+    LOG_INFO("Elevated helper ready");
+    return true;
+}
+
+bool Injection::elevated_mem_write(pid_t pid, uintptr_t addr,
+                                    const void* data, size_t len) {
+    if (elevated_pid_ <= 0 && !start_elevated_helper())
+        return false;
+
+    std::string hex;
+    hex.reserve(len * 2);
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; i++) {
+        char h[3];
+        snprintf(h, sizeof(h), "%02x", bytes[i]);
+        hex += h;
+    }
+
+    std::string cmd = "W " + std::to_string(pid) + " " +
+                      std::to_string(addr) + " " + hex + "\n";
+
+    ssize_t wr = write(elevated_in_fd_, cmd.c_str(), cmd.size());
+    if (wr != static_cast<ssize_t>(cmd.size())) return false;
+
+    struct pollfd pfd = { elevated_out_fd_, POLLIN, 0 };
+    if (poll(&pfd, 1, 5000) <= 0) return false;
+
+    char buf[256] = {};
+    ssize_t n = read(elevated_out_fd_, buf, sizeof(buf) - 1);
+    if (n <= 0) return false;
+
+    return buf[0] == 'K';
+}
+
+void Injection::stop_elevated_helper() {
+    if (elevated_in_fd_ >= 0) {
+        (void)write(elevated_in_fd_, "Q\n", 2);
+        close(elevated_in_fd_);
+        elevated_in_fd_ = -1;
+    }
+    if (elevated_out_fd_ >= 0) {
+        close(elevated_out_fd_);
+        elevated_out_fd_ = -1;
+    }
+    if (elevated_pid_ > 0) {
+        int st;
+        if (waitpid(elevated_pid_, &st, WNOHANG) == 0) {
+            kill(elevated_pid_, SIGTERM);
+            usleep(100000);
+            if (waitpid(elevated_pid_, &st, WNOHANG) == 0) {
+                kill(elevated_pid_, SIGKILL);
+                waitpid(elevated_pid_, &st, 0);
+            }
+        }
+        elevated_pid_ = -1;
+    }
+    unlink("/tmp/.oss_mem_helper.py");
+}
+
 bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
                                     uintptr_t dlopen_addr, uint64_t dlopen_flags) {
     LOG_INFO("inject_via_procmem: PID {} lib={}", pid, lib_path);
 
-    std::string mem_path = "/proc/" + std::to_string(pid) + "/mem";
-    {
-        int test_fd = open(mem_path.c_str(), O_RDWR);
-        if (test_fd < 0) {
-            error_ = "Cannot open " + mem_path + " for writing: " + strerror(errno);
-            LOG_ERROR("{}", error_);
-            return false;
-        }
-        close(test_fd);
-    }
-    LOG_DEBUG("Confirmed /proc/pid/mem is writable");
-
     pid_t tracer = get_tracer_pid(pid);
     if (tracer > 0)
-        LOG_WARN("PID {} is already traced by PID {} — may affect injection", pid, tracer);
+        LOG_WARN("PID {} is already traced by PID {} — using elevated writes", pid, tracer);
 
     auto regions = memory_.get_regions();
     if (regions.empty()) {
@@ -1453,6 +1581,7 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
     proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
     kill(pid, SIGCONT);
 
+    stop_elevated_helper();
     LOG_INFO("inject_via_procmem: complete, process restored");
     payload_loaded_ = true;
     return true;
@@ -1737,6 +1866,7 @@ bool Injection::attach() {
 }
 
 bool Injection::detach() {
+    stop_elevated_helper();
     set_state(InjectionState::Detached, "Detached");
     memory_.set_pid(0);
     mode_            = InjectionMode::None;
@@ -2047,4 +2177,5 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
