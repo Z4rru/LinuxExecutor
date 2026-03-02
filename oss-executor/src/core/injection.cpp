@@ -960,18 +960,47 @@ std::string Injection::resolve_socket_path() {
     return PAYLOAD_SOCK;
 }
 
-static pid_t get_tracer_pid(pid_t pid) {
-    std::ifstream status("/proc/" + std::to_string(pid) + "/status");
-    if (!status.is_open()) return -1;
-    std::string line;
-    while (std::getline(status, line)) {
-        if (line.compare(0, 10, "TracerPid:") == 0) {
-            pid_t tp = 0;
-            sscanf(line.c_str() + 10, "%d", &tp);
-            return tp;
+struct ProcessDetails {
+    char state;
+    pid_t tracer_pid;
+};
+
+static ProcessDetails get_process_details(pid_t pid) {
+    ProcessDetails result = {'?', 0};
+    char path[64], buf[4096];
+
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = 0;
+            char* close_paren = strrchr(buf, ')');
+            if (close_paren && close_paren[1] == ' ') {
+                result.state = close_paren[2];
+            }
         }
+        close(fd);
     }
-    return 0;
+
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = 0;
+            char* line = strstr(buf, "TracerPid:");
+            if (line) {
+                result.tracer_pid = atoi(line + 10);
+            }
+        }
+        close(fd);
+    }
+    return result;
+}
+
+static pid_t get_tracer_pid(pid_t pid) {
+    return get_process_details(pid).tracer_pid;
 }
 
 struct ThreadState {
@@ -1100,6 +1129,372 @@ static bool find_code_cave(pid_t pid, const std::vector<MemoryRegion>& regions,
     }
 
     return false;
+}
+
+bool Injection::freeze_tracer(pid_t tracer_pid) {
+    if (tracer_pid <= 0) return false;
+    LOG_INFO("Freezing tracer PID {}...", tracer_pid);
+
+    if (kill(tracer_pid, SIGSTOP) != 0) {
+        LOG_WARN("Failed to SIGSTOP tracer PID {}: {}", tracer_pid, strerror(errno));
+        return false;
+    }
+
+    for (int i = 0; i < 50; i++) {
+        usleep(10000);
+        ProcessDetails pd = get_process_details(tracer_pid);
+        if (pd.state == 'T' || pd.state == 't') {
+            LOG_INFO("Tracer PID {} frozen (state={})", tracer_pid, pd.state);
+            return true;
+        }
+    }
+
+    LOG_WARN("Tracer PID {} did not stop in time, resuming", tracer_pid);
+    kill(tracer_pid, SIGCONT);
+    return false;
+}
+
+void Injection::thaw_tracer(pid_t tracer_pid) {
+    if (tracer_pid <= 0) return;
+    kill(tracer_pid, SIGCONT);
+    LOG_INFO("Resumed tracer PID {}", tracer_pid);
+}
+
+bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
+                                        uintptr_t dlopen_addr, uint64_t dlopen_flags) {
+    LOG_INFO("Attempting inline hook injection into PID {}...", pid);
+
+    const char* candidates[] = {
+        "nanosleep", "clock_nanosleep", "poll", "epoll_wait",
+        "usleep", "select", "pselect", "read", "write",
+        "clock_gettime", "gettimeofday"
+    };
+
+    uintptr_t hook_func_addr = 0;
+    const char* hooked_name = nullptr;
+    for (const char* name : candidates) {
+        uintptr_t addr = find_remote_symbol(pid, "c", name);
+        if (addr != 0) {
+            hook_func_addr = addr;
+            hooked_name = name;
+            LOG_INFO("Targeting libc function '{}' at 0x{:X}", name, addr);
+            break;
+        }
+    }
+    if (hook_func_addr == 0) {
+        error_ = "No hookable libc function found";
+        LOG_ERROR("{}", error_);
+        return false;
+    }
+
+    uint8_t orig_prologue[16];
+    if (!proc_mem_read(pid, hook_func_addr, orig_prologue, sizeof(orig_prologue))) {
+        error_ = "Failed to read prologue of " + std::string(hooked_name);
+        LOG_ERROR("{}", error_);
+        return false;
+    }
+
+    int steal_size = 0;
+    int pos = 0;
+
+    if (orig_prologue[0] == 0xF3 && orig_prologue[1] == 0x0F &&
+        orig_prologue[2] == 0x1E && orig_prologue[3] == 0xFA) {
+        pos = 4;
+    }
+
+    while (pos < 5 && pos < 14) {
+        uint8_t b = orig_prologue[pos];
+        bool has_rex = (b >= 0x40 && b <= 0x4F);
+        int rex_off = has_rex ? 1 : 0;
+        uint8_t next = orig_prologue[pos + rex_off];
+
+        if (!has_rex && b >= 0x50 && b <= 0x5F) {
+            pos += 1;
+        } else if (b == 0x41 && (next >= 0x50 && next <= 0x57)) {
+            pos += 2;
+        } else if (has_rex && next == 0x89 && orig_prologue[pos + rex_off + 1] == 0xE5) {
+            pos += rex_off + 2;
+        } else if (has_rex && next == 0x83 && orig_prologue[pos + rex_off + 1] == 0xEC) {
+            pos += rex_off + 3;
+        } else if (has_rex && next == 0x81 && orig_prologue[pos + rex_off + 1] == 0xEC) {
+            pos += rex_off + 6;
+        } else if (b == 0x31 && orig_prologue[pos + 1] == 0xC0) {
+            pos += 2;
+        } else if (has_rex && next == 0x8D) {
+            uint8_t modrm = orig_prologue[pos + rex_off + 1];
+            int mod = (modrm >> 6) & 3;
+            int rm = modrm & 7;
+            pos += rex_off + 2;
+            if (rm == 4) pos += 1;
+            if (mod == 1) pos += 1;
+            else if (mod == 2 || (mod == 0 && rm == 5)) pos += 4;
+        } else if (b == 0x55) {
+            pos += 1;
+        } else if (b == 0x90 || b == 0xCC) {
+            pos += 1;
+        } else {
+            LOG_WARN("Unknown opcode 0x{:02X} at prologue offset {}, assuming 1 byte", b, pos);
+            pos += 1;
+        }
+    }
+    steal_size = pos;
+
+    if (steal_size < 5) {
+        error_ = "Cannot determine safe steal size for " + std::string(hooked_name) +
+                 " (got " + std::to_string(steal_size) + " bytes)";
+        LOG_ERROR("{}", error_);
+        return false;
+    }
+    LOG_DEBUG("Stealing {} bytes from prologue of {}", steal_size, hooked_name);
+
+    auto regions = memory_.get_regions();
+    uintptr_t data_addr = 0;
+    for (const auto& r : regions) {
+        if (!r.writable() || !r.readable()) continue;
+        if (r.size() < 4096) continue;
+        if (r.path.find("[stack") != std::string::npos) continue;
+        if (r.path.find("[vvar") != std::string::npos) continue;
+        if (r.path.find("[vdso") != std::string::npos) continue;
+        data_addr = r.end - 4096;
+        break;
+    }
+    if (data_addr == 0) {
+        error_ = "No writable data region for inline hook";
+        LOG_ERROR("{}", error_);
+        return false;
+    }
+
+    uint8_t orig_data[4096];
+    if (!proc_mem_read(pid, data_addr, orig_data, sizeof(orig_data))) {
+        error_ = "Failed to save data region";
+        LOG_ERROR("{}", error_);
+        return false;
+    }
+
+    uintptr_t path_addr   = data_addr;
+    uintptr_t result_addr = data_addr + 512;
+    uintptr_t guard_addr  = data_addr + 520;
+
+    uint8_t path_buf[512] = {};
+    size_t plen = std::min(lib_path.size(), sizeof(path_buf) - 1);
+    memcpy(path_buf, lib_path.c_str(), plen);
+    if (!proc_mem_write(pid, path_addr, path_buf, plen + 1)) {
+        error_ = "Failed to write library path";
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    uint64_t zero = 0;
+    proc_mem_write(pid, result_addr, &zero, 8);
+    proc_mem_write(pid, guard_addr, &zero, 8);
+
+    size_t sc_needed = 256;
+    ExeRegionInfo cave;
+    if (!find_code_cave(pid, regions, sc_needed, cave)) {
+        error_ = "No code cave for inline hook shellcode";
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+    LOG_DEBUG("Inline hook code cave at 0x{:X} ({} bytes)", cave.padding_start, cave.padding_size);
+
+    uint8_t orig_cave[256];
+    if (!proc_mem_read(pid, cave.padding_start, orig_cave, sc_needed)) {
+        error_ = "Failed to save code cave";
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    uintptr_t code_addr = cave.padding_start;
+    uint8_t sc[256];
+    memset(sc, 0xCC, sizeof(sc));
+    int off = 0;
+
+
+    sc[off++] = 0x9C;
+
+    sc[off++] = 0x50; sc[off++] = 0x51; sc[off++] = 0x52; sc[off++] = 0x53;
+    sc[off++] = 0x55; sc[off++] = 0x56; sc[off++] = 0x57;
+
+    sc[off++] = 0x41; sc[off++] = 0x50;
+    sc[off++] = 0x41; sc[off++] = 0x51;
+    sc[off++] = 0x41; sc[off++] = 0x52;
+    sc[off++] = 0x41; sc[off++] = 0x53;
+    sc[off++] = 0x41; sc[off++] = 0x54;
+    sc[off++] = 0x41; sc[off++] = 0x55;
+    sc[off++] = 0x41; sc[off++] = 0x56;
+    sc[off++] = 0x41; sc[off++] = 0x57;
+
+    sc[off++] = 0x55;
+    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xE5;
+    sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xE4; sc[off++] = 0xF0;
+
+
+    sc[off++] = 0x48; sc[off++] = 0xBA;
+    memcpy(sc + off, &guard_addr, 8); off += 8;
+
+    sc[off++] = 0xB8; sc[off++] = 0x01; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
+   
+    sc[off++] = 0xF0; sc[off++] = 0x87; sc[off++] = 0x02;
+   
+    sc[off++] = 0x85; sc[off++] = 0xC0;
+
+ 
+    sc[off++] = 0x0F; sc[off++] = 0x85;
+    int jnz_patch_offset = off;
+    off += 4;
+
+  
+    sc[off++] = 0x48; sc[off++] = 0xBF;
+    memcpy(sc + off, &path_addr, 8); off += 8;
+
+
+    sc[off++] = 0x48; sc[off++] = 0xBE;
+    memcpy(sc + off, &dlopen_flags, 8); off += 8;
+
+
+    sc[off++] = 0x48; sc[off++] = 0xB8;
+    memcpy(sc + off, &dlopen_addr, 8); off += 8;
+    sc[off++] = 0xFF; sc[off++] = 0xD0;
+
+
+    sc[off++] = 0x48; sc[off++] = 0xBA;
+    memcpy(sc + off, &result_addr, 8); off += 8;
+    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x02;
+
+
+    int skip_target = off;
+    int32_t jnz_rel = skip_target - (jnz_patch_offset + 4);
+    memcpy(sc + jnz_patch_offset, &jnz_rel, 4);
+
+
+    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xEC;
+    sc[off++] = 0x5D;
+
+    sc[off++] = 0x41; sc[off++] = 0x5F;
+    sc[off++] = 0x41; sc[off++] = 0x5E;
+    sc[off++] = 0x41; sc[off++] = 0x5D;
+    sc[off++] = 0x41; sc[off++] = 0x5C;
+    sc[off++] = 0x41; sc[off++] = 0x5B;
+    sc[off++] = 0x41; sc[off++] = 0x5A;
+    sc[off++] = 0x41; sc[off++] = 0x59;
+    sc[off++] = 0x41; sc[off++] = 0x58;
+   
+    sc[off++] = 0x5F; sc[off++] = 0x5E; sc[off++] = 0x5D; sc[off++] = 0x5B;
+    sc[off++] = 0x5A; sc[off++] = 0x59; sc[off++] = 0x58;
+
+    sc[off++] = 0x9D;
+
+
+    memcpy(sc + off, orig_prologue, steal_size);
+    off += steal_size;
+
+
+    uintptr_t jmp_from = code_addr + off + 5;
+    uintptr_t jmp_to = hook_func_addr + steal_size;
+    int64_t jmp_disp = static_cast<int64_t>(jmp_to) - static_cast<int64_t>(jmp_from);
+
+    if (jmp_disp >= INT32_MIN && jmp_disp <= INT32_MAX) {
+        sc[off++] = 0xE9;
+        int32_t rel32 = static_cast<int32_t>(jmp_disp);
+        memcpy(sc + off, &rel32, 4); off += 4;
+    } else {
+        sc[off++] = 0xFF; sc[off++] = 0x25;
+        sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
+        memcpy(sc + off, &jmp_to, 8); off += 8;
+    }
+
+    LOG_DEBUG("Inline hook shellcode: {} bytes", off);
+
+    if (static_cast<size_t>(off) > sc_needed) {
+        error_ = "Inline hook shellcode too large";
+        LOG_ERROR("Shellcode {} > {} bytes", off, sc_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    if (!proc_mem_write(pid, code_addr, sc, off)) {
+        error_ = "Failed to write inline hook shellcode";
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    // Build hook patch for function prologue
+    uint8_t hook_patch[16];
+    int hook_size = 0;
+
+    int64_t hook_disp = static_cast<int64_t>(code_addr) - static_cast<int64_t>(hook_func_addr + 5);
+    if (hook_disp >= INT32_MIN && hook_disp <= INT32_MAX && steal_size >= 5) {
+        hook_patch[0] = 0xE9;
+        int32_t rel32 = static_cast<int32_t>(hook_disp);
+        memcpy(hook_patch + 1, &rel32, 4);
+        for (int i = 5; i < steal_size; i++) hook_patch[i] = 0x90;
+        hook_size = steal_size;
+    } else if (steal_size >= 14) {
+        hook_patch[0] = 0xFF; hook_patch[1] = 0x25;
+        hook_patch[2] = 0x00; hook_patch[3] = 0x00;
+        hook_patch[4] = 0x00; hook_patch[5] = 0x00;
+        memcpy(hook_patch + 6, &code_addr, 8);
+        hook_size = 14;
+    } else {
+        error_ = "Cannot encode jump: steal_size=" + std::to_string(steal_size) +
+                 " disp=" + std::to_string(hook_disp);
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, code_addr, orig_cave, sc_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+
+    if (!proc_mem_write(pid, hook_func_addr, hook_patch, hook_size)) {
+        error_ = "Failed to install inline hook";
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, code_addr, orig_cave, sc_needed);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
+    }
+    LOG_INFO("Inline hook installed on {} ({} bytes patched)", hooked_name, hook_size);
+
+    uint64_t result = 0;
+    bool completed = false;
+    for (int i = 0; i < 100; i++) {
+        usleep(100000);
+        if (proc_mem_read(pid, result_addr, &result, 8) && result != 0) {
+            LOG_INFO("Inline hook dlopen completed, handle=0x{:X}", result);
+            completed = true;
+            break;
+        }
+        if (kill(pid, 0) != 0) {
+            error_ = "Process died during inline hook injection";
+            LOG_ERROR("{}", error_);
+            return false;
+        }
+    }
+
+
+    if (!proc_mem_write(pid, hook_func_addr, orig_prologue, steal_size)) {
+        LOG_ERROR("Failed to restore prologue of {} — process may crash!", hooked_name);
+    } else {
+        LOG_DEBUG("Restored original prologue of {}", hooked_name);
+    }
+
+    usleep(50000);
+
+    proc_mem_write(pid, code_addr, orig_cave, sc_needed);
+    proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+
+    if (!completed) {
+        error_ = "Inline hook dlopen timed out after 10s";
+        LOG_ERROR("{}", error_);
+        return false;
+    }
+
+    payload_loaded_ = true;
+    stop_elevated_helper();
+    LOG_INFO("inject_via_inline_hook: complete, all memory restored");
+    return true;
 }
 
 bool Injection::proc_mem_write(pid_t pid, uintptr_t addr,
@@ -1273,109 +1668,6 @@ void Injection::stop_elevated_helper() {
     unlink("/tmp/.oss_mem_helper.py");
 }
 
-bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
-                                    uintptr_t dlopen_addr, uint64_t dlopen_flags) {
-    LOG_INFO("inject_via_procmem: PID {} lib={}", pid, lib_path);
-
-    pid_t tracer = get_tracer_pid(pid);
-    if (tracer > 0)
-        LOG_WARN("PID {} is already traced by PID {} — using elevated writes", pid, tracer);
-
-    auto regions = memory_.get_regions();
-    if (regions.empty()) {
-        error_ = "No memory regions available";
-        LOG_ERROR("{}", error_);
-        return false;
-    }
-
-    uintptr_t data_addr = 0;
-    for (const auto& r : regions) {
-        if (!r.writable() || !r.readable()) continue;
-        if (r.size() < 4096) continue;
-        if (r.path.find("[stack") != std::string::npos) continue;
-        if (r.path.find("[vvar")  != std::string::npos) continue;
-        if (r.path.find("[vdso")  != std::string::npos) continue;
-        data_addr = r.end - 4096;
-        LOG_DEBUG("Data region at 0x{:X} from '{}'", data_addr,
-                  r.path.empty() ? "[anon]" : r.path);
-        break;
-    }
-    if (data_addr == 0) {
-        error_ = "No suitable writable region found";
-        LOG_ERROR("{}", error_);
-        return false;
-    }
-
-    uint8_t orig_data[4096];
-    if (!proc_mem_read(pid, data_addr, orig_data, sizeof(orig_data))) {
-        error_ = "Failed to save original data region";
-        LOG_ERROR("{}", error_);
-        return false;
-    }
-
-    uintptr_t path_addr   = data_addr;
-    uintptr_t result_addr = data_addr + 512;
-    uintptr_t done_addr   = data_addr + 520;
-
-    uint8_t path_buf[512] = {};
-    size_t path_len = std::min(lib_path.size(), sizeof(path_buf) - 1);
-    memcpy(path_buf, lib_path.c_str(), path_len);
-    if (!proc_mem_write(pid, data_addr, path_buf, path_len + 1)) {
-        error_ = "Failed to write library path to target";
-        LOG_ERROR("{}", error_);
-        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
-        return false;
-    }
-
-    uint64_t zero = 0;
-    proc_mem_write(pid, result_addr, &zero, sizeof(zero));
-    proc_mem_write(pid, done_addr,   &zero, sizeof(zero));
-
-    size_t shellcode_needed = 256;
-    ExeRegionInfo cave;
-    if (!find_code_cave(pid, regions, shellcode_needed, cave)) {
-        error_ = "No suitable code cave found for shellcode";
-        LOG_ERROR("{}", error_);
-        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
-        return false;
-    }
-    LOG_DEBUG("Code cave at 0x{:X} ({} bytes)", cave.padding_start, cave.padding_size);
-
-    uint8_t orig_cave[256];
-    if (!proc_mem_read(pid, cave.padding_start, orig_cave, shellcode_needed)) {
-        error_ = "Failed to save code cave bytes";
-        LOG_ERROR("{}", error_);
-        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
-        return false;
-    }
-
-    if (kill(pid, SIGSTOP) != 0) {
-        error_ = std::string("SIGSTOP failed: ") + strerror(errno);
-        LOG_ERROR("{}", error_);
-        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
-        return false;
-    }
-
-    bool stopped = false;
-    for (int i = 0; i < 20; i++) {
-        usleep(10000);
-        std::ifstream sf("/proc/" + std::to_string(pid) + "/stat");
-        std::string sline;
-        std::getline(sf, sline);
-        auto ce = sline.rfind(')');
-        if (ce != std::string::npos && ce + 2 < sline.size()) {
-            char state = sline[ce + 2];
-            if (state == 'T' || state == 't') { stopped = true; break; }
-        }
-    }
-    if (!stopped) {
-        error_ = "Process did not stop after SIGSTOP";
-        LOG_ERROR("{}", error_);
-        kill(pid, SIGCONT);
-        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
-        return false;
-    }
-
     pid_t tid = pick_injectable_thread(pid);
     ThreadState ts;
     if (!get_thread_state(pid, tid, ts)) {
@@ -1383,6 +1675,7 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
         LOG_ERROR("{}", error_);
         kill(pid, SIGCONT);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
         return false;
     }
     LOG_DEBUG("Thread {} state: RIP=0x{:X} RSP=0x{:X}", tid, ts.rip, ts.rsp);
@@ -1393,25 +1686,24 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
         LOG_ERROR("Failed to read code at RIP 0x{:X}", ts.rip);
         kill(pid, SIGCONT);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
         return false;
     }
 
+ 
     uintptr_t return_addr = ts.rip;
     uint8_t sc[256];
     memset(sc, 0, sizeof(sc));
     int off = 0;
 
+   
     sc[off++] = 0x48; sc[off++] = 0x81; sc[off++] = 0xEC;
     sc[off++] = 0x80; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
 
+ 
     sc[off++] = 0x9C;
-    sc[off++] = 0x50;
-    sc[off++] = 0x51;
-    sc[off++] = 0x52;
-    sc[off++] = 0x53;
-    sc[off++] = 0x55;
-    sc[off++] = 0x56;
-    sc[off++] = 0x57;
+    sc[off++] = 0x50; sc[off++] = 0x51; sc[off++] = 0x52; sc[off++] = 0x53;
+    sc[off++] = 0x55; sc[off++] = 0x56; sc[off++] = 0x57;
     sc[off++] = 0x41; sc[off++] = 0x50;
     sc[off++] = 0x41; sc[off++] = 0x51;
     sc[off++] = 0x41; sc[off++] = 0x52;
@@ -1421,25 +1713,29 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
     sc[off++] = 0x41; sc[off++] = 0x56;
     sc[off++] = 0x41; sc[off++] = 0x57;
 
+
     sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xE5;
     sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xE4; sc[off++] = 0xF0;
 
     sc[off++] = 0x48; sc[off++] = 0xBF;
     memcpy(sc + off, &path_addr, 8); off += 8;
 
+
     sc[off++] = 0x48; sc[off++] = 0xBE;
     memcpy(sc + off, &dlopen_flags, 8); off += 8;
+
 
     sc[off++] = 0x48; sc[off++] = 0xB8;
     memcpy(sc + off, &dlopen_addr, 8); off += 8;
     sc[off++] = 0xFF; sc[off++] = 0xD0;
 
+  
     sc[off++] = 0x48; sc[off++] = 0xB9;
     memcpy(sc + off, &result_addr, 8); off += 8;
     sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x01;
 
+ 
     int spin_top = off;
-
     sc[off++] = 0x48; sc[off++] = 0xB9;
     memcpy(sc + off, &done_addr, 8); off += 8;
     sc[off++] = 0x48; sc[off++] = 0x8B; sc[off++] = 0x09;
@@ -1449,8 +1745,10 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
     int8_t spin_disp = static_cast<int8_t>(spin_top - (off + 2));
     sc[off++] = 0xEB; sc[off++] = static_cast<uint8_t>(spin_disp);
 
+ 
     sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xEC;
 
+ 
     sc[off++] = 0x41; sc[off++] = 0x5F;
     sc[off++] = 0x41; sc[off++] = 0x5E;
     sc[off++] = 0x41; sc[off++] = 0x5D;
@@ -1459,18 +1757,14 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
     sc[off++] = 0x41; sc[off++] = 0x5A;
     sc[off++] = 0x41; sc[off++] = 0x59;
     sc[off++] = 0x41; sc[off++] = 0x58;
-    sc[off++] = 0x5F;
-    sc[off++] = 0x5E;
-    sc[off++] = 0x5D;
-    sc[off++] = 0x5B;
-    sc[off++] = 0x5A;
-    sc[off++] = 0x59;
-    sc[off++] = 0x58;
-
+    sc[off++] = 0x5F; sc[off++] = 0x5E; sc[off++] = 0x5D; sc[off++] = 0x5B;
+    sc[off++] = 0x5A; sc[off++] = 0x59; sc[off++] = 0x58;
     sc[off++] = 0x9D;
+
 
     sc[off++] = 0x48; sc[off++] = 0x81; sc[off++] = 0xC4;
     sc[off++] = 0x80; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
+
 
     sc[off++] = 0xFF; sc[off++] = 0x25;
     sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
@@ -1482,18 +1776,22 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
         LOG_ERROR("Shellcode {} > {} bytes", off, shellcode_needed);
         kill(pid, SIGCONT);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
         return false;
     }
+
 
     if (!proc_mem_write(pid, cave.padding_start, sc, off)) {
         error_ = "Failed to write shellcode to cave";
         LOG_ERROR("{}", error_);
         kill(pid, SIGCONT);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
         return false;
     }
     LOG_DEBUG("Shellcode written: {} bytes at 0x{:X}", off, cave.padding_start);
 
+ 
     uint8_t trampoline[16];
     memset(trampoline, 0, sizeof(trampoline));
     int toff = 0;
@@ -1519,6 +1817,7 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
         kill(pid, SIGCONT);
         proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
         return false;
     }
 
@@ -1528,12 +1827,21 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
         kill(pid, SIGCONT);
         proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        cleanup_tracer();
         return false;
     }
     LOG_DEBUG("Trampoline: {} bytes at 0x{:X}", toff, ts.rip);
 
+    if (tracer_frozen) {
+        LOG_DEBUG("Thawing tracer PID {} before resuming target...", tracer);
+        thaw_tracer(tracer);
+        tracer_frozen = false;
+        usleep(20000);
+    }
+
     kill(pid, SIGCONT);
     LOG_DEBUG("Process resumed, waiting for dlopen...");
+
 
     bool completed = false;
     for (int i = 0; i < 100; i++) {
@@ -1555,15 +1863,23 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
     if (!completed) {
         error_ = "dlopen did not complete within timeout";
         LOG_ERROR("{}", error_);
+
+   
+        if (tracer > 0) tracer_frozen = freeze_tracer(tracer);
         kill(pid, SIGSTOP);
         usleep(50000);
         proc_mem_write(pid, ts.rip, orig_rip_code, sizeof(orig_rip_code));
         proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         kill(pid, SIGCONT);
-        return false;
+        if (tracer_frozen) thaw_tracer(tracer);
+
+        LOG_WARN("Freeze-tracer RIP injection failed, attempting inline hook fallback");
+        return inject_via_inline_hook(pid, lib_path, dlopen_addr, dlopen_flags);
     }
 
+
+    if (tracer > 0) tracer_frozen = freeze_tracer(tracer);
     kill(pid, SIGSTOP);
     usleep(50000);
 
@@ -1572,14 +1888,25 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
     uint64_t done_signal = 1;
     proc_mem_write(pid, done_addr, &done_signal, sizeof(done_signal));
 
+  
+    if (tracer_frozen) {
+        thaw_tracer(tracer);
+        tracer_frozen = false;
+        usleep(20000);
+    }
     kill(pid, SIGCONT);
-    usleep(100000);
+    usleep(200000);
 
+ 
+    if (tracer > 0) tracer_frozen = freeze_tracer(tracer);
     kill(pid, SIGSTOP);
     usleep(50000);
+
     proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
     proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+
     kill(pid, SIGCONT);
+    if (tracer_frozen) thaw_tracer(tracer);
 
     stop_elevated_helper();
     LOG_INFO("inject_via_procmem: complete, process restored");
@@ -1648,7 +1975,11 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     }
 
     LOG_INFO("Falling back to /proc/pid/mem injection path");
-    return inject_via_procmem(pid, target_path, dlopen_addr, flags);
+    if (inject_via_procmem(pid, target_path, dlopen_addr, flags))
+        return true;
+
+    LOG_WARN("All procmem strategies exhausted, attempting direct inline hook");
+    return inject_via_inline_hook(pid, target_path, dlopen_addr, flags);
 }
 
 bool Injection::inject_shellcode_ptrace(pid_t pid, const std::string& lib_path,
@@ -2177,6 +2508,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
