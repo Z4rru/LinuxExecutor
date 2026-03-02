@@ -28,6 +28,7 @@ static void plog(const char* fmt, ...) {
     FILE* f = fopen("/tmp/oss_payload.log", "a");
     if (f) {
         vfprintf(f, fmt, ap);
+        fflush(f);
         fclose(f);
     }
     va_end(ap);
@@ -69,15 +70,15 @@ static uintptr_t aob_scan(uintptr_t base, size_t size,
 }
 
 using lua_State = void;
-using fn_compile = char* (*)(const char*, size_t, void*, size_t*);
-using fn_load    = int   (*)(lua_State*, const char*, const char*, size_t, int);
-using fn_pcall   = int   (*)(lua_State*, int, int, int);
-using fn_resume  = int   (*)(lua_State*, lua_State*, int);
+using fn_compile   = char* (*)(const char*, size_t, void*, size_t*);
+using fn_load      = int   (*)(lua_State*, const char*, const char*, size_t, int);
+using fn_pcall     = int   (*)(lua_State*, int, int, int);
+using fn_resume    = int   (*)(lua_State*, lua_State*, int);
 using fn_newthread = lua_State* (*)(lua_State*);
-using fn_settop  = void  (*)(lua_State*, int);
+using fn_settop    = void  (*)(lua_State*, int);
 using fn_tolstring = const char* (*)(lua_State*, int, size_t*);
-using fn_gettop  = int   (*)(lua_State*);
-using fn_sandbox = void  (*)(lua_State*);
+using fn_gettop    = int   (*)(lua_State*);
+using fn_sandbox   = void  (*)(lua_State*);
 
 struct {
     uintptr_t     mod_base = 0;
@@ -133,13 +134,13 @@ static void drain_queue(lua_State* L) {
         } else if (G.compile) {
             compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
             if (!compiled || bc_sz == 0) {
-                plog( "[payload] compile fail\n");
+                plog("[payload] compile fail\n");
                 free(compiled);
                 continue;
             }
             bc_data = compiled;
         } else {
-            plog( "[payload] no compiler and received source, skipping %zu bytes\n", src.size());
+            plog("[payload] no compiler and source received (%zu bytes), skipping\n", src.size());
             continue;
         }
 
@@ -150,15 +151,18 @@ static void drain_queue(lua_State* L) {
         if (lr != 0) {
             size_t len = 0;
             const char* e = G.tolstring(th, -1, &len);
-            plog( "[payload] load: %.*s\n", (int)len, e);
+            plog("[payload] load error: %.*s\n", (int)len, e);
             G.settop(L, G.gettop(L) - 1);
             continue;
         }
+        plog("[payload] executing script (%zu bytes bc)...\n", bc_sz);
         int rr = G.original_resume(th, nullptr, 0);
         if (rr != 0 && rr != 1) {
             size_t len = 0;
             const char* e = G.tolstring(th, -1, &len);
-            plog( "[payload] run: %.*s\n", (int)len, e);
+            plog("[payload] run error: %.*s\n", (int)len, e);
+        } else {
+            plog("[payload] script executed OK (result=%d)\n", rr);
         }
         G.settop(L, G.gettop(L) - 1);
     }
@@ -168,12 +172,9 @@ static int resume_detour(lua_State* L, lua_State* from, int nargs) {
     int ret = G.original_resume(L, from, nargs);
     if (g_in) return ret;
     g_in = true;
-    if (!G.captured_L) {
-        G.captured_L = L;
-        plog( "[payload] captured lua_State %p\n", L);
-    }
+    G.captured_L = L;
     if (!G.queue.empty())
-        drain_queue(G.captured_L);
+        drain_queue(L);
     g_in = false;
     return ret;
 }
@@ -218,7 +219,10 @@ static size_t insn_len(const uint8_t* p) {
     if (p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA) return 4;
 
     size_t i = 0;
-    while (i < 4 && (p[i] == 0x66 || p[i] == 0x67 || p[i] == 0xF2 || p[i] == 0xF3))
+    while (i < 4 && (p[i] == 0x66 || p[i] == 0x67 || p[i] == 0xF2 ||
+                     p[i] == 0xF3 || p[i] == 0x26 || p[i] == 0x2E ||
+                     p[i] == 0x36 || p[i] == 0x3E || p[i] == 0x64 ||
+                     p[i] == 0x65))
         i++;
 
     bool rex_w = false;
@@ -231,27 +235,40 @@ static size_t insn_len(const uint8_t* p) {
 
     if ((op >= 0x50 && op <= 0x5F) || op == 0x90 || op == 0xC3 ||
         op == 0xCC || op == 0xC9 || op == 0x9C || op == 0x9D ||
-        op == 0xF4 || op == 0xCB)
+        op == 0xF4 || op == 0xCB || op == 0xF8 || op == 0xF9 ||
+        op == 0xFC || op == 0xFD || op == 0xF5 || op == 0x98 ||
+        op == 0x99 || op == 0x9E || op == 0x9F || op == 0xCE ||
+        op == 0xCF || (op >= 0x91 && op <= 0x97))
         return i;
+
     if (op == 0xC2) return i + 2;
     if (op >= 0xB0 && op <= 0xB7) return i + 1;
     if (op >= 0xB8 && op <= 0xBF) return i + (rex_w ? 8 : 4);
     if (op == 0xE8 || op == 0xE9) return i + 4;
-    if (op == 0xEB || (op >= 0x70 && op <= 0x7F)) return i + 1;
+    if (op == 0xEB || (op >= 0x70 && op <= 0x7F) || op == 0xE3) return i + 1;
     if (op == 0x68) return i + 4;
     if (op == 0x6A) return i + 1;
+
     if (op == 0x04 || op == 0x0C || op == 0x14 || op == 0x1C ||
         op == 0x24 || op == 0x2C || op == 0x34 || op == 0x3C || op == 0xA8)
         return i + 1;
     if (op == 0x05 || op == 0x0D || op == 0x15 || op == 0x1D ||
         op == 0x25 || op == 0x2D || op == 0x35 || op == 0x3D || op == 0xA9)
         return i + 4;
+
+    if (op >= 0xA0 && op <= 0xA3) return i + (rex_w ? 8 : 4);
+    if (op == 0xCD) return i + 1;
+    if (op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7) return i + 1;
+
     if (op == 0x80 || op == 0x82 || op == 0x83 || op == 0xC0 || op == 0xC1)
         return modrm_len(p, i) + 1;
-    if (op == 0x81 || op == 0xC7) return modrm_len(p, i) + 4;
+    if (op == 0x81)
+        return modrm_len(p, i) + 4;
+    if (op == 0xC7) return modrm_len(p, i) + 4;
     if (op == 0xC6) return modrm_len(p, i) + 1;
     if (op == 0x69) return modrm_len(p, i) + 4;
     if (op == 0x6B) return modrm_len(p, i) + 1;
+
     if (op == 0xF6) {
         uint8_t m = p[i];
         size_t r = modrm_len(p, i);
@@ -262,45 +279,225 @@ static size_t insn_len(const uint8_t* p) {
         size_t r = modrm_len(p, i);
         return ((m & 0x38) == 0) ? r + 4 : r;
     }
+
     if (op == 0x0F) {
         uint8_t op2 = p[i++];
         if (op2 >= 0x80 && op2 <= 0x8F) return i + 4;
+        if (op2 >= 0x90 && op2 <= 0x9F) return modrm_len(p, i);
+        if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF)
+            return modrm_len(p, i);
+        if (op2 == 0xAF) return modrm_len(p, i);
+        if (op2 >= 0x40 && op2 <= 0x4F) return modrm_len(p, i);
+        if (op2 == 0xBC || op2 == 0xBD || op2 == 0xB8)
+            return modrm_len(p, i);
+        if (op2 == 0xA3 || op2 == 0xAB || op2 == 0xB3 || op2 == 0xBB)
+            return modrm_len(p, i);
+        if (op2 == 0xBA) return modrm_len(p, i) + 1;
+        if (op2 == 0xA4 || op2 == 0xAC) return modrm_len(p, i) + 1;
+        if (op2 == 0xA5 || op2 == 0xAD) return modrm_len(p, i);
+        if (op2 == 0xB0 || op2 == 0xB1) return modrm_len(p, i);
+        if (op2 == 0xC0 || op2 == 0xC1) return modrm_len(p, i);
+        if (op2 == 0x1F) return modrm_len(p, i);
+        if (op2 == 0x18) return modrm_len(p, i);
+        if ((op2 >= 0x10 && op2 <= 0x17) || (op2 >= 0x28 && op2 <= 0x2F) ||
+            (op2 >= 0x50 && op2 <= 0x7F) || (op2 >= 0xC2 && op2 <= 0xC6) ||
+            (op2 >= 0xD0 && op2 <= 0xFF))
+            return modrm_len(p, i);
+        if (op2 == 0x05 || op2 == 0x07) return i;
+        if (op2 == 0x31) return i;
+        if (op2 == 0xA2) return i;
         return modrm_len(p, i);
     }
-    if ((op & 0xC4) == 0x00 || (op & 0xFE) == 0x84 || (op & 0xFC) == 0x88 ||
-        op == 0x8D || op == 0x63 || (op >= 0xD0 && op <= 0xD3) ||
-        op == 0xFE || op == 0xFF || op == 0x8F)
-        return modrm_len(p, i);
 
+    if (op == 0x86 || op == 0x87) return modrm_len(p, i);
+    if ((op & 0xC4) == 0x00)  return modrm_len(p, i);
+    if ((op & 0xFE) == 0x84)  return modrm_len(p, i);
+    if ((op & 0xFC) == 0x88 || op == 0x8C || op == 0x8E)
+        return modrm_len(p, i);
+    if (op == 0x8D) return modrm_len(p, i);
+    if (op == 0x63) return modrm_len(p, i);
+    if (op >= 0xD0 && op <= 0xD3) return modrm_len(p, i);
+    if (op == 0xFE || op == 0xFF) return modrm_len(p, i);
+    if (op == 0x8F) return modrm_len(p, i);
+
+    plog("[payload] insn_len: unknown opcode 0x%02X at offset %zu\n", op, i - 1);
     return 0;
+}
+
+static void relocate_rip_relative(uint8_t* tramp, size_t len,
+                                  uintptr_t orig_addr, uintptr_t tramp_addr) {
+    size_t off = 0;
+    while (off < len) {
+        size_t il = insn_len(tramp + off);
+        if (il == 0) break;
+
+        size_t ii = off;
+        while (ii < off + il && (tramp[ii] == 0x66 || tramp[ii] == 0x67 ||
+               tramp[ii] == 0xF2 || tramp[ii] == 0xF3 || tramp[ii] == 0x26 ||
+               tramp[ii] == 0x2E || tramp[ii] == 0x36 || tramp[ii] == 0x3E ||
+               tramp[ii] == 0x64 || tramp[ii] == 0x65))
+            ii++;
+        if (ii < off + il && tramp[ii] >= 0x40 && tramp[ii] <= 0x4F)
+            ii++;
+
+        uint8_t opc = (ii < off + il) ? tramp[ii] : 0;
+        size_t modrm_pos = 0;
+        bool has_modrm = false;
+
+        if (opc == 0xE8 || opc == 0xE9) {
+            size_t disp_off = ii + 1;
+            if (disp_off + 4 <= off + il) {
+                int32_t disp;
+                memcpy(&disp, tramp + disp_off, 4);
+                uintptr_t abs_target = orig_addr + off + il + (int64_t)disp;
+                int64_t new_disp = (int64_t)abs_target - (int64_t)(tramp_addr + off + il);
+                if (new_disp >= INT32_MIN && new_disp <= INT32_MAX) {
+                    int32_t nd = (int32_t)new_disp;
+                    memcpy(tramp + disp_off, &nd, 4);
+                } else {
+                    plog("[payload] WARN: cannot relocate call/jmp at tramp+%zu\n", off);
+                }
+            }
+            off += il;
+            continue;
+        }
+
+        if (opc == 0x0F) {
+            uint8_t op2 = (ii + 1 < off + il) ? tramp[ii + 1] : 0;
+            if (op2 >= 0x80 && op2 <= 0x8F) {
+                size_t disp_off = ii + 2;
+                if (disp_off + 4 <= off + il) {
+                    int32_t disp;
+                    memcpy(&disp, tramp + disp_off, 4);
+                    uintptr_t abs_target = orig_addr + off + il + (int64_t)disp;
+                    int64_t new_disp = (int64_t)abs_target - (int64_t)(tramp_addr + off + il);
+                    if (new_disp >= INT32_MIN && new_disp <= INT32_MAX) {
+                        int32_t nd = (int32_t)new_disp;
+                        memcpy(tramp + disp_off, &nd, 4);
+                    }
+                }
+                off += il;
+                continue;
+            }
+            modrm_pos = ii + 2;
+            has_modrm = (modrm_pos < off + il);
+        } else {
+            bool need_modrm = ((opc & 0xC4) == 0x00) || ((opc & 0xFE) == 0x84) ||
+                              ((opc & 0xFC) == 0x88) || opc == 0x8C || opc == 0x8E ||
+                              opc == 0x8D || opc == 0x63 ||
+                              (opc >= 0x80 && opc <= 0x83) || opc == 0xC7 || opc == 0xC6 ||
+                              opc == 0x69 || opc == 0x6B || opc == 0x86 || opc == 0x87 ||
+                              opc == 0xF6 || opc == 0xF7 || opc == 0xFE || opc == 0xFF ||
+                              opc == 0x8F || (opc >= 0xD0 && opc <= 0xD3) ||
+                              opc == 0xC0 || opc == 0xC1;
+            if (need_modrm) {
+                modrm_pos = ii + 1;
+                has_modrm = (modrm_pos < off + il);
+            }
+        }
+
+        if (has_modrm && modrm_pos < off + il) {
+            uint8_t modrm = tramp[modrm_pos];
+            uint8_t mod = (modrm >> 6) & 3;
+            uint8_t rm  = modrm & 7;
+            if (mod == 0 && rm == 5) {
+                size_t disp_off = modrm_pos + 1;
+                if (disp_off + 4 <= off + il) {
+                    int32_t disp;
+                    memcpy(&disp, tramp + disp_off, 4);
+                    uintptr_t abs_target = orig_addr + off + il + (int64_t)disp;
+                    int64_t new_disp = (int64_t)abs_target - (int64_t)(tramp_addr + off + il);
+                    if (new_disp >= INT32_MIN && new_disp <= INT32_MAX) {
+                        int32_t nd = (int32_t)new_disp;
+                        memcpy(tramp + disp_off, &nd, 4);
+                    } else {
+                        plog("[payload] WARN: RIP-rel reloc overflow at tramp+%zu\n", off);
+                    }
+                }
+            }
+        }
+        off += il;
+    }
 }
 
 static bool install_hook(uintptr_t target, void* detour, uint8_t*& tramp_out) {
     size_t total = 0;
     while (total < 5) {
         size_t il = insn_len((const uint8_t*)(target + total));
-        if (il == 0) return false;
+        if (il == 0) {
+            plog("[payload] hook: insn_len=0 at target+%zu (byte=0x%02X)\n",
+                 total, *(uint8_t*)(target + total));
+            return false;
+        }
         total += il;
-        if (total > MAX_STOLEN) return false;
+        if (total > MAX_STOLEN) {
+            plog("[payload] hook: stolen exceeds MAX_STOLEN (%zu)\n", total);
+            return false;
+        }
     }
+    plog("[payload] hook: stealing %zu bytes from %lx\n", total, target);
+
     uint8_t* tramp = alloc_near(target, total + 14);
-    if (!tramp) return false;
+    if (!tramp) {
+        plog("[payload] hook: alloc_near failed\n");
+        return false;
+    }
+
     memcpy(tramp, (void*)target, total);
+    relocate_rip_relative(tramp, total, target, (uintptr_t)tramp);
+
     tramp[total]     = 0xFF;
     tramp[total + 1] = 0x25;
     *(uint32_t*)(tramp + total + 2) = 0;
     *(uint64_t*)(tramp + total + 6) = target + total;
+
     tramp_out = tramp;
     G.original_resume = (fn_resume)tramp;
     memcpy(G.stolen, (void*)target, total);
     G.stolen_len = total;
     G.hook_addr  = target;
-    if (!make_rwx((void*)target, total)) return false;
-    int32_t rel = (int32_t)((uintptr_t)detour - (target + 5));
-    auto* code = (uint8_t*)target;
-    code[0] = 0xE9;
-    memcpy(code + 1, &rel, 4);
-    for (size_t i = 5; i < total; ++i) code[i] = 0x90;
+
+    if (!make_rwx((void*)target, total)) {
+        plog("[payload] hook: mprotect failed on target\n");
+        return false;
+    }
+
+    int64_t rel64 = (int64_t)((uintptr_t)detour - (target + 5));
+    if (rel64 >= INT32_MIN && rel64 <= INT32_MAX) {
+        int32_t rel = (int32_t)rel64;
+        auto* code = (uint8_t*)target;
+        code[0] = 0xE9;
+        memcpy(code + 1, &rel, 4);
+        for (size_t j = 5; j < total; ++j) code[j] = 0x90;
+        plog("[payload] hook: direct E9 jump installed (rel=%d)\n", rel);
+    } else {
+        plog("[payload] hook: detour too far (delta=%ld), using relay\n", (long)rel64);
+
+        uint8_t* relay = alloc_near(target, 14);
+        if (!relay) {
+            plog("[payload] hook: relay alloc failed\n");
+            memcpy((void*)target, G.stolen, G.stolen_len);
+            return false;
+        }
+        relay[0] = 0xFF;
+        relay[1] = 0x25;
+        *(uint32_t*)(relay + 2) = 0;
+        *(uint64_t*)(relay + 6) = (uintptr_t)detour;
+
+        int64_t relay_rel64 = (int64_t)((uintptr_t)relay - (target + 5));
+        if (relay_rel64 < INT32_MIN || relay_rel64 > INT32_MAX) {
+            plog("[payload] hook: even relay is too far, abort\n");
+            memcpy((void*)target, G.stolen, G.stolen_len);
+            return false;
+        }
+        int32_t relay_rel = (int32_t)relay_rel64;
+        auto* code = (uint8_t*)target;
+        code[0] = 0xE9;
+        memcpy(code + 1, &relay_rel, 4);
+        for (size_t j = 5; j < total; ++j) code[j] = 0x90;
+        plog("[payload] hook: relay jump installed at %p\n", relay);
+    }
+
     return true;
 }
 
@@ -308,6 +505,7 @@ static void restore_hook() {
     if (G.hook_addr && G.stolen_len) {
         make_rwx((void*)G.hook_addr, G.stolen_len);
         memcpy((void*)G.hook_addr, G.stolen, G.stolen_len);
+        plog("[payload] hook restored\n");
     }
 }
 
@@ -371,6 +569,8 @@ static bool find_module() {
         }
 
         if (!best_file.empty()) {
+            plog("[payload] best candidate module: %s (%zu MB)\n",
+                 best_file.c_str(), best_sz >> 20);
             std::ifstream maps3("/proc/self/maps");
             while (std::getline(maps3, line)) {
                 if (line.find(best_file) != std::string::npos) {
@@ -400,7 +600,7 @@ static bool find_module() {
     if (!found) return false;
     G.mod_base = lo;
     G.mod_size = hi - lo;
-    plog( "[payload] module %lx-%lx (%zu MB)\n", lo, hi, G.mod_size >> 20);
+    plog("[payload] module %lx-%lx (%zu MB)\n", lo, hi, G.mod_size >> 20);
     return true;
 }
 
@@ -560,6 +760,27 @@ static uintptr_t find_lea_xref(uintptr_t string_addr) {
             }
         }
     }
+    for (auto& r : regions) {
+        if (!r.r || !r.x) continue;
+        if (G.mod_base && (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size))
+            continue;
+        const uint8_t* code = (const uint8_t*)r.base;
+        for (size_t i = 0; i + 7 <= r.size; i++) {
+            if (code[i] == 0x8B && (code[i+1] & 0xC7) == 0x05) {
+                int32_t disp;
+                memcpy(&disp, code + i + 2, 4);
+                uintptr_t target = r.base + i + 6 + (uintptr_t)(intptr_t)disp;
+                if (target == string_addr) return r.base + i;
+            }
+            if (code[i] >= 0x40 && code[i] <= 0x4F &&
+                code[i+1] == 0x8B && (code[i+2] & 0xC7) == 0x05) {
+                int32_t disp;
+                memcpy(&disp, code + i + 3, 4);
+                uintptr_t target = r.base + i + 7 + (uintptr_t)(intptr_t)disp;
+                if (target == string_addr) return r.base + i;
+            }
+        }
+    }
     return 0;
 }
 
@@ -576,7 +797,16 @@ static uintptr_t walk_back_to_func(uintptr_t addr) {
         else if (p + 4 <= addr &&
                  c[0] == 0x55 && c[1] == 0x48 && c[2] == 0x89 && c[3] == 0xE5)
             candidate = true;
+        else if (p + 4 <= addr &&
+                 c[0] == 0xF3 && c[1] == 0x0F && c[2] == 0x1E && c[3] == 0xFA)
+            candidate = true;
         else if (c[0] == 0x55 && p > limit) {
+            uint8_t prev = *((const uint8_t*)(p - 1));
+            if (prev == 0xC3 || prev == 0xCC || prev == 0x90)
+                candidate = true;
+        }
+        else if (p + 4 <= addr && p > limit &&
+                 c[0] == 0x48 && c[1] == 0x83 && c[2] == 0xEC) {
             uint8_t prev = *((const uint8_t*)(p - 1));
             if (prev == 0xC3 || prev == 0xCC)
                 candidate = true;
@@ -612,6 +842,11 @@ static bool resolve_functions() {
     G.gettop    = (fn_gettop)dlsym(h, "lua_gettop");
     G.sandbox   = (fn_sandbox)dlsym(h, "luaL_sandboxthread");
 
+    plog("[payload] dlsym: compile=%p load=%p resume=%p newthread=%p "
+         "settop=%p tolstring=%p gettop=%p\n",
+         (void*)G.compile, (void*)G.load, (void*)G.resume,
+         (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
+
     if (G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop)
         return true;
 
@@ -632,9 +867,14 @@ static bool resolve_functions() {
         uintptr_t addr = find_elf_sym(s.name);
         if (addr) {
             *s.ptr = (void*)addr;
-            plog( "[payload] elf-sym: %s at %lx\n", s.name, addr);
+            plog("[payload] elf-sym: %s at %lx\n", s.name, addr);
         }
     }
+
+    plog("[payload] elf-sym: compile=%p load=%p resume=%p newthread=%p "
+         "settop=%p tolstring=%p gettop=%p\n",
+         (void*)G.compile, (void*)G.load, (void*)G.resume,
+         (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
 
     if (G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop)
         return true;
@@ -644,26 +884,80 @@ static bool resolve_functions() {
             "cannot resume dead coroutine",
             "cannot resume running coroutine",
             "attempt to yield across metamethod/C-call boundary",
+            "cannot resume non-suspended coroutine",
             nullptr
         };
         for (int i = 0; resume_strings[i] && !G.resume; i++) {
             size_t slen = strlen(resume_strings[i]);
             uintptr_t str_addr = scan_for_string(resume_strings[i], slen);
             if (!str_addr) continue;
-            plog( "[payload] found string '%s' at %lx\n", resume_strings[i], str_addr);
+            plog("[payload] found resume string '%s' at %lx\n", resume_strings[i], str_addr);
             uintptr_t xref = find_lea_xref(str_addr);
             if (!xref) continue;
-            plog( "[payload] xref at %lx\n", xref);
+            plog("[payload] xref at %lx\n", xref);
             uintptr_t func = walk_back_to_func(xref);
             if (func) {
                 G.resume = (fn_resume)func;
-                plog( "[payload] string-ref: lua_resume at %lx\n", func);
+                plog("[payload] string-ref: lua_resume at %lx\n", func);
+            }
+        }
+    }
+
+    if (!G.newthread) {
+        static const char* nt_strings[] = { "lua_newthread", nullptr };
+        for (int i = 0; nt_strings[i] && !G.newthread; i++) {
+            size_t slen = strlen(nt_strings[i]);
+            uintptr_t str_addr = scan_for_string(nt_strings[i], slen);
+            if (!str_addr) continue;
+            uintptr_t xref = find_lea_xref(str_addr);
+            if (!xref) continue;
+            uintptr_t func = walk_back_to_func(xref);
+            if (func) {
+                G.newthread = (fn_newthread)func;
+                plog("[payload] string-ref: lua_newthread at %lx\n", func);
+            }
+        }
+    }
+
+    if (!G.settop) {
+        const char* settop_str = "stack overflow";
+        size_t slen = strlen(settop_str);
+        uintptr_t str_addr = scan_for_string(settop_str, slen);
+        if (str_addr) {
+            uintptr_t xref = find_lea_xref(str_addr);
+            if (xref) {
+                uintptr_t func = walk_back_to_func(xref);
+                if (func) {
+                    G.settop = (fn_settop)func;
+                    plog("[payload] string-ref: lua_settop at %lx\n", func);
+                }
+            }
+        }
+    }
+
+    if (!G.load) {
+        static const char* load_strings[] = {
+            "bytecode version mismatch",
+            "truncated",
+            nullptr
+        };
+        for (int i = 0; load_strings[i] && !G.load; i++) {
+            size_t slen = strlen(load_strings[i]);
+            uintptr_t str_addr = scan_for_string(load_strings[i], slen);
+            if (!str_addr) continue;
+            uintptr_t xref = find_lea_xref(str_addr);
+            if (!xref) continue;
+            uintptr_t func = walk_back_to_func(xref);
+            if (func) {
+                G.load = (fn_load)func;
+                plog("[payload] string-ref: luau_load at %lx\n", func);
             }
         }
     }
 
     if (!G.resume && G.mod_base) {
-        static const uint8_t pat1[] = {0xF3, 0x0F, 0x1E, 0xFA, 0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56};
+        static const uint8_t pat1[] = {0xF3, 0x0F, 0x1E, 0xFA, 0x55, 0x48, 0x89, 0xE5,
+                                       0x41, 0x57, 0x41, 0x56};
         static const char mask1[]   = "xxxxxxxxxxxx";
         static const uint8_t pat2[] = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56};
         static const char mask2[]   = "xxxxxxxx";
@@ -671,21 +965,21 @@ static bool resolve_functions() {
         for (auto& r : regions) {
             if (!r.r || !r.x) continue;
             if (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size) continue;
-            if (!G.resume) {
-                uintptr_t a = aob_scan(r.base, r.size, pat1, mask1, sizeof(pat1));
-                if (!a) a = aob_scan(r.base, r.size, pat2, mask2, sizeof(pat2));
-                if (a) {
-                    G.resume = (fn_resume)a;
-                    plog( "[payload] aob: lua_resume at %lx\n", a);
-                }
+            uintptr_t a = aob_scan(r.base, r.size, pat1, mask1, sizeof(pat1));
+            if (!a) a = aob_scan(r.base, r.size, pat2, mask2, sizeof(pat2));
+            if (a) {
+                G.resume = (fn_resume)a;
+                plog("[payload] aob: lua_resume at %lx\n", a);
+                break;
             }
         }
     }
 
-    plog( "[payload] resolve: compile=%p load=%p resume=%p newthread=%p "
-            "settop=%p tolstring=%p gettop=%p\n",
-            (void*)G.compile, (void*)G.load, (void*)G.resume,
-            (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
+    plog("[payload] final: compile=%p load=%p resume=%p newthread=%p "
+         "settop=%p tolstring=%p gettop=%p sandbox=%p\n",
+         (void*)G.compile, (void*)G.load, (void*)G.resume,
+         (void*)G.newthread, (void*)G.settop, (void*)G.tolstring,
+         (void*)G.gettop, (void*)G.sandbox);
 
     return G.load && G.resume && G.newthread && G.settop && G.tolstring && G.gettop;
 }
@@ -700,74 +994,13 @@ static void write_status(const char* status) {
                 (void*)G.compile, (void*)G.load, (void*)G.resume,
                 (void*)G.newthread, (void*)G.settop, (void*)G.gettop,
                 (void*)G.tolstring, status);
+        fflush(f);
         fclose(f);
     }
 }
 
-static void try_direct_execute(const std::string& src) {
-    if (!G.captured_L) {
-        plog("[payload] direct-exec: no captured_L, cannot execute\n");
-        return;
-    }
-    if (!G.load || !G.newthread || !G.settop || !G.gettop || !G.tolstring) {
-        plog("[payload] direct-exec: missing functions\n");
-        return;
-    }
-    if (!G.original_resume) {
-        plog("[payload] direct-exec: no original_resume\n");
-        return;
-    }
-
-    const char* bc_data = nullptr;
-    size_t bc_sz = 0;
-    char* compiled = nullptr;
-
-    uint8_t first_byte = static_cast<uint8_t>(src[0]);
-    bool is_bytecode = (first_byte >= 1 && first_byte <= 6 && src.size() > 4);
-
-    if (is_bytecode) {
-        bc_data = src.data();
-        bc_sz = src.size();
-    } else if (G.compile) {
-        compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
-        if (!compiled || bc_sz == 0) {
-            plog("[payload] direct-exec: compile failed\n");
-            free(compiled);
-            return;
-        }
-        bc_data = compiled;
-    } else {
-        plog("[payload] direct-exec: no compiler, cannot run source\n");
-        return;
-    }
-
-    lua_State* th = G.newthread(G.captured_L);
-    set_identity(th);
-    int lr = G.load(th, "=oss", bc_data, bc_sz, 0);
-    free(compiled);
-    if (lr != 0) {
-        size_t len = 0;
-        const char* e = G.tolstring(th, -1, &len);
-        plog("[payload] direct-exec load error: %.*s\n", (int)len, e);
-        G.settop(G.captured_L, G.gettop(G.captured_L) - 1);
-        return;
-    }
-
-    fn_resume resume_fn = G.original_resume ? G.original_resume : G.resume;
-    int rr = resume_fn(th, nullptr, 0);
-    if (rr != 0 && rr != 1) {
-        size_t len = 0;
-        const char* e = G.tolstring(th, -1, &len);
-        plog("[payload] direct-exec run error: %.*s\n", (int)len, e);
-    } else {
-        plog("[payload] direct-exec: script executed successfully (result=%d)\n", rr);
-    }
-    G.settop(G.captured_L, G.gettop(G.captured_L) - 1);
-}
-
 static void* file_cmd_worker(void*) {
     plog("[payload] file-IPC watcher started\n");
-    int stale_count = 0;
 
     while (G.alive.load(std::memory_order_relaxed)) {
         struct stat st;
@@ -790,24 +1023,14 @@ static void* file_cmd_worker(void*) {
 
                         if (total > 0) {
                             std::string script(buf, (size_t)total);
-                            plog("[payload] file-IPC: read %zd bytes, hooked=%d captured_L=%p\n",
+                            plog("[payload] file-IPC: received %zd bytes, hooked=%d captured_L=%p\n",
                                  total, G.hooked.load() ? 1 : 0, G.captured_L);
-                            write_status("received");
-
-                          
-                            if (G.captured_L) {
-                                plog("[payload] file-IPC: attempting direct execution\n");
-                                try_direct_execute(script);
-                                write_status("executed_direct");
-                            } else {
-                                {
-                                    std::lock_guard<std::mutex> lk(G.mtx);
-                                    G.queue.emplace_back(std::move(script));
-                                }
-                                plog("[payload] file-IPC: queued (no captured_L yet)\n");
-                                write_status("queued");
-                                stale_count = 0;
+                            {
+                                std::lock_guard<std::mutex> lk(G.mtx);
+                                G.queue.emplace_back(std::move(script));
                             }
+                            plog("[payload] file-IPC: queued (queue size=%zu)\n", G.queue.size());
+                            write_status("queued");
                         }
                         free(buf);
                     } else {
@@ -820,33 +1043,18 @@ static void* file_cmd_worker(void*) {
             }
         }
 
-      
         {
-            std::deque<std::string> batch;
-            {
-                std::lock_guard<std::mutex> lk(G.mtx);
-                if (!G.queue.empty()) {
-                    stale_count++;
-                    if (stale_count == 40) {
-                        plog("[payload] WARNING: %zu scripts queued for 2s without drain. "
-                             "hooked=%d captured_L=%p\n",
-                             G.queue.size(), G.hooked.load() ? 1 : 0, G.captured_L);
-                        write_status("stale");
-                    }
-                    if (stale_count >= 60 && G.captured_L) {
-                        plog("[payload] attempting stale queue drain from file thread\n");
-                        batch.swap(G.queue);
-                        stale_count = 0;
-                    }
-                } else {
-                    stale_count = 0;
+            std::lock_guard<std::mutex> lk(G.mtx);
+            if (!G.queue.empty()) {
+                static int stale_ticks = 0;
+                stale_ticks++;
+                if (stale_ticks % 40 == 0) {
+                    plog("[payload] WARNING: %zu scripts queued for %ds without drain. "
+                         "hooked=%d captured_L=%p\n",
+                         G.queue.size(), stale_ticks / 20,
+                         G.hooked.load() ? 1 : 0, G.captured_L);
+                    write_status("stale");
                 }
-            }
-            for (auto& s : batch) {
-                try_direct_execute(s);
-            }
-            if (!batch.empty()) {
-                write_status("drained_fallback");
             }
         }
 
@@ -854,6 +1062,7 @@ static void* file_cmd_worker(void*) {
     }
     return nullptr;
 }
+
 static void* ipc_worker(void*) {
     int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sfd < 0) return nullptr;
@@ -862,16 +1071,16 @@ static void* ipc_worker(void*) {
     strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
     unlink(SOCK_PATH);
     if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        plog( "[payload] bind(%s) failed: %s\n", SOCK_PATH, strerror(errno));
+        plog("[payload] bind(%s) failed: %s\n", SOCK_PATH, strerror(errno));
         close(sfd);
         return nullptr;
     }
     if (listen(sfd, 4) < 0) {
-        plog( "[payload] listen failed: %s\n", strerror(errno));
+        plog("[payload] listen failed: %s\n", strerror(errno));
         close(sfd);
         return nullptr;
     }
-    plog( "[payload] ipc listening\n");
+    plog("[payload] ipc listening on %s\n", SOCK_PATH);
     auto* buf = (char*)malloc(RECV_BUF);
     if (!buf) { close(sfd); return nullptr; }
     while (G.alive.load(std::memory_order_relaxed)) {
@@ -888,8 +1097,7 @@ static void* ipc_worker(void*) {
         if (total > 0) {
             std::lock_guard<std::mutex> lk(G.mtx);
             G.queue.emplace_back(buf, total);
-            plog( "[payload] queued %zu bytes (hooked=%d captured_L=%p)\n",
-                    total, G.hooked.load() ? 1 : 0, G.captured_L);
+            plog("[payload] ipc: queued %zu bytes\n", total);
         }
     }
     free(buf);
@@ -901,9 +1109,9 @@ static void* ipc_worker(void*) {
 static void* init_worker(void*) {
     usleep(500000);
 
-    plog( "[payload] init_worker: resolving module...\n");
+    plog("[payload] init_worker: resolving module...\n");
     if (!find_module()) {
-        plog( "[payload] WARN: roblox module not found, retrying with relaxed scan...\n");
+        plog("[payload] WARN: module not found, relaxed scan...\n");
         auto regions = get_regions();
         uintptr_t lo = UINTPTR_MAX, hi = 0;
         for (auto& r : regions) {
@@ -915,95 +1123,94 @@ static void* init_worker(void*) {
         if (hi > lo) {
             G.mod_base = lo;
             G.mod_size = hi - lo;
-            plog( "[payload] fallback module range %lx-%lx (%zu MB)\n",
-                    lo, hi, G.mod_size >> 20);
+            plog("[payload] fallback module %lx-%lx (%zu MB)\n", lo, hi, G.mod_size >> 20);
         } else {
-            plog( "[payload] FATAL: no executable regions found\n");
+            plog("[payload] FATAL: no executable regions\n");
+            write_status("fatal_no_regions");
             return nullptr;
         }
     }
 
     bool resolved = false;
-    for (int attempt = 0; attempt < 5; attempt++) {
+    for (int attempt = 0; attempt < 10; attempt++) {
         if (resolve_functions()) {
             resolved = true;
             break;
         }
-        plog( "[payload] resolve attempt %d/5 failed, retrying...\n", attempt + 1);
+        plog("[payload] resolve attempt %d/10 failed, retrying...\n", attempt + 1);
+        write_status("resolving");
         usleep(1000000);
     }
 
     if (!resolved) {
-        plog( "[payload] FATAL: could not resolve luau functions after retries"
-                " (compile=%p load=%p resume=%p newthread=%p settop=%p tolstring=%p gettop=%p)\n",
-                (void*)G.compile, (void*)G.load, (void*)G.resume,
-                (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
+        plog("[payload] FATAL: could not resolve luau functions\n");
+        write_status("fatal_no_resolve");
         return nullptr;
     }
 
     if (!G.compile)
-        plog( "[payload] luau_compile not found, expecting pre-compiled bytecode\n");
+        plog("[payload] NOTE: luau_compile not found, expecting pre-compiled bytecode\n");
+
+    plog("[payload] installing hook on lua_resume at %lx...\n", (uintptr_t)G.resume);
 
     uint8_t* tramp = nullptr;
     if (!install_hook((uintptr_t)G.resume, (void*)resume_detour, tramp)) {
-        plog( "[payload] FATAL: hook install failed\n");
+        plog("[payload] FATAL: hook install failed\n");
+        write_status("fatal_hook_fail");
         return nullptr;
     }
     G.trampoline = tramp;
     G.hooked.store(true, std::memory_order_release);
-    plog( "[payload] armed — waiting for scripts\n");
+
+    plog("[payload] armed, waiting for scripts\n");
+    write_status("armed");
     return nullptr;
 }
 
 __attribute__((constructor))
 static void payload_init() {
-    
     unlink("/tmp/oss_payload.log");
     unlink("/tmp/oss_payload_status");
 
     plog("[payload] init pid %d\n", getpid());
 
- 
     FILE* marker = fopen(READY_PATH, "w");
     if (marker) {
         fprintf(marker, "%d\n", getpid());
+        fflush(marker);
         fclose(marker);
-        plog( "[payload] ready marker created at %s\n", READY_PATH);
+        plog("[payload] ready marker: %s\n", READY_PATH);
     } else {
-        plog( "[payload] WARN: cannot create ready marker: %s\n", strerror(errno));
+        plog("[payload] WARN: cannot create ready marker: %s\n", strerror(errno));
     }
 
     unlink(CMD_PATH);
 
     G.alive.store(true, std::memory_order_release);
-
+    write_status("initializing");
 
     pthread_t file_t;
-    if (pthread_create(&file_t, nullptr, file_cmd_worker, nullptr) == 0) {
+    if (pthread_create(&file_t, nullptr, file_cmd_worker, nullptr) == 0)
         pthread_detach(file_t);
-    } else {
-        plog( "[payload] WARN: file_cmd_worker thread failed\n");
-    }
-
+    else
+        plog("[payload] WARN: file_cmd_worker thread failed\n");
 
     pthread_t ipc_t;
-    if (pthread_create(&ipc_t, nullptr, ipc_worker, nullptr) == 0) {
+    if (pthread_create(&ipc_t, nullptr, ipc_worker, nullptr) == 0)
         pthread_detach(ipc_t);
-    } else {
-        plog( "[payload] WARN: ipc_worker thread failed\n");
-    }
+    else
+        plog("[payload] WARN: ipc_worker thread failed\n");
 
     pthread_t init_t;
-    if (pthread_create(&init_t, nullptr, init_worker, nullptr) == 0) {
+    if (pthread_create(&init_t, nullptr, init_worker, nullptr) == 0)
         pthread_detach(init_t);
-    } else {
-        plog( "[payload] WARN: init_worker thread failed\n");
-    }
+    else
+        plog("[payload] WARN: init_worker thread failed\n");
 }
 
 __attribute__((destructor))
 static void payload_fini() {
-    plog( "[payload] shutdown\n");
+    plog("[payload] shutdown\n");
     G.alive.store(false, std::memory_order_release);
     unlink(READY_PATH);
     unlink(CMD_PATH);
@@ -1020,4 +1227,5 @@ static void payload_fini() {
         close(fd);
     }
     usleep(50000);
+    write_status("shutdown");
 }
