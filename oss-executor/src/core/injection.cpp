@@ -2413,6 +2413,8 @@ bool Injection::inject() {
             } else {
                 LOG_WARN("Payload handshake timeout — library may still be initializing");
             }
+       
+            payload_loaded_ = true;
         } else {
             LOG_WARN("Library injection failed ({}), continuing with VM-scan mode", error_);
 
@@ -2479,7 +2481,6 @@ bool Injection::verify_payload_alive() {
         }
     }
     if (!mapped) {
-        payload_loaded_ = false;
         return false;
     }
 
@@ -2498,7 +2499,6 @@ bool Injection::verify_payload_alive() {
 
     if (!reachable) {
         LOG_WARN("Payload mapped but socket unreachable at {}", sock);
-        payload_loaded_ = false;
     }
     return reachable;
 }
@@ -2625,6 +2625,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
