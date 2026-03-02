@@ -27,6 +27,7 @@
 #include <luacode.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/stat.h>
 
 namespace fs = std::filesystem;
 
@@ -2484,27 +2485,20 @@ bool Injection::verify_payload_alive() {
         return false;
     }
 
-    std::string sock_path = PAYLOAD_SOCK;
+       
+    std::string prefix;
     if (proc_info_.via_flatpak || proc_info_.via_sober) {
         pid_t pid = memory_.get_pid();
         if (pid > 0)
-            sock_path = "/proc/" + std::to_string(pid) + "/root" + PAYLOAD_SOCK;
+            prefix = "/proc/" + std::to_string(pid) + "/root";
     }
 
-    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
-    struct timeval tv{};
-    tv.tv_usec = 500000;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    bool reachable = (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
-                                sizeof(addr)) == 0);
-    ::close(fd);
+    std::string ready_path = prefix + "/tmp/oss_payload_ready";
+    struct stat st;
+    bool reachable = (::stat(ready_path.c_str(), &st) == 0);
 
     if (!reachable) {
-        LOG_WARN("Payload mapped but socket unreachable at {}", sock_path);
+        LOG_WARN("Payload mapped but ready marker not found at {}", ready_path);
     }
     return reachable;
 }
@@ -2636,6 +2630,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
