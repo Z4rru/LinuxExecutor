@@ -701,7 +701,8 @@ static void* ipc_worker(void*) {
         if (total > 0) {
             std::lock_guard<std::mutex> lk(G.mtx);
             G.queue.emplace_back(buf, total);
-            fprintf(stderr, "[payload] queued %zu bytes\n", total);
+            fprintf(stderr, "[payload] queued %zu bytes (hooked=%d captured_L=%p)\n",
+                    total, G.hooked.load() ? 1 : 0, G.captured_L);
         }
     }
     free(buf);
@@ -709,34 +710,75 @@ static void* ipc_worker(void*) {
     return nullptr;
 }
 
-__attribute__((constructor))
-static void payload_init() {
-    fprintf(stderr, "[payload] init pid %d\n", getpid());
+static void* init_worker(void*) {
+    usleep(500000);
+
+    fprintf(stderr, "[payload] init_worker: resolving module...\n");
     if (!find_module()) {
-        fprintf(stderr, "[payload] FATAL: roblox module not found\n");
-        return;
+        fprintf(stderr, "[payload] WARN: roblox module not found, retrying with relaxed scan...\n");
+        auto regions = get_regions();
+        uintptr_t lo = UINTPTR_MAX, hi = 0;
+        for (auto& r : regions) {
+            if (!r.r || !r.x) continue;
+            if (r.size < 0x10000) continue;
+            if (r.base < lo) lo = r.base;
+            if (r.base + r.size > hi) hi = r.base + r.size;
+        }
+        if (hi > lo) {
+            G.mod_base = lo;
+            G.mod_size = hi - lo;
+            fprintf(stderr, "[payload] fallback module range %lx-%lx (%zu MB)\n",
+                    lo, hi, G.mod_size >> 20);
+        } else {
+            fprintf(stderr, "[payload] FATAL: no executable regions found\n");
+            return nullptr;
+        }
     }
-    if (!resolve_functions()) {
-        fprintf(stderr, "[payload] FATAL: could not resolve luau functions"
+
+    bool resolved = false;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (resolve_functions()) {
+            resolved = true;
+            break;
+        }
+        fprintf(stderr, "[payload] resolve attempt %d/5 failed, retrying...\n", attempt + 1);
+        usleep(1000000);
+    }
+
+    if (!resolved) {
+        fprintf(stderr, "[payload] FATAL: could not resolve luau functions after retries"
                 " (compile=%p load=%p resume=%p newthread=%p settop=%p tolstring=%p gettop=%p)\n",
                 (void*)G.compile, (void*)G.load, (void*)G.resume,
                 (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
-        return;
+        return nullptr;
     }
+
     if (!G.compile)
         fprintf(stderr, "[payload] luau_compile not found, expecting pre-compiled bytecode\n");
-    G.alive.store(true, std::memory_order_release);
-    pthread_t t;
-    pthread_create(&t, nullptr, ipc_worker, nullptr);
-    pthread_detach(t);
+
     uint8_t* tramp = nullptr;
     if (!install_hook((uintptr_t)G.resume, (void*)resume_detour, tramp)) {
         fprintf(stderr, "[payload] FATAL: hook install failed\n");
-        return;
+        return nullptr;
     }
     G.trampoline = tramp;
     G.hooked.store(true, std::memory_order_release);
     fprintf(stderr, "[payload] armed — waiting for scripts\n");
+    return nullptr;
+}
+
+__attribute__((constructor))
+static void payload_init() {
+    fprintf(stderr, "[payload] init pid %d\n", getpid());
+
+    G.alive.store(true, std::memory_order_release);
+    pthread_t ipc_t;
+    pthread_create(&ipc_t, nullptr, ipc_worker, nullptr);
+    pthread_detach(ipc_t);
+
+    pthread_t init_t;
+    pthread_create(&init_t, nullptr, init_worker, nullptr);
+    pthread_detach(init_t);
 }
 
 __attribute__((destructor))
