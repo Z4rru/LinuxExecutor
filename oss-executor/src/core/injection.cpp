@@ -1134,173 +1134,113 @@ bool Injection::proc_mem_read(pid_t pid, uintptr_t addr,
 }
 
 bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
-                                    uintptr_t dlopen_addr) {
-    LOG_INFO("Attempting /proc/pid/mem injection (ptrace-free) for PID {}", pid);
+                                    uintptr_t dlopen_addr, uint64_t dlopen_flags) {
+    LOG_INFO("inject_via_procmem: PID {} lib={}", pid, lib_path);
 
-    pid_t tracer = get_tracer_pid(pid);
-    if (tracer > 0) {
-        LOG_WARN("PID {} is already traced by PID {} — may affect injection", pid, tracer);
-    }
 
     std::string mem_path = "/proc/" + std::to_string(pid) + "/mem";
-    int test_fd = open(mem_path.c_str(), O_RDWR);
-    if (test_fd < 0) {
-        LOG_ERROR("Cannot open {} for writing: {}", mem_path, strerror(errno));
-        return false;
+    {
+        int test_fd = open(mem_path.c_str(), O_RDWR);
+        if (test_fd < 0) {
+            error_ = "Cannot open " + mem_path + " for writing: " + strerror(errno);
+            LOG_ERROR("{}", error_);
+            return false;
+        }
+        close(test_fd);
     }
-    close(test_fd);
     LOG_DEBUG("Confirmed /proc/pid/mem is writable");
+
+    pid_t tracer = get_tracer_pid(pid);
+    if (tracer > 0)
+        LOG_WARN("PID {} is already traced by PID {} — may affect injection", pid, tracer);
 
     auto regions = memory_.get_regions();
     if (regions.empty()) {
-        LOG_ERROR("No memory regions available");
+        error_ = "No memory regions available";
+        LOG_ERROR("{}", error_);
         return false;
     }
 
+  
     uintptr_t data_addr = 0;
     for (const auto& r : regions) {
         if (!r.writable() || !r.readable()) continue;
         if (r.size() < 4096) continue;
         if (r.path.find("[stack") != std::string::npos) continue;
-        if (r.path.find("[vvar") != std::string::npos) continue;
-        if (r.path.find("[vdso") != std::string::npos) continue;
+        if (r.path.find("[vvar")  != std::string::npos) continue;
+        if (r.path.find("[vdso")  != std::string::npos) continue;
         data_addr = r.end - 4096;
-        LOG_DEBUG("Using data region at 0x{:X} from '{}'", data_addr,
+        LOG_DEBUG("Data region at 0x{:X} from '{}'", data_addr,
                   r.path.empty() ? "[anon]" : r.path);
         break;
     }
     if (data_addr == 0) {
-        LOG_ERROR("No suitable writable region found");
+        error_ = "No suitable writable region found";
+        LOG_ERROR("{}", error_);
         return false;
     }
+
 
     uint8_t orig_data[4096];
     if (!proc_mem_read(pid, data_addr, orig_data, sizeof(orig_data))) {
-        LOG_ERROR("Failed to save original data region");
+        error_ = "Failed to save original data region";
+        LOG_ERROR("{}", error_);
         return false;
     }
 
-    size_t path_offset = 0;
-    memset(orig_data + path_offset, 0, lib_path.size() + 1);
+ 
+    uintptr_t path_addr   = data_addr;
+    uintptr_t result_addr = data_addr + 512;
+    uintptr_t done_addr   = data_addr + 520;
+
 
     uint8_t path_buf[512] = {};
     size_t path_len = std::min(lib_path.size(), sizeof(path_buf) - 1);
     memcpy(path_buf, lib_path.c_str(), path_len);
     if (!proc_mem_write(pid, data_addr, path_buf, path_len + 1)) {
-        LOG_ERROR("Failed to write library path to data region");
+        error_ = "Failed to write library path to target";
+        LOG_ERROR("{}", error_);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
     }
 
-    size_t flag_offset = 512;
-    uintptr_t flag_addr = data_addr + flag_offset;
+
     uint64_t zero = 0;
-    proc_mem_write(pid, flag_addr, &zero, sizeof(zero));
+    proc_mem_write(pid, result_addr, &zero, sizeof(zero));
+    proc_mem_write(pid, done_addr,   &zero, sizeof(zero));
+
 
     size_t shellcode_needed = 256;
     ExeRegionInfo cave;
     if (!find_code_cave(pid, regions, shellcode_needed, cave)) {
-        LOG_ERROR("No suitable code cave found for shellcode");
+        error_ = "No suitable code cave found for shellcode";
+        LOG_ERROR("{}", error_);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
     }
-    LOG_DEBUG("Code cave at 0x{:X} ({} bytes available)", cave.padding_start, cave.padding_size);
+    LOG_DEBUG("Code cave at 0x{:X} ({} bytes)", cave.padding_start, cave.padding_size);
 
+   
     uint8_t orig_cave[256];
     if (!proc_mem_read(pid, cave.padding_start, orig_cave, shellcode_needed)) {
-        LOG_ERROR("Failed to save original code cave bytes");
+        error_ = "Failed to save code cave bytes";
+        LOG_ERROR("{}", error_);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
     }
 
-    uintptr_t path_addr = data_addr;
-
-    uint8_t sc[256];
-    int off = 0;
-
-    sc[off++] = 0x50;
-    sc[off++] = 0x51;
-    sc[off++] = 0x52;
-    sc[off++] = 0x53;
-    sc[off++] = 0x56;
-    sc[off++] = 0x57;
-    sc[off++] = 0x41; sc[off++] = 0x50;
-    sc[off++] = 0x41; sc[off++] = 0x51;
-    sc[off++] = 0x41; sc[off++] = 0x52;
-    sc[off++] = 0x41; sc[off++] = 0x53;
-    sc[off++] = 0x41; sc[off++] = 0x54;
-    sc[off++] = 0x41; sc[off++] = 0x55;
-    sc[off++] = 0x41; sc[off++] = 0x56;
-    sc[off++] = 0x41; sc[off++] = 0x57;
-
-    sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xE4; sc[off++] = 0xF0;
-
-    sc[off++] = 0x48; sc[off++] = 0xBF;
-    memcpy(sc + off, &path_addr, 8); off += 8;
-
-    uint64_t dlopen_flags = 0x00000002ULL;
-    sc[off++] = 0x48; sc[off++] = 0xBE;
-    memcpy(sc + off, &dlopen_flags, 8); off += 8;
-
-    sc[off++] = 0x48; sc[off++] = 0xB8;
-    memcpy(sc + off, &dlopen_addr, 8); off += 8;
-
-    sc[off++] = 0xFF; sc[off++] = 0xD0;
-
-    sc[off++] = 0x48; sc[off++] = 0xB9;
-    memcpy(sc + off, &flag_addr, 8); off += 8;
-    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x01;
-
-    int loop_top = off;
-    sc[off++] = 0x48; sc[off++] = 0xB9;
-    memcpy(sc + off, &flag_addr, 8); off += 8;
-    sc[off++] = 0x48; sc[off++] = 0x8B; sc[off++] = 0x09;
-    sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xF9; sc[off++] = 0x01;
-    sc[off++] = 0x74; sc[off++] = 0x06;
-    sc[off++] = 0xF3; sc[off++] = 0x90;
-    int8_t jmp_back = static_cast<int8_t>(loop_top - (off + 2));
-    sc[off++] = 0xEB; sc[off++] = static_cast<uint8_t>(jmp_back);
-
-    sc[off++] = 0x41; sc[off++] = 0x5F;
-    sc[off++] = 0x41; sc[off++] = 0x5E;
-    sc[off++] = 0x41; sc[off++] = 0x5D;
-    sc[off++] = 0x41; sc[off++] = 0x5C;
-    sc[off++] = 0x41; sc[off++] = 0x5B;
-    sc[off++] = 0x41; sc[off++] = 0x5A;
-    sc[off++] = 0x41; sc[off++] = 0x59;
-    sc[off++] = 0x41; sc[off++] = 0x58;
-    sc[off++] = 0x5F;
-    sc[off++] = 0x5E;
-    sc[off++] = 0x5B;
-    sc[off++] = 0x5A;
-    sc[off++] = 0x59;
-    sc[off++] = 0x58;
-    sc[off++] = 0xC3;
-
-    if (static_cast<size_t>(off) > shellcode_needed) {
-        LOG_ERROR("Shellcode too large: {} > {}", off, shellcode_needed);
-        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
-        return false;
-    }
-
-    if (!proc_mem_write(pid, cave.padding_start, sc, off)) {
-        LOG_ERROR("Failed to write shellcode to code cave");
-        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
-        return false;
-    }
-    LOG_DEBUG("Shellcode written: {} bytes at 0x{:X}", off, cave.padding_start);
 
     if (kill(pid, SIGSTOP) != 0) {
-        LOG_ERROR("SIGSTOP failed: {}", strerror(errno));
-        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+        error_ = std::string("SIGSTOP failed: ") + strerror(errno);
+        LOG_ERROR("{}", error_);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
     }
-    usleep(50000);
 
-    std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
     bool stopped = false;
     for (int i = 0; i < 20; i++) {
-        std::ifstream sf(stat_path);
+        usleep(10000);
+        std::ifstream sf("/proc/" + std::to_string(pid) + "/stat");
         std::string sline;
         std::getline(sf, sline);
         auto ce = sline.rfind(')');
@@ -1308,160 +1248,221 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
             char state = sline[ce + 2];
             if (state == 'T' || state == 't') { stopped = true; break; }
         }
-        usleep(10000);
     }
-
     if (!stopped) {
-        LOG_ERROR("Process did not stop after SIGSTOP");
+        error_ = "Process did not stop after SIGSTOP";
+        LOG_ERROR("{}", error_);
         kill(pid, SIGCONT);
-        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
     }
 
+  
     pid_t tid = pick_injectable_thread(pid);
     ThreadState ts;
     if (!get_thread_state(pid, tid, ts)) {
-        LOG_ERROR("Cannot read thread state for TID {}", tid);
+        error_ = "Cannot read thread state for TID " + std::to_string(tid);
+        LOG_ERROR("{}", error_);
         kill(pid, SIGCONT);
-        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
     }
     LOG_DEBUG("Thread {} state: RIP=0x{:X} RSP=0x{:X}", tid, ts.rip, ts.rsp);
 
+
     uint8_t orig_rip_code[16];
     if (!proc_mem_read(pid, ts.rip, orig_rip_code, sizeof(orig_rip_code))) {
-        LOG_ERROR("Failed to read original code at RIP 0x{:X}", ts.rip);
+        error_ = "Failed to read code at RIP";
+        LOG_ERROR("Failed to read code at RIP 0x{:X}", ts.rip);
         kill(pid, SIGCONT);
-        proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
     }
 
-    uint8_t trampoline[16];
-    int toff = 0;
-    trampoline[toff++] = 0x48; trampoline[toff++] = 0xB8;
-    memcpy(trampoline + toff, &cave.padding_start, 8); toff += 8;
 
     uintptr_t return_addr = ts.rip;
-    uintptr_t new_rsp = ts.rsp - 128;
+    uint8_t sc[256];
+    memset(sc, 0, sizeof(sc));
+    int off = 0;
 
-    uint8_t stack_setup[32];
-    int soff = 0;
-    stack_setup[soff++] = 0x48; stack_setup[soff++] = 0x81;
-    stack_setup[soff++] = 0xEC;
-    uint32_t sub_val = 128;
-    memcpy(stack_setup + soff, &sub_val, 4); soff += 4;
-    stack_setup[soff++] = 0x48; stack_setup[soff++] = 0xB9;
-    memcpy(stack_setup + soff, &return_addr, 8); soff += 8;
-    stack_setup[soff++] = 0x51;
+ 
+    sc[off++] = 0x48; sc[off++] = 0x81; sc[off++] = 0xEC;
+    sc[off++] = 0x80; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
 
-    (void)new_rsp;
-    (void)stack_setup;
-    (void)soff;
 
-    trampoline[toff++] = 0x50;
+    sc[off++] = 0x9C; 
 
-    trampoline[toff++] = 0x48; trampoline[toff++] = 0xB8;
-    uintptr_t cave_addr = cave.padding_start;
-    memcpy(trampoline + toff, &cave_addr, 8); toff += 8;
+    sc[off++] = 0x50;                   // push rax
+    sc[off++] = 0x51;                   // push rcx
+    sc[off++] = 0x52;                   // push rdx
+    sc[off++] = 0x53;                   // push rbx
+    sc[off++] = 0x55;                   // push rbp
+    sc[off++] = 0x56;                   // push rsi
+    sc[off++] = 0x57;                   // push rdi
+    sc[off++] = 0x41; sc[off++] = 0x50; // push r8
+    sc[off++] = 0x41; sc[off++] = 0x51; // push r9
+    sc[off++] = 0x41; sc[off++] = 0x52; // push r10
+    sc[off++] = 0x41; sc[off++] = 0x53; // push r11
+    sc[off++] = 0x41; sc[off++] = 0x54; // push r12
+    sc[off++] = 0x41; sc[off++] = 0x55; // push r13
+    sc[off++] = 0x41; sc[off++] = 0x56; // push r14
+    sc[off++] = 0x41; sc[off++] = 0x57; // push r15
 
-    toff = 0;
 
-    trampoline[toff++] = 0x68;
-    uint32_t ret_lo = static_cast<uint32_t>(return_addr & 0xFFFFFFFF);
-    memcpy(trampoline + toff, &ret_lo, 4); toff += 4;
+    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xE5;
 
-    if ((return_addr >> 32) != 0) {
-        trampoline[toff++] = 0xC7; trampoline[toff++] = 0x44;
-        trampoline[toff++] = 0x24; trampoline[toff++] = 0x04;
-        uint32_t ret_hi = static_cast<uint32_t>(return_addr >> 32);
-        memcpy(trampoline + toff, &ret_hi, 4); toff += 4;
+
+    sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xE4; sc[off++] = 0xF0;
+
+   
+    sc[off++] = 0x48; sc[off++] = 0xBF;
+    memcpy(sc + off, &path_addr, 8); off += 8;
+
+    sc[off++] = 0x48; sc[off++] = 0xBE;
+    memcpy(sc + off, &dlopen_flags, 8); off += 8;
+
+ 
+    sc[off++] = 0x48; sc[off++] = 0xB8;
+    memcpy(sc + off, &dlopen_addr, 8); off += 8;
+    sc[off++] = 0xFF; sc[off++] = 0xD0;
+
+    sc[off++] = 0x48; sc[off++] = 0xB9;
+    memcpy(sc + off, &result_addr, 8); off += 8;
+    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x01;
+
+  
+    int spin_top = off;
+ 
+    sc[off++] = 0x48; sc[off++] = 0xB9;
+    memcpy(sc + off, &done_addr, 8); off += 8;
+
+    sc[off++] = 0x48; sc[off++] = 0x8B; sc[off++] = 0x09;
+
+    sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xF9; sc[off++] = 0x01;
+    
+    sc[off++] = 0x74; sc[off++] = 0x04;
+  
+    sc[off++] = 0xF3; sc[off++] = 0x90;
+  
+    int8_t spin_disp = static_cast<int8_t>(spin_top - (off + 2));
+    sc[off++] = 0xEB; sc[off++] = static_cast<uint8_t>(spin_disp);
+  
+
+   
+    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xEC;
+
+
+    sc[off++] = 0x41; sc[off++] = 0x5F; // pop r15
+    sc[off++] = 0x41; sc[off++] = 0x5E; // pop r14
+    sc[off++] = 0x41; sc[off++] = 0x5D; // pop r13
+    sc[off++] = 0x41; sc[off++] = 0x5C; // pop r12
+    sc[off++] = 0x41; sc[off++] = 0x5B; // pop r11
+    sc[off++] = 0x41; sc[off++] = 0x5A; // pop r10
+    sc[off++] = 0x41; sc[off++] = 0x59; // pop r9
+    sc[off++] = 0x41; sc[off++] = 0x58; // pop r8
+    sc[off++] = 0x5F;                   // pop rdi
+    sc[off++] = 0x5E;                   // pop rsi
+    sc[off++] = 0x5D;                   // pop rbp
+    sc[off++] = 0x5B;                   // pop rbx
+    sc[off++] = 0x5A;                   // pop rdx
+    sc[off++] = 0x59;                   // pop rcx
+    sc[off++] = 0x58;                   // pop rax
+
+
+    sc[off++] = 0x9D; 
+
+    sc[off++] = 0x48; sc[off++] = 0x81; sc[off++] = 0xC4;
+    sc[off++] = 0x80; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
+
+
+    sc[off++] = 0xFF; sc[off++] = 0x25;
+    sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
+    memcpy(sc + off, &return_addr, 8); off += 8;
+
+    LOG_DEBUG("Shellcode size: {} bytes (limit {})", off, shellcode_needed);
+    if (off > static_cast<int>(shellcode_needed)) {
+        error_ = "Shellcode too large";
+        LOG_ERROR("Shellcode {} > {} bytes", off, shellcode_needed);
+        kill(pid, SIGCONT);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
     }
 
-    trampoline[toff++] = 0xE9;
-    int32_t rel32 = static_cast<int32_t>(
-        static_cast<int64_t>(cave.padding_start) -
-        static_cast<int64_t>(ts.rip + toff + 4));
-    memcpy(trampoline + toff, &rel32, 4); toff += 4;
-
-    bool use_rel_jmp = true;
-    int64_t displacement = static_cast<int64_t>(cave.padding_start) -
-                           static_cast<int64_t>(ts.rip + 5);
-    if (displacement < INT32_MIN || displacement > INT32_MAX) {
-        use_rel_jmp = false;
+    if (!proc_mem_write(pid, cave.padding_start, sc, off)) {
+        error_ = "Failed to write shellcode to cave";
+        LOG_ERROR("{}", error_);
+        kill(pid, SIGCONT);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        return false;
     }
+    LOG_DEBUG("Shellcode written: {} bytes at 0x{:X}", off, cave.padding_start);
 
-    toff = 0;
+
+    uint8_t trampoline[16];
     memset(trampoline, 0, sizeof(trampoline));
+    int toff = 0;
 
-    if (use_rel_jmp) {
-        trampoline[toff++] = 0x68;
-        memcpy(trampoline + toff, &ret_lo, 4); toff += 4;
-        if ((return_addr >> 32) != 0) {
-            trampoline[toff++] = 0xC7; trampoline[toff++] = 0x44;
-            trampoline[toff++] = 0x24; trampoline[toff++] = 0x04;
-            uint32_t ret_hi = static_cast<uint32_t>(return_addr >> 32);
-            memcpy(trampoline + toff, &ret_hi, 4); toff += 4;
-        }
+    int64_t jmp_disp = static_cast<int64_t>(cave.padding_start) -
+                       static_cast<int64_t>(ts.rip + 5);
+
+    if (jmp_disp >= INT32_MIN && jmp_disp <= INT32_MAX) {
+    
         trampoline[toff++] = 0xE9;
-        rel32 = static_cast<int32_t>(
-            static_cast<int64_t>(cave.padding_start) -
-            static_cast<int64_t>(ts.rip + toff + 4));
+        int32_t rel32 = static_cast<int32_t>(jmp_disp);
         memcpy(trampoline + toff, &rel32, 4); toff += 4;
     } else {
-        trampoline[toff++] = 0x68;
-        memcpy(trampoline + toff, &ret_lo, 4); toff += 4;
-        if ((return_addr >> 32) != 0) {
-            trampoline[toff++] = 0xC7; trampoline[toff++] = 0x44;
-            trampoline[toff++] = 0x24; trampoline[toff++] = 0x04;
-            uint32_t ret_hi = static_cast<uint32_t>(return_addr >> 32);
-            memcpy(trampoline + toff, &ret_hi, 4); toff += 4;
-        }
+      
         trampoline[toff++] = 0xFF; trampoline[toff++] = 0x25;
-        uint32_t z = 0;
-        memcpy(trampoline + toff, &z, 4); toff += 4;
+        trampoline[toff++] = 0x00; trampoline[toff++] = 0x00;
+        trampoline[toff++] = 0x00; trampoline[toff++] = 0x00;
+        uintptr_t cave_addr = cave.padding_start;
         memcpy(trampoline + toff, &cave_addr, 8); toff += 8;
     }
 
     if (toff > static_cast<int>(sizeof(orig_rip_code))) {
-        LOG_ERROR("Trampoline too large: {} bytes", toff);
+        error_ = "Trampoline too large: " + std::to_string(toff) + " bytes";
+        LOG_ERROR("{}", error_);
         kill(pid, SIGCONT);
         proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
     }
+
 
     if (!proc_mem_write(pid, ts.rip, trampoline, toff)) {
-        LOG_ERROR("Failed to write trampoline at RIP 0x{:X}", ts.rip);
+        error_ = "Failed to write trampoline";
+        LOG_ERROR("Failed to write trampoline at 0x{:X}", ts.rip);
         kill(pid, SIGCONT);
         proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
     }
-    LOG_DEBUG("Trampoline written: {} bytes at 0x{:X}", toff, ts.rip);
+    LOG_DEBUG("Trampoline: {} bytes at 0x{:X}", toff, ts.rip);
+
 
     kill(pid, SIGCONT);
-    LOG_DEBUG("Process resumed, waiting for dlopen completion...");
+    LOG_DEBUG("Process resumed, waiting for dlopen...");
 
     bool completed = false;
     for (int i = 0; i < 100; i++) {
         usleep(50000);
-        uint64_t flag_val = 0;
-        if (proc_mem_read(pid, flag_addr, &flag_val, sizeof(flag_val)) && flag_val != 0) {
-            LOG_INFO("dlopen completed, handle=0x{:X}", flag_val);
+        uint64_t result_val = 0;
+        if (proc_mem_read(pid, result_addr, &result_val, sizeof(result_val)) &&
+            result_val != 0) {
+            LOG_INFO("dlopen completed, handle=0x{:X}", result_val);
             completed = true;
             break;
         }
         if (kill(pid, 0) != 0) {
-            LOG_ERROR("Process died during injection");
+            error_ = "Process died during injection";
+            LOG_ERROR("{}", error_);
             return false;
         }
     }
 
     if (!completed) {
-        LOG_ERROR("dlopen did not complete within timeout");
+        error_ = "dlopen did not complete within timeout";
+        LOG_ERROR("{}", error_);
         kill(pid, SIGSTOP);
         usleep(50000);
         proc_mem_write(pid, ts.rip, orig_rip_code, sizeof(orig_rip_code));
@@ -1471,56 +1472,32 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
         return false;
     }
 
-    uint64_t signal_done = 1;
-    proc_mem_write(pid, flag_addr, &signal_done, sizeof(signal_done));
-
-    usleep(50000);
 
     kill(pid, SIGSTOP);
     usleep(50000);
 
+  
     proc_mem_write(pid, ts.rip, orig_rip_code, sizeof(orig_rip_code));
-    proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
 
-    uint8_t zero_region[4096] = {};
-    proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+ 
+    uint64_t done_signal = 1;
+    proc_mem_write(pid, done_addr, &done_signal, sizeof(done_signal));
+
 
     kill(pid, SIGCONT);
-    LOG_INFO("Injection complete, process restored and resumed");
+    usleep(100000);
 
+
+    kill(pid, SIGSTOP);
+    usleep(50000);
+    proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
+    proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+    kill(pid, SIGCONT);
+
+    LOG_INFO("inject_via_procmem: complete, process restored");
     payload_loaded_ = true;
     return true;
 }
-
-bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
-    LOG_INFO("Injecting {} into PID {}", lib_path, pid);
-
-    if (!fs::exists(lib_path)) {
-        error_ = "Payload library does not exist: " + lib_path;
-        LOG_ERROR("inject_library: {}", error_);
-        return false;
-    }
-
-    std::string target_path = prepare_payload_for_injection(pid, lib_path);
-
-    bool libc_internal = false;
-    uintptr_t dlopen_addr = find_remote_symbol(pid, "c", "__libc_dlopen_mode");
-    if (dlopen_addr != 0) {
-        libc_internal = true;
-        LOG_DEBUG("Remote __libc_dlopen_mode at 0x{:x}", dlopen_addr);
-    } else {
-        dlopen_addr = find_remote_symbol(pid, "dl", "dlopen");
-        if (dlopen_addr == 0)
-            dlopen_addr = find_remote_symbol(pid, "c", "dlopen");
-        if (dlopen_addr != 0)
-            LOG_DEBUG("Remote dlopen at 0x{:x}", dlopen_addr);
-    }
-
-    if (dlopen_addr == 0) {
-        error_ = "Could not find dlopen in target process";
-        LOG_ERROR("inject_library: {}", error_);
-        return false;
-    }
 
     uint64_t flags = libc_internal ? 0x80000002ULL : 0x00000002ULL;
 
@@ -1554,7 +1531,7 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     }
 
     LOG_INFO("Falling back to /proc/pid/mem injection path");
-    return inject_via_procmem(pid, target_path, dlopen_addr);
+    return inject_via_procmem(pid, target_path, dlopen_addr, flags);
 }
 
 bool Injection::inject_shellcode_ptrace(pid_t pid, const std::string& lib_path,
@@ -2082,3 +2059,4 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
