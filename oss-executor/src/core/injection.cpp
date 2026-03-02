@@ -1250,7 +1250,7 @@ bool Injection::elevated_mem_write(pid_t pid, uintptr_t addr,
 
 void Injection::stop_elevated_helper() {
     if (elevated_in_fd_ >= 0) {
-        (void)write(elevated_in_fd_, "Q\n", 2);
+        if (write(elevated_in_fd_, "Q\n", 2) < 0) { /* ignore */ }
         close(elevated_in_fd_);
         elevated_in_fd_ = -1;
     }
@@ -2177,5 +2177,6 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
