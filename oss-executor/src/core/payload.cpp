@@ -17,6 +17,7 @@
 #include <vector>
 #include <algorithm>
 #include <elf.h>
+#include <cerrno>
 
 static constexpr const char* SOCK_PATH    = "/tmp/oss_executor.sock";
 static constexpr size_t      RECV_BUF     = 1 << 18;
@@ -678,12 +679,18 @@ static void* ipc_worker(void*) {
     if (sfd < 0) return nullptr;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    const char* abs_name = "oss_executor";
-    size_t abs_nlen = strlen(abs_name);
-    memcpy(addr.sun_path + 1, abs_name, abs_nlen);
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + abs_nlen;
-    if (bind(sfd, (struct sockaddr*)&addr, addr_len) < 0 ||
-        listen(sfd, 4) < 0) { close(sfd); return nullptr; }
+    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+    unlink(SOCK_PATH);
+    if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "[payload] bind(%s) failed: %s\n", SOCK_PATH, strerror(errno));
+        close(sfd);
+        return nullptr;
+    }
+    if (listen(sfd, 4) < 0) {
+        fprintf(stderr, "[payload] listen failed: %s\n", strerror(errno));
+        close(sfd);
+        return nullptr;
+    }
     fprintf(stderr, "[payload] ipc listening\n");
     auto* buf = (char*)malloc(RECV_BUF);
     if (!buf) { close(sfd); return nullptr; }
@@ -707,6 +714,7 @@ static void* ipc_worker(void*) {
     }
     free(buf);
     close(sfd);
+    unlink(SOCK_PATH);
     return nullptr;
 }
 
@@ -793,11 +801,8 @@ static void payload_fini() {
     if (fd >= 0) {
         struct sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
-        const char* abs_name = "oss_executor";
-        size_t abs_nlen = strlen(abs_name);
-        memcpy(addr.sun_path + 1, abs_name, abs_nlen);
-        socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + abs_nlen;
-        connect(fd, (struct sockaddr*)&addr, addr_len);
+        strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+        connect(fd, (struct sockaddr*)&addr, sizeof(addr));
         close(fd);
     }
     usleep(50000);
