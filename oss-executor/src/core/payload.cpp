@@ -57,14 +57,34 @@ static std::vector<MemRegion> get_regions() {
     return out;
 }
 
+static int g_mem_fd = -1;
+
+static bool safe_read(uintptr_t addr, void* buf, size_t len) {
+    if (g_mem_fd < 0) {
+        g_mem_fd = open("/proc/self/mem", O_RDONLY);
+        if (g_mem_fd < 0) return false;
+    }
+    ssize_t rd = pread(g_mem_fd, buf, len, (off_t)addr);
+    return rd == (ssize_t)len;
+}
+
 static uintptr_t aob_scan(uintptr_t base, size_t size,
                           const uint8_t* pat, const char* mask, size_t plen) {
-    for (size_t i = 0; i + plen <= size; ++i) {
-        bool match = true;
-        for (size_t j = 0; j < plen && match; ++j)
-            if (mask[j] == 'x' && ((const uint8_t*)base)[i + j] != pat[j])
-                match = false;
-        if (match) return base + i;
+    const size_t PAGE = 4096;
+    uint8_t buf[PAGE + 64];
+    size_t step = (plen < PAGE) ? (PAGE - plen + 1) : 1;
+    for (size_t off = 0; off < size; off += step) {
+        size_t chunk = size - off;
+        if (chunk > PAGE) chunk = PAGE;
+        if (chunk < plen) break;
+        if (!safe_read(base + off, buf, chunk)) continue;
+        for (size_t i = 0; i + plen <= chunk; i++) {
+            bool match = true;
+            for (size_t j = 0; j < plen && match; j++)
+                if (mask[j] == 'x' && buf[i + j] != pat[j])
+                    match = false;
+            if (match) return base + off + i;
+        }
     }
     return 0;
 }
@@ -98,6 +118,7 @@ struct {
     std::mutex              mtx;
     std::atomic<bool>       alive{false};
     std::atomic<bool>       hooked{false};
+    std::atomic<bool>       init_done{false};
     uint8_t       stolen[MAX_STOLEN]{};
     size_t        stolen_len = 0;
     uint8_t*      trampoline = nullptr;
@@ -173,7 +194,12 @@ static int resume_detour(lua_State* L, lua_State* from, int nargs) {
     if (g_in) return ret;
     g_in = true;
     G.captured_L = L;
-    if (!G.queue.empty())
+    bool has_work;
+    {
+        std::lock_guard<std::mutex> lk(G.mtx);
+        has_work = !G.queue.empty();
+    }
+    if (has_work)
         drain_queue(L);
     g_in = false;
     return ret;
@@ -219,11 +245,14 @@ static size_t insn_len(const uint8_t* p) {
     if (p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA) return 4;
 
     size_t i = 0;
-    while (i < 4 && (p[i] == 0x66 || p[i] == 0x67 || p[i] == 0xF2 ||
-                     p[i] == 0xF3 || p[i] == 0x26 || p[i] == 0x2E ||
-                     p[i] == 0x36 || p[i] == 0x3E || p[i] == 0x64 ||
-                     p[i] == 0x65))
+    bool has_67 = false;
+    while (i < 4 && (p[i] == 0x66 || p[i] == 0x67 || p[i] == 0xF0 ||
+                     p[i] == 0xF2 || p[i] == 0xF3 || p[i] == 0x26 ||
+                     p[i] == 0x2E || p[i] == 0x36 || p[i] == 0x3E ||
+                     p[i] == 0x64 || p[i] == 0x65)) {
+        if (p[i] == 0x67) has_67 = true;
         i++;
+    }
 
     bool rex_w = false;
     if (p[i] >= 0x40 && p[i] <= 0x4F) {
@@ -256,7 +285,7 @@ static size_t insn_len(const uint8_t* p) {
         op == 0x25 || op == 0x2D || op == 0x35 || op == 0x3D || op == 0xA9)
         return i + 4;
 
-    if (op >= 0xA0 && op <= 0xA3) return i + (rex_w ? 8 : 4);
+    if (op >= 0xA0 && op <= 0xA3) return i + (has_67 ? 4 : 8);
     if (op == 0xCD) return i + 1;
     if (op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7) return i + 1;
 
@@ -333,9 +362,9 @@ static void relocate_rip_relative(uint8_t* tramp, size_t len,
 
         size_t ii = off;
         while (ii < off + il && (tramp[ii] == 0x66 || tramp[ii] == 0x67 ||
-               tramp[ii] == 0xF2 || tramp[ii] == 0xF3 || tramp[ii] == 0x26 ||
-               tramp[ii] == 0x2E || tramp[ii] == 0x36 || tramp[ii] == 0x3E ||
-               tramp[ii] == 0x64 || tramp[ii] == 0x65))
+               tramp[ii] == 0xF0 || tramp[ii] == 0xF2 || tramp[ii] == 0xF3 ||
+               tramp[ii] == 0x26 || tramp[ii] == 0x2E || tramp[ii] == 0x36 ||
+               tramp[ii] == 0x3E || tramp[ii] == 0x64 || tramp[ii] == 0x65))
             ii++;
         if (ii < off + il && tramp[ii] >= 0x40 && tramp[ii] <= 0x4F)
             ii++;
@@ -716,22 +745,26 @@ static uintptr_t find_elf_sym(const char* name) {
 
 static uintptr_t scan_for_string(const char* str, size_t slen) {
     auto regions = get_regions();
-    for (auto& r : regions) {
-        if (!r.r) continue;
-        if (G.mod_base && (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size))
-            continue;
-        for (size_t i = 0; i + slen <= r.size; i++) {
-            if (memcmp((const void*)(r.base + i), str, slen) == 0)
-                return r.base + i;
-        }
-    }
-    for (auto& r : regions) {
-        if (!r.r) continue;
-        if (G.mod_base && r.base >= G.mod_base && r.base < G.mod_base + G.mod_size)
-            continue;
-        for (size_t i = 0; i + slen <= r.size; i++) {
-            if (memcmp((const void*)(r.base + i), str, slen) == 0)
-                return r.base + i;
+    const size_t PAGE = 4096;
+    uint8_t buf[PAGE];
+    size_t step = (slen < PAGE) ? (PAGE - slen + 1) : 1;
+    for (int pass = 0; pass < 2; pass++) {
+        for (auto& r : regions) {
+            if (!r.r) continue;
+            bool in_mod = G.mod_base && r.base >= G.mod_base &&
+                          r.base < G.mod_base + G.mod_size;
+            if (pass == 0 && !in_mod && G.mod_base) continue;
+            if (pass == 1 && in_mod) continue;
+            for (size_t off = 0; off < r.size; off += step) {
+                size_t chunk = r.size - off;
+                if (chunk > PAGE) chunk = PAGE;
+                if (chunk < slen) break;
+                if (!safe_read(r.base + off, buf, chunk)) continue;
+                for (size_t i = 0; i + slen <= chunk; i++) {
+                    if (memcmp(buf + i, str, slen) == 0)
+                        return r.base + off + i;
+                }
+            }
         }
     }
     return 0;
@@ -739,45 +772,34 @@ static uintptr_t scan_for_string(const char* str, size_t slen) {
 
 static uintptr_t find_lea_xref(uintptr_t string_addr) {
     auto regions = get_regions();
-    for (auto& r : regions) {
-        if (!r.r || !r.x) continue;
-        if (G.mod_base && (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size))
-            continue;
-        const uint8_t* code = (const uint8_t*)r.base;
-        for (size_t i = 0; i + 7 <= r.size; i++) {
-            if (code[i] == 0x8D && (code[i+1] & 0xC7) == 0x05) {
-                int32_t disp;
-                memcpy(&disp, code + i + 2, 4);
-                uintptr_t target = r.base + i + 6 + (uintptr_t)(intptr_t)disp;
-                if (target == string_addr) return r.base + i;
-            }
-            if (code[i] >= 0x40 && code[i] <= 0x4F &&
-                code[i+1] == 0x8D && (code[i+2] & 0xC7) == 0x05) {
-                int32_t disp;
-                memcpy(&disp, code + i + 3, 4);
-                uintptr_t target = r.base + i + 7 + (uintptr_t)(intptr_t)disp;
-                if (target == string_addr) return r.base + i;
-            }
-        }
-    }
-    for (auto& r : regions) {
-        if (!r.r || !r.x) continue;
-        if (G.mod_base && (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size))
-            continue;
-        const uint8_t* code = (const uint8_t*)r.base;
-        for (size_t i = 0; i + 7 <= r.size; i++) {
-            if (code[i] == 0x8B && (code[i+1] & 0xC7) == 0x05) {
-                int32_t disp;
-                memcpy(&disp, code + i + 2, 4);
-                uintptr_t target = r.base + i + 6 + (uintptr_t)(intptr_t)disp;
-                if (target == string_addr) return r.base + i;
-            }
-            if (code[i] >= 0x40 && code[i] <= 0x4F &&
-                code[i+1] == 0x8B && (code[i+2] & 0xC7) == 0x05) {
-                int32_t disp;
-                memcpy(&disp, code + i + 3, 4);
-                uintptr_t target = r.base + i + 7 + (uintptr_t)(intptr_t)disp;
-                if (target == string_addr) return r.base + i;
+    const size_t PAGE = 4096;
+    uint8_t buf[PAGE];
+    for (int mode = 0; mode < 2; mode++) {
+        uint8_t opc = (mode == 0) ? 0x8D : 0x8B;
+        for (auto& r : regions) {
+            if (!r.r || !r.x) continue;
+            if (G.mod_base && (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size))
+                continue;
+            for (size_t off = 0; off < r.size; off += (PAGE - 6)) {
+                size_t chunk = r.size - off;
+                if (chunk > PAGE) chunk = PAGE;
+                if (chunk < 7) break;
+                if (!safe_read(r.base + off, buf, chunk)) continue;
+                for (size_t i = 0; i + 7 <= chunk; i++) {
+                    if (buf[i] == opc && (buf[i+1] & 0xC7) == 0x05) {
+                        int32_t disp;
+                        memcpy(&disp, buf + i + 2, 4);
+                        uintptr_t target = r.base + off + i + 6 + (int64_t)disp;
+                        if (target == string_addr) return r.base + off + i;
+                    }
+                    if (buf[i] >= 0x40 && buf[i] <= 0x4F &&
+                        buf[i+1] == opc && (buf[i+2] & 0xC7) == 0x05) {
+                        int32_t disp;
+                        memcpy(&disp, buf + i + 3, 4);
+                        uintptr_t target = r.base + off + i + 7 + (int64_t)disp;
+                        if (target == string_addr) return r.base + off + i;
+                    }
+                }
             }
         }
     }
@@ -787,40 +809,52 @@ static uintptr_t find_lea_xref(uintptr_t string_addr) {
 static uintptr_t walk_back_to_func(uintptr_t addr) {
     if (!addr || addr < 0x1000) return 0;
     uintptr_t limit = (addr > 4096) ? addr - 4096 : 0x1000;
+    uint8_t window[8];
     for (uintptr_t p = addr - 1; p >= limit; p--) {
-        const uint8_t* c = (const uint8_t*)p;
+        if (!safe_read(p, window, sizeof(window))) continue;
         bool candidate = false;
 
         if (p + 5 <= addr &&
-            c[0] == 0xF3 && c[1] == 0x0F && c[2] == 0x1E && c[3] == 0xFA && c[4] == 0x55)
+            window[0] == 0xF3 && window[1] == 0x0F && window[2] == 0x1E &&
+            window[3] == 0xFA && window[4] == 0x55)
             candidate = true;
         else if (p + 4 <= addr &&
-                 c[0] == 0x55 && c[1] == 0x48 && c[2] == 0x89 && c[3] == 0xE5)
+                 window[0] == 0x55 && window[1] == 0x48 && window[2] == 0x89 &&
+                 window[3] == 0xE5)
             candidate = true;
         else if (p + 4 <= addr &&
-                 c[0] == 0xF3 && c[1] == 0x0F && c[2] == 0x1E && c[3] == 0xFA)
+                 window[0] == 0xF3 && window[1] == 0x0F && window[2] == 0x1E &&
+                 window[3] == 0xFA)
             candidate = true;
-        else if (c[0] == 0x55 && p > limit) {
-            uint8_t prev = *((const uint8_t*)(p - 1));
-            if (prev == 0xC3 || prev == 0xCC || prev == 0x90)
+        else if (window[0] == 0x55 && p > limit) {
+            uint8_t prev;
+            if (safe_read(p - 1, &prev, 1) &&
+                (prev == 0xC3 || prev == 0xCC || prev == 0x90))
                 candidate = true;
         }
         else if (p + 4 <= addr && p > limit &&
-                 c[0] == 0x48 && c[1] == 0x83 && c[2] == 0xEC) {
-            uint8_t prev = *((const uint8_t*)(p - 1));
-            if (prev == 0xC3 || prev == 0xCC)
+                 window[0] == 0x48 && window[1] == 0x83 && window[2] == 0xEC) {
+            uint8_t prev;
+            if (safe_read(p - 1, &prev, 1) &&
+                (prev == 0xC3 || prev == 0xCC))
                 candidate = true;
         }
 
         if (candidate) {
+            uint8_t ibuf[128];
+            size_t read_sz = sizeof(ibuf);
+            bool ok = safe_read(p, ibuf, read_sz);
+            if (!ok) {
+                read_sz = 64;
+                ok = safe_read(p, ibuf, read_sz);
+            }
+            if (!ok) continue;
             size_t decoded = 0;
-            uintptr_t ip = p;
             int valid_insns = 0;
-            while (decoded < 32 && ip < addr + 64) {
-                size_t il = insn_len((const uint8_t*)ip);
+            while (decoded < 64 && decoded + 15 <= read_sz) {
+                size_t il = insn_len(ibuf + decoded);
                 if (il == 0) break;
                 decoded += il;
-                ip += il;
                 valid_insns++;
             }
             if (valid_insns >= 3)
@@ -1044,16 +1078,41 @@ static void* file_cmd_worker(void*) {
         }
 
         {
-            std::lock_guard<std::mutex> lk(G.mtx);
-            if (!G.queue.empty()) {
-                static int stale_ticks = 0;
-                stale_ticks++;
-                if (stale_ticks % 40 == 0) {
-                    plog("[payload] WARNING: %zu scripts queued for %ds without drain. "
-                         "hooked=%d captured_L=%p\n",
-                         G.queue.size(), stale_ticks / 20,
-                         G.hooked.load() ? 1 : 0, G.captured_L);
-                    write_status("stale");
+            static int stale_ticks = 0;
+            static int reinit_attempts = 0;
+            bool need_reinit = false;
+            {
+                std::lock_guard<std::mutex> lk(G.mtx);
+                if (!G.queue.empty()) {
+                    stale_ticks++;
+                    if (stale_ticks % 40 == 0) {
+                        plog("[payload] WARNING: %zu scripts queued for %ds without drain. "
+                             "hooked=%d captured_L=%p\n",
+                             G.queue.size(), stale_ticks / 20,
+                             G.hooked.load() ? 1 : 0, G.captured_L);
+                        write_status("stale");
+                    }
+                    if (!G.hooked.load() && G.init_done.load() &&
+                        stale_ticks >= 60 && reinit_attempts < 5) {
+                        reinit_attempts++;
+                        stale_ticks = 0;
+                        need_reinit = true;
+                    }
+                } else {
+                    stale_ticks = 0;
+                }
+            }
+            if (need_reinit) {
+                plog("[payload] hook not installed, re-init attempt %d/5\n", reinit_attempts);
+                if (!G.mod_base) find_module();
+                if (resolve_functions() && G.resume && !G.hooked.load()) {
+                    uint8_t* tramp = nullptr;
+                    if (install_hook((uintptr_t)G.resume, (void*)resume_detour, tramp)) {
+                        G.trampoline = tramp;
+                        G.hooked.store(true, std::memory_order_release);
+                        plog("[payload] re-init: hook installed successfully\n");
+                        write_status("armed");
+                    }
                 }
             }
         }
@@ -1127,6 +1186,7 @@ static void* init_worker(void*) {
         } else {
             plog("[payload] FATAL: no executable regions\n");
             write_status("fatal_no_regions");
+            G.init_done.store(true, std::memory_order_release);
             return nullptr;
         }
     }
@@ -1145,6 +1205,7 @@ static void* init_worker(void*) {
     if (!resolved) {
         plog("[payload] FATAL: could not resolve luau functions\n");
         write_status("fatal_no_resolve");
+        G.init_done.store(true, std::memory_order_release);
         return nullptr;
     }
 
@@ -1157,6 +1218,7 @@ static void* init_worker(void*) {
     if (!install_hook((uintptr_t)G.resume, (void*)resume_detour, tramp)) {
         plog("[payload] FATAL: hook install failed\n");
         write_status("fatal_hook_fail");
+        G.init_done.store(true, std::memory_order_release);
         return nullptr;
     }
     G.trampoline = tramp;
@@ -1164,6 +1226,7 @@ static void* init_worker(void*) {
 
     plog("[payload] armed, waiting for scripts\n");
     write_status("armed");
+    G.init_done.store(true, std::memory_order_release);
     return nullptr;
 }
 
@@ -1227,5 +1290,9 @@ static void payload_fini() {
         close(fd);
     }
     usleep(50000);
+    if (g_mem_fd >= 0) {
+        close(g_mem_fd);
+        g_mem_fd = -1;
+    }
     write_status("shutdown");
 }
