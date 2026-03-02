@@ -1290,9 +1290,23 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     proc_mem_write(pid, guard_addr, &zero, 8);
 
     size_t sc_needed = 256;
+
+    
+    std::vector<MemoryRegion> nearby_regions;
+    for (const auto& r : regions) {
+        int64_t dist_lo = static_cast<int64_t>(r.start) - static_cast<int64_t>(hook_func_addr);
+        int64_t dist_hi = static_cast<int64_t>(r.end) - static_cast<int64_t>(hook_func_addr);
+        if ((dist_lo > INT32_MIN && dist_lo < INT32_MAX) ||
+            (dist_hi > INT32_MIN && dist_hi < INT32_MAX)) {
+            nearby_regions.push_back(r);
+        }
+    }
+    LOG_DEBUG("Filtered {} of {} regions within ±2GB of hook target",
+              nearby_regions.size(), regions.size());
+
     ExeRegionInfo cave;
-    if (!find_code_cave(pid, regions, sc_needed, cave)) {
-        error_ = "No code cave for inline hook shellcode";
+    if (!find_code_cave(pid, nearby_regions, sc_needed, cave)) {
+        error_ = "No reachable code cave within ±2GB of " + std::string(hooked_name);
         LOG_ERROR("{}", error_);
         proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
         return false;
@@ -2611,6 +2625,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
