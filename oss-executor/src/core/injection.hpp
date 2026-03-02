@@ -163,7 +163,7 @@ private:
     int                 elevated_in_fd_ = -1;
     int                 elevated_out_fd_ = -1;
 };
-};
 
 }
+
 
