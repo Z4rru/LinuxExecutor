@@ -848,23 +848,11 @@ static void* file_cmd_worker(void*) {
                 write_status("drained_fallback");
             }
         }
-            for (auto& s : batch) {
-                try_direct_execute(s);
-            }
-            if (!batch.empty()) {
-                write_status("drained_fallback");
-            }
-        }
-            } else {
-                stale_count = 0;
-            }
-        }
 
         usleep(50000);
     }
     return nullptr;
 }
-
 static void* ipc_worker(void*) {
     int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sfd < 0) return nullptr;
