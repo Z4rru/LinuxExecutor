@@ -202,8 +202,12 @@ static void drain_queue(lua_State* L) {
         }
 
         lua_State* th = G.newthread(L);
+        if (!th) {
+            plog("[payload] FATAL: lua_newthread returned NULL (L=%p)\n", L);
+            free(compiled);
+            continue;
+        }
 
-       
         if (G.sandbox) {
             G.sandbox(th);
         } else {
@@ -1084,29 +1088,11 @@ static bool resolve_functions() {
         }
     }
 
+               
         if (!G.compile) {
-        
-        static const char* comp_strings[] = {
-            "exceeded constant limit",
-            "exceeded closure limit",
-            "exceeded local register limit",
-            "exceeded upvalue limit",
-            nullptr
-        };
-        for (int i = 0; comp_strings[i] && !G.compile; i++) {
-            size_t slen = strlen(comp_strings[i]);
-            uintptr_t str_addr = scan_for_string(comp_strings[i], slen);
-            if (!str_addr) continue;
-            plog("[payload] found compile string '%s' at %lx\n", comp_strings[i], str_addr);
-            uintptr_t xref = find_lea_xref(str_addr);
-            if (!xref) continue;
-            uintptr_t func = walk_back_to_func(xref);
-            if (func) {
-                G.compile = (fn_compile)func;
-                plog("[payload] string-ref: luau_compile candidate at %lx\n", func);
-            }
+            plog("[payload] luau_compile not in any symbol table; "
+                 "source code scripts require pre-compiled bytecode from the executor\n");
         }
-    }
 
     if (!G.load) {
         static const char* load_strings[] = {
