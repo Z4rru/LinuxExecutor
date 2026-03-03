@@ -242,12 +242,16 @@ static void drain_queue(lua_State* L) {
 }
 
 static int resume_detour(lua_State* L, lua_State* from, int nargs) {
+    if (from && !G.captured_L) G.captured_L = from;
+
     int ret = G.original_resume(L, from, nargs);
     if (g_in) return ret;
     g_in = true;
-    G.captured_L = L;
+
+    lua_State* parent = from ? from : L;
     if (G.queue_count.load(std::memory_order_relaxed) > 0)
-        drain_queue(L);
+        drain_queue(parent);
+
     g_in = false;
     return ret;
 }
@@ -932,7 +936,22 @@ static uintptr_t walk_back_to_func(uintptr_t addr) {
                              window[0] == 0x48 && window[1] == 0x83 && window[2] == 0xEC) {
             uint8_t prev;
             if (safe_read(p - 1, &prev, 1) &&
-                (prev == 0xC3 || prev == 0xCC))
+                (prev == 0xC3 || prev == 0xCC || prev == 0x90))
+                candidate = true;
+        }
+     
+        else if (p + 2 <= addr && p > limit && window[0] == 0x53) {
+            uint8_t prev;
+            if (safe_read(p - 1, &prev, 1) &&
+                (prev == 0xC3 || prev == 0xCC || prev == 0x90))
+                candidate = true;
+        }
+    
+        else if (p + 3 <= addr && p > limit &&
+                 window[0] == 0x41 && window[1] >= 0x54 && window[1] <= 0x57) {
+            uint8_t prev;
+            if (safe_read(p - 1, &prev, 1) &&
+                (prev == 0xC3 || prev == 0xCC || prev == 0x90))
                 candidate = true;
         }
 
