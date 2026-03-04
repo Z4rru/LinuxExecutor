@@ -86,7 +86,6 @@ public:
     const ProcessInfo&  process_info() const { return proc_info_; }
     const VMScanResult& vm_scan()      const { return vm_scan_; }
     uintptr_t           vm_marker_addr() const { return vm_marker_addr_; }
-    bool                is_payload_loaded() const { return payload_loaded_; }
 
     Memory& memory() { return memory_; }
 
@@ -170,6 +169,7 @@ private:
 };
 
 }
+
 
 
 
