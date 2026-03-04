@@ -185,6 +185,13 @@ static void set_identity(lua_State* L) {
     uint8_t* extra = *reinterpret_cast<uint8_t**>(L);
     if (!extra) return;
 
+    // Validate the extra pointer is in a readable region
+    uint8_t probe_byte;
+    if (!safe_read((uintptr_t)extra, &probe_byte, 1)) {
+        plog("[payload] set_identity: extra pointer %p unreadable\n", extra);
+        return;
+    }
+
     if (IDENTITY_OFF == 0) {
         static const size_t known[] = {72, 48, 80, 88, 56, 64, 96, 104, 24, 32, 40};
         for (size_t off : known) {
@@ -247,25 +254,35 @@ static void drain_queue(lua_State* L) {
             size_t out_sz = 0;
             compiled = G.compile(src.c_str(), src.size(), nullptr, &out_sz);
             if (!compiled || out_sz == 0) {
-                plog("[payload] in-process compile failed (%zu bytes src)\n", src.size());
+                plog("[payload] target compile failed (%zu bytes src), trying builtin\n", src.size());
                 if (compiled) { free(compiled); compiled = nullptr; }
-                continue;
+                // Fall through to builtin compiler below
+            } else {
+                bc_data = compiled;
+                bc_sz = out_sz;
+                plog("[payload] compiled %zu src -> %zu bc (target compiler)\n", src.size(), bc_sz);
             }
-            bc_data = compiled;
-            bc_sz = out_sz;
-            plog("[payload] compiled %zu src -> %zu bc (target compiler)\n", src.size(), bc_sz);
-        } else {
-            plog("[payload] target compiler missing, using builtin static compiler\n");
+        }
+
+        // Builtin fallback: use our statically-linked luau_compile
+        if (!bc_data && !is_bytecode) {
+            plog("[payload] using builtin luau_compile (WARNING: bytecode version may mismatch target VM!)\n");
             size_t out_sz = 0;
             compiled = luau_compile(src.c_str(), src.size(), nullptr, &out_sz);
-            if (!compiled || out_sz == 0 || compiled[0] == '\0') {
-                plog("[payload] builtin compile failed: %s\n", compiled ? compiled + 1 : "unknown");
+            if (!compiled || out_sz == 0 || static_cast<uint8_t>(compiled[0]) == 0) {
+                plog("[payload] builtin compile failed: %s\n",
+                     (compiled && compiled[0] == '\0') ? compiled + 1 : "unknown");
                 if (compiled) { free(compiled); compiled = nullptr; }
                 continue;
             }
             bc_data = compiled;
             bc_sz = out_sz;
             plog("[payload] compiled %zu src -> %zu bc (builtin compiler)\n", src.size(), bc_sz);
+        }
+
+        if (!bc_data) {
+            plog("[payload] no bytecode produced, skipping script\n");
+            continue;
         }
 
         lua_State* th = G.newthread(L);
@@ -318,17 +335,20 @@ static void drain_queue(lua_State* L) {
 }
 
 static int resume_detour(lua_State* L, lua_State* from, int nargs) {
-    if (from && !G.captured_L) {
-        G.captured_L = from;
-        plog("[payload] captured lua_State* = %p (from resume_detour)\n", from);
+    // Capture L as well when from is null — first valid state we see
+    if (!G.captured_L) {
+        G.captured_L = from ? from : L;
+        plog("[payload] captured lua_State* = %p (from=%p L=%p)\n",
+             G.captured_L, from, L);
     }
 
     int ret = G.original_resume(L, from, nargs);
     if (g_in) return ret;
     g_in = true;
 
-    lua_State* parent = from ? from : L;
-    if (G.queue_count.load(std::memory_order_relaxed) > 0)
+    // Use captured_L as ultimate fallback if both from and L are null
+    lua_State* parent = from ? from : (L ? L : G.captured_L);
+    if (parent && G.queue_count.load(std::memory_order_relaxed) > 0)
         drain_queue(parent);
 
     g_in = false;
@@ -1463,6 +1483,18 @@ static void* file_cmd_worker(void*) {
                 plog("[payload] re-init: resolve failed\n");
                 write_status("reinit_resolve_fail");
             }
+        }
+
+        // Direct drain: if hook is armed and we have a captured lua_State
+        // but the queue is stuck (resume_detour not firing), drain from here
+        if (G.hooked.load(std::memory_order_relaxed) && G.captured_L &&
+            G.queue_count.load(std::memory_order_relaxed) > 0 && stale_ticks >= 10) {
+            plog("[payload] direct drain attempt (stale %d ticks, captured_L=%p)\n",
+                 stale_ticks, G.captured_L);
+            g_in = true;   // block re-entrancy from the hook
+            drain_queue(G.captured_L);
+            g_in = false;
+            stale_ticks = 0;
         }
 
         usleep(50000); // 50ms
