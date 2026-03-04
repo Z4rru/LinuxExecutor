@@ -22,16 +22,22 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+static const char* g_log_path = "/tmp/oss_payload.log";
+
 static void plog(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    FILE* f = fopen("/tmp/oss_payload.log", "a");
-    if (f) {
-        vfprintf(f, fmt, ap);
-        fflush(f);
-        fclose(f);
-    }
+    char buf[2048];
+    int len = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    if (len <= 0) return;
+    if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
+    int fd = open(g_log_path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) {
+        ssize_t r = write(fd, buf, (size_t)len);
+        (void)r;
+        close(fd);
+    }
 }
 
 static constexpr const char* SOCK_PATH    = "/tmp/oss_executor.sock";
@@ -1187,17 +1193,22 @@ static bool resolve_functions() {
 }
 
 static void write_status(const char* status) {
-    FILE* f = fopen("/tmp/oss_payload_status", "w");
-    if (f) {
-        fprintf(f, "hooked=%d captured_L=%p queue=%d compile=%p load=%p "
-                "resume=%p newthread=%p settop=%p gettop=%p tolstring=%p status=%s\n",
-                G.hooked.load() ? 1 : 0, G.captured_L,
-                G.queue_count.load(),
-                (void*)G.compile, (void*)G.load, (void*)G.resume,
-                (void*)G.newthread, (void*)G.settop, (void*)G.gettop,
-                (void*)G.tolstring, status);
-        fflush(f);
-        fclose(f);
+    char buf[1024];
+    int len = snprintf(buf, sizeof(buf),
+        "hooked=%d captured_L=%p queue=%d compile=%p load=%p "
+        "resume=%p newthread=%p settop=%p gettop=%p tolstring=%p status=%s\n",
+        G.hooked.load() ? 1 : 0, G.captured_L,
+        G.queue_count.load(),
+        (void*)G.compile, (void*)G.load, (void*)G.resume,
+        (void*)G.newthread, (void*)G.settop, (void*)G.gettop,
+        (void*)G.tolstring, status);
+    if (len <= 0) return;
+    if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
+    int fd = open("/tmp/oss_payload_status", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) {
+        ssize_t r = write(fd, buf, (size_t)len);
+        (void)r;
+        close(fd);
     }
 }
 
@@ -1410,19 +1421,39 @@ static void* init_worker(void*) {
 
 __attribute__((constructor))
 static void payload_init() {
-    unlink("/tmp/oss_payload.log");
+    const char* entered = "[payload] constructor entered\n";
+    ssize_t wr = write(STDERR_FILENO, entered, strlen(entered));
+    (void)wr;
+
+    int probe = open("/tmp/.oss_probe", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (probe >= 0) {
+        close(probe);
+        unlink("/tmp/.oss_probe");
+        g_log_path = "/tmp/oss_payload.log";
+    } else {
+        probe = open("/dev/shm/.oss_probe", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (probe >= 0) {
+            close(probe);
+            unlink("/dev/shm/.oss_probe");
+            g_log_path = "/dev/shm/oss_payload.log";
+        }
+    }
+
+    unlink(g_log_path);
     unlink("/tmp/oss_payload_status");
 
-    plog("[payload] init pid %d\n", getpid());
+    plog("[payload] init pid %d log=%s\n", getpid(), g_log_path);
 
-    FILE* marker = fopen(READY_PATH, "w");
-    if (marker) {
-        fprintf(marker, "%d\n", getpid());
-        fflush(marker);
-        fclose(marker);
+    char rbuf[32];
+    int rlen = snprintf(rbuf, sizeof(rbuf), "%d\n", getpid());
+    int rfd = open(READY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (rfd >= 0) {
+        ssize_t rw = write(rfd, rbuf, (size_t)rlen);
+        (void)rw;
+        close(rfd);
         plog("[payload] ready marker: %s\n", READY_PATH);
     } else {
-        plog("[payload] WARN: cannot create ready marker: %s\n", strerror(errno));
+        plog("[payload] WARN: cannot create ready marker: %s (errno=%d)\n", strerror(errno), errno);
     }
 
     unlink(CMD_PATH);
