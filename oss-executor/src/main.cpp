@@ -118,9 +118,11 @@ int main(int argc, char** argv) {
         exit_code = app.run();
         LOG_INFO("UI exited with code {}", exit_code);
 
+        oss::Injection::instance().stop_auto_scan();
+        oss::Injection::instance().detach();
         executor.shutdown();
-        oss::Logger::shutdown();
         LOG_INFO("OSS Executor shut down cleanly");
+        oss::Logger::shutdown(); 
 
     } catch (const std::exception& e) {
         std::cerr << "[FATAL] " << e.what() << std::endl;
@@ -132,3 +134,4 @@ int main(int argc, char** argv) {
 
     return exit_code;
 }
+
