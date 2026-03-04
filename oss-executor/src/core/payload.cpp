@@ -222,7 +222,6 @@ static void drain_queue(lua_State* L) {
         lua_State* th = G.newthread(L);
         if (!th) {
             plog("[payload] FATAL: lua_newthread returned NULL (L=%p)\n", L);
-            free(compiled);
             continue;
         }
 
@@ -235,7 +234,6 @@ static void drain_queue(lua_State* L) {
 
         set_identity(th);
         int lr = G.load(th, "=oss", bc_data, bc_sz, 0);
-        free(compiled);
         if (lr != 0) {
             if (G.tolstring) {
                 size_t len = 0;
@@ -1172,23 +1170,8 @@ static bool resolve_functions() {
     }
 
     if (!G.sandbox) {
-        // FIX: Also search for luaL_sandboxthread by string reference
-        static const char* sandbox_strings[] = {
-            "attempt to modify a readonly table",
-            nullptr
-        };
-        for (int i = 0; sandbox_strings[i] && !G.sandbox; i++) {
-            size_t slen = strlen(sandbox_strings[i]);
-            uintptr_t str_addr = scan_for_string(sandbox_strings[i], slen);
-            if (!str_addr) continue;
-            uintptr_t xref = find_lea_xref(str_addr);
-            if (!xref) continue;
-            uintptr_t func = walk_back_to_func(xref);
-            if (func) {
-                G.sandbox = (fn_sandbox)func;
-                plog("[payload] string-ref: luaL_sandboxthread at %lx\n", func);
-            }
-        }
+        plog("[payload] luaL_sandboxthread not found via dlsym or ELF scan; "
+             "scripts inherit parent globals directly\n");
     }
 
     if (!G.tolstring) {
