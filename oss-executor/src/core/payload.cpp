@@ -253,18 +253,15 @@ static void drain_queue(lua_State* L) {
                 size_t len = 0;
                 const char* e = G.tolstring(th, -1, &len);
                 plog("[payload] load error: %.*s\n", (int)len, e);
-                // FIX #5: Detect bytecode version mismatch
                 if (e && strstr(e, "version")) {
                     plog("[payload] >>> BYTECODE VERSION MISMATCH. The executor's "
                          "Luau compiler version does not match Roblox's VM. "
                          "Update the Luau version in CMakeLists.txt or use "
                          "Roblox's own compiler.\n");
                 }
-        } else {
-            plog("[payload] script executed OK (result=%d)\n", rr);
-        }
-        if (compiled) { free(compiled); compiled = nullptr; }
-        G.settop(L, -2);
+            }
+            if (compiled) { free(compiled); compiled = nullptr; }
+            G.settop(L, -2);
             continue;
         }
         plog("[payload] executing script (%zu bytes bc)...\n", bc_sz);
@@ -424,7 +421,7 @@ static size_t insn_len(const uint8_t* p) {
         if (op2 == 0x18) return modrm_len(p, i);
         if ((op2 >= 0x10 && op2 <= 0x17) || (op2 >= 0x28 && op2 <= 0x2F) ||
             (op2 >= 0x50 && op2 <= 0x7F) || (op2 >= 0xC2 && op2 <= 0xC6) ||
-            (op2 >= 0xD0 && op2 <= 0xFF))
+            (op2 >= 0xD0))
             return modrm_len(p, i);
         if (op2 == 0x05 || op2 == 0x07) return i;
         if (op2 == 0x31) return i;
