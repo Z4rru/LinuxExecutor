@@ -22,6 +22,25 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+// ─── FIX #3: Memory-mapped mailbox for cross-namespace IPC ───────────────────
+// The executor can find this via /proc/PID/mem scanning and write scripts
+// directly into it, bypassing all filesystem namespace issues.
+static constexpr size_t   MAILBOX_DATA_CAP = 1 << 18; // 256 KB
+static constexpr char     MAILBOX_MAGIC[16] = {
+    'O','S','S','_','M','A','I','L','B','O','X','_','V','2','\0','\0'
+};
+
+struct alignas(64) Mailbox {
+    char                   magic[16];      // "OSS_MAILBOX_V2\0\0"
+    alignas(8) uint64_t    seq;            // executor increments after writing data
+    alignas(8) uint64_t    ack;            // payload increments after consuming
+    uint32_t               data_size;      // bytes of script in data[]
+    uint32_t               flags;          // 1 = bytecode, 0 = source
+    char                   data[MAILBOX_DATA_CAP];
+};
+static Mailbox* g_mailbox = nullptr;
+// ─────────────────────────────────────────────────────────────────────────────
+
 static const char* g_log_path = "/tmp/oss_payload.log";
 
 static void plog(const char* fmt, ...) {
@@ -41,11 +60,14 @@ static void plog(const char* fmt, ...) {
 }
 
 static constexpr const char* SOCK_PATH    = "/tmp/oss_executor.sock";
+// FIX #2: Abstract socket name (bypasses mount-namespace isolation)
+static constexpr const char  ABSTRACT_SOCK_NAME[] = "oss_executor_v2";
+
 static constexpr const char* CMD_PATH     = "/tmp/oss_payload_cmd";
 static constexpr const char* READY_PATH   = "/tmp/oss_payload_ready";
 static constexpr size_t      RECV_BUF     = 1 << 18;
 static constexpr int         IDENTITY     = 8;
-static size_t                IDENTITY_OFF = 0;  
+static size_t                IDENTITY_OFF = 0;
 static constexpr size_t      MAX_STOLEN   = 32;
 
 struct MemRegion { uintptr_t base; size_t size; bool r; bool x; };
@@ -129,6 +151,9 @@ struct {
     size_t        stolen_len = 0;
     uint8_t*      trampoline = nullptr;
     uintptr_t     hook_addr  = 0;
+    // FIX #1: store target PID for namespace-aware paths
+    pid_t         target_pid = 0;
+    bool          is_containerized = false;
 } G;
 
 static thread_local bool g_in = false;
@@ -138,7 +163,6 @@ static void set_identity(lua_State* L) {
     if (!extra) return;
 
     if (IDENTITY_OFF == 0) {
-  
         static const size_t known[] = {72, 48, 80, 88, 56, 64, 96, 104, 24, 32, 40};
         for (size_t off : known) {
             int val;
@@ -149,7 +173,6 @@ static void set_identity(lua_State* L) {
                 break;
             }
         }
-  
         if (IDENTITY_OFF == 0) {
             for (size_t off = 16; off < 160; off += 4) {
                 int val;
@@ -184,46 +207,37 @@ static void drain_queue(lua_State* L) {
         char* compiled = nullptr;
 
         uint8_t first_byte = static_cast<uint8_t>(src[0]);
+        // FIX #5: Accept Roblox bytecode versions (may differ from open-source Luau)
+        // Roblox uses bytecode version 3-6 typically; open-source Luau uses 3-5
         bool is_bytecode = (first_byte >= 1 && first_byte <= 9 && src.size() > 4);
 
         if (is_bytecode) {
             bc_data = src.data();
             bc_sz = src.size();
+            plog("[payload] received pre-compiled bytecode (%zu bytes, version=%d)\n",
+                 bc_sz, first_byte);
         } else if (G.compile) {
-           
+            // FIX #5: Log which compiler we're using (payload's static or target's)
             compiled = nullptr;
             bc_sz = 0;
             compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
             if (!compiled || bc_sz == 0 ||
                 (bc_sz > 0 && ((uint8_t)compiled[0] < 1 || (uint8_t)compiled[0] > 9))) {
-                plog("[payload] compile failed or produced invalid bytecode (sz=%zu first=0x%02X)\n",
+                plog("[payload] compile failed (sz=%zu first=0x%02X). "
+                     "NOTE: payload's static Luau compiler may produce bytecode "
+                     "incompatible with Roblox's VM. Send pre-compiled bytecode "
+                     "from the executor instead.\n",
                      bc_sz, compiled ? (uint8_t)compiled[0] : 0);
                 free(compiled);
                 continue;
             }
+            plog("[payload] compiled source (%zu bytes) → bytecode (%zu bytes, ver=%d)\n",
+                 src.size(), bc_sz, (uint8_t)compiled[0]);
             bc_data = compiled;
         } else {
-   
-            if (!G.compile) {
-                G.compile = (fn_compile)dlsym(RTLD_DEFAULT, "luau_compile");
-                if (G.compile)
-                    plog("[payload] late-bound luau_compile at %p\n", (void*)G.compile);
-            }
-            if (G.compile) {
-                compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
-                if (compiled && bc_sz > 0 &&
-                    ((uint8_t)compiled[0] >= 1 && (uint8_t)compiled[0] <= 9)) {
-                    bc_data = compiled;
-                } else {
-                    plog("[payload] late-compile failed (sz=%zu)\n", bc_sz);
-                    free(compiled);
-                    continue;
-                }
-            } else {
-                plog("[payload] FATAL: no compiler available, cannot execute "
-                     "source (%zu bytes). Send pre-compiled bytecode.\n", src.size());
-                continue;
-            }
+            plog("[payload] FATAL: no compiler available, cannot execute "
+                 "source (%zu bytes). Send pre-compiled bytecode.\n", src.size());
+            continue;
         }
 
         lua_State* th = G.newthread(L);
@@ -236,7 +250,8 @@ static void drain_queue(lua_State* L) {
         if (G.sandbox) {
             G.sandbox(th);
         } else {
-            plog("[payload] WARN: luaL_sandboxthread not found, script will lack game globals\n");
+            plog("[payload] WARN: luaL_sandboxthread not found, "
+                 "script will lack game globals (game, workspace, etc.)\n");
         }
 
         set_identity(th);
@@ -247,6 +262,13 @@ static void drain_queue(lua_State* L) {
                 size_t len = 0;
                 const char* e = G.tolstring(th, -1, &len);
                 plog("[payload] load error: %.*s\n", (int)len, e);
+                // FIX #5: Detect bytecode version mismatch
+                if (e && strstr(e, "version")) {
+                    plog("[payload] >>> BYTECODE VERSION MISMATCH. The executor's "
+                         "Luau compiler version does not match Roblox's VM. "
+                         "Update the Luau version in CMakeLists.txt or use "
+                         "Roblox's own compiler.\n");
+                }
             } else {
                 plog("[payload] load error (code %d)\n", lr);
             }
@@ -271,7 +293,10 @@ static void drain_queue(lua_State* L) {
 }
 
 static int resume_detour(lua_State* L, lua_State* from, int nargs) {
-    if (from && !G.captured_L) G.captured_L = from;
+    if (from && !G.captured_L) {
+        G.captured_L = from;
+        plog("[payload] captured lua_State* = %p (from resume_detour)\n", from);
+    }
 
     int ret = G.original_resume(L, from, nargs);
     if (g_in) return ret;
@@ -759,7 +784,6 @@ static uintptr_t find_elf_sym_in_file(const char* filepath, const char* name,
                                        uintptr_t load_bias);
 
 static uintptr_t find_elf_sym(const char* name) {
-
     char exe_path[512];
     ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (len <= 0) return 0;
@@ -770,7 +794,6 @@ static uintptr_t find_elf_sym(const char* name) {
     uintptr_t load_off = get_exe_load_offset();
     uintptr_t result = find_elf_sym_in_file(exe_path, name, load_off);
     if (result) return result;
-
 
     std::ifstream maps("/proc/self/maps");
     std::string line;
@@ -792,7 +815,6 @@ static uintptr_t find_elf_sym(const char* name) {
             continue;
         searched.push_back(filepath);
 
-       
         uintptr_t lib_base = 0;
         unsigned long file_off = 0;
         char perms[5]{};
@@ -961,21 +983,19 @@ static uintptr_t walk_back_to_func(uintptr_t addr) {
                 (prev == 0xC3 || prev == 0xCC || prev == 0x90))
                 candidate = true;
         }
-        else if (p + 4 <= addr && p > limit && 
-                             window[0] == 0x48 && window[1] == 0x83 && window[2] == 0xEC) {
+        else if (p + 4 <= addr && p > limit &&
+                 window[0] == 0x48 && window[1] == 0x83 && window[2] == 0xEC) {
             uint8_t prev;
             if (safe_read(p - 1, &prev, 1) &&
                 (prev == 0xC3 || prev == 0xCC || prev == 0x90))
                 candidate = true;
         }
-     
         else if (p + 2 <= addr && p > limit && window[0] == 0x53) {
             uint8_t prev;
             if (safe_read(p - 1, &prev, 1) &&
                 (prev == 0xC3 || prev == 0xCC || prev == 0x90))
                 candidate = true;
         }
-    
         else if (p + 3 <= addr && p > limit &&
                  window[0] == 0x41 && window[1] >= 0x54 && window[1] <= 0x57) {
             uint8_t prev;
@@ -1017,9 +1037,40 @@ static bool resolve_functions() {
     G.sandbox   = (fn_sandbox)dlsym(h, "luaL_sandboxthread");
 
     plog("[payload] dlsym: compile=%p load=%p resume=%p newthread=%p "
-         "settop=%p tolstring=%p gettop=%p\n",
+         "settop=%p tolstring=%p gettop=%p sandbox=%p\n",
          (void*)G.compile, (void*)G.load, (void*)G.resume,
-         (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
+         (void*)G.newthread, (void*)G.settop, (void*)G.tolstring,
+         (void*)G.gettop, (void*)G.sandbox);
+
+    // FIX #5: Check if dlsym found symbols from OUR OWN library (payload's
+    // static Luau) vs the TARGET's Luau. If resume/load/etc point into
+    // our own .so, they're wrong — we need the target's functions.
+    {
+        Dl_info di;
+        if (G.resume && dladdr((void*)G.resume, &di) && di.dli_fname) {
+            if (strstr(di.dli_fname, "liboss_payload")) {
+                plog("[payload] WARNING: dlsym resolved lua_resume from our own "
+                     "payload library — NOT the target's Luau VM. Clearing.\n");
+                // These are our statically-linked Luau, not the target's
+                G.resume    = nullptr;
+                G.load      = nullptr;
+                G.pcall     = nullptr;
+                G.newthread = nullptr;
+                G.settop    = nullptr;
+                G.tolstring = nullptr;
+                G.gettop    = nullptr;
+                G.sandbox   = nullptr;
+                // Keep compile — we can use ours as fallback compiler
+            }
+        }
+        // Also check load
+        if (G.load && dladdr((void*)G.load, &di) && di.dli_fname) {
+            if (strstr(di.dli_fname, "liboss_payload")) {
+                plog("[payload] WARNING: dlsym resolved luau_load from payload. Clearing.\n");
+                G.load = nullptr;
+            }
+        }
+    }
 
     if (G.load && G.resume && G.newthread && G.settop)
         return true;
@@ -1040,15 +1091,24 @@ static bool resolve_functions() {
         if (*s.ptr) continue;
         uintptr_t addr = find_elf_sym(s.name);
         if (addr) {
+            // FIX #5: Verify the resolved symbol is NOT in our own .so
+            Dl_info di;
+            if (dladdr((void*)addr, &di) && di.dli_fname &&
+                strstr(di.dli_fname, "liboss_payload")) {
+                plog("[payload] elf-sym: %s at %lx is in payload .so, skipping\n",
+                     s.name, addr);
+                continue;
+            }
             *s.ptr = (void*)addr;
             plog("[payload] elf-sym: %s at %lx\n", s.name, addr);
         }
     }
 
     plog("[payload] elf-sym: compile=%p load=%p resume=%p newthread=%p "
-         "settop=%p tolstring=%p gettop=%p\n",
+         "settop=%p tolstring=%p gettop=%p sandbox=%p\n",
          (void*)G.compile, (void*)G.load, (void*)G.resume,
-         (void*)G.newthread, (void*)G.settop, (void*)G.tolstring, (void*)G.gettop);
+         (void*)G.newthread, (void*)G.settop, (void*)G.tolstring,
+         (void*)G.gettop, (void*)G.sandbox);
 
     if (G.load && G.resume && G.newthread && G.settop)
         return true;
@@ -1113,12 +1173,6 @@ static bool resolve_functions() {
         }
     }
 
-               
-        if (!G.compile) {
-            plog("[payload] luau_compile not in any symbol table; "
-                 "source code scripts require pre-compiled bytecode from the executor\n");
-        }
-
     if (!G.load) {
         static const char* load_strings[] = {
             "bytecode version mismatch",
@@ -1135,6 +1189,26 @@ static bool resolve_functions() {
             if (func) {
                 G.load = (fn_load)func;
                 plog("[payload] string-ref: luau_load at %lx\n", func);
+            }
+        }
+    }
+
+    if (!G.sandbox) {
+        // FIX: Also search for luaL_sandboxthread by string reference
+        static const char* sandbox_strings[] = {
+            "attempt to modify a readonly table",
+            nullptr
+        };
+        for (int i = 0; sandbox_strings[i] && !G.sandbox; i++) {
+            size_t slen = strlen(sandbox_strings[i]);
+            uintptr_t str_addr = scan_for_string(sandbox_strings[i], slen);
+            if (!str_addr) continue;
+            uintptr_t xref = find_lea_xref(str_addr);
+            if (!xref) continue;
+            uintptr_t func = walk_back_to_func(xref);
+            if (func) {
+                G.sandbox = (fn_sandbox)func;
+                plog("[payload] string-ref: luaL_sandboxthread at %lx\n", func);
             }
         }
     }
@@ -1156,6 +1230,11 @@ static bool resolve_functions() {
                 plog("[payload] string-ref: lua_tolstring at %lx\n", func);
             }
         }
+    }
+
+    if (!G.compile) {
+        plog("[payload] luau_compile not in target; "
+             "source scripts require pre-compiled bytecode from the executor\n");
     }
 
     if (!G.resume && G.mod_base) {
@@ -1196,12 +1275,14 @@ static void write_status(const char* status) {
     char buf[1024];
     int len = snprintf(buf, sizeof(buf),
         "hooked=%d captured_L=%p queue=%d compile=%p load=%p "
-        "resume=%p newthread=%p settop=%p gettop=%p tolstring=%p status=%s\n",
+        "resume=%p newthread=%p settop=%p gettop=%p tolstring=%p "
+        "sandbox=%p mailbox=%p status=%s\n",
         G.hooked.load() ? 1 : 0, G.captured_L,
         G.queue_count.load(),
         (void*)G.compile, (void*)G.load, (void*)G.resume,
         (void*)G.newthread, (void*)G.settop, (void*)G.gettop,
-        (void*)G.tolstring, status);
+        (void*)G.tolstring, (void*)G.sandbox,
+        (void*)g_mailbox, status);
     if (len <= 0) return;
     if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
     int fd = open("/tmp/oss_payload_status", O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -1212,12 +1293,45 @@ static void write_status(const char* status) {
     }
 }
 
+// ─── FIX #3: Mailbox polling — check for scripts written via /proc/PID/mem ──
+static void poll_mailbox() {
+    if (!g_mailbox) return;
+    // Use volatile reads since executor writes via /proc/PID/mem
+    uint64_t seq = __atomic_load_n(&g_mailbox->seq, __ATOMIC_ACQUIRE);
+    uint64_t ack = __atomic_load_n(&g_mailbox->ack, __ATOMIC_ACQUIRE);
+    if (seq <= ack) return; // nothing new
+
+    uint32_t sz = g_mailbox->data_size;
+    if (sz == 0 || sz > MAILBOX_DATA_CAP) {
+        // Invalid, just ack it
+        __atomic_store_n(&g_mailbox->ack, seq, __ATOMIC_RELEASE);
+        return;
+    }
+
+    std::string script(g_mailbox->data, sz);
+    plog("[payload] mailbox: received %u bytes (seq=%lu flags=%u)\n",
+         sz, (unsigned long)seq, g_mailbox->flags);
+
+    {
+        std::lock_guard<std::mutex> lk(G.mtx);
+        G.queue.emplace_back(std::move(script));
+        G.queue_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    __atomic_store_n(&g_mailbox->ack, seq, __ATOMIC_RELEASE);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 static void* file_cmd_worker(void*) {
     plog("[payload] file-IPC watcher started\n");
     int stale_ticks = 0;
     int reinit_attempts = 0;
 
     while (G.alive.load(std::memory_order_relaxed)) {
+
+        // FIX #3: Also poll the memory mailbox
+        poll_mailbox();
+
         struct stat st;
         if (stat(CMD_PATH, &st) == 0 && st.st_size > 0) {
             usleep(10000);
@@ -1292,13 +1406,6 @@ static void* file_cmd_worker(void*) {
                     G.hooked.store(true, std::memory_order_release);
                     plog("[payload] re-init: hook installed successfully\n");
                     write_status("armed");
-                                  
-                    if (!G.compile) {
-                        G.compile = (fn_compile)dlsym(RTLD_DEFAULT, "luau_compile");
-                        if (G.compile)
-                            plog("[payload] re-init: late-bound luau_compile at %p\n",
-                                 (void*)G.compile);
-                    }
                 } else {
                     plog("[payload] re-init: hook install failed\n");
                     write_status("reinit_hook_fail");
@@ -1309,29 +1416,57 @@ static void* file_cmd_worker(void*) {
             }
         }
 
-        usleep(50000);
+        usleep(50000); // 50ms
     }
     return nullptr;
 }
 
+// ─── FIX #2: Abstract Unix socket for cross-namespace IPC ────────────────────
 static void* ipc_worker(void*) {
     int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sfd < 0) return nullptr;
+
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
-    unlink(SOCK_PATH);
-    if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        plog("[payload] bind(%s) failed: %s\n", SOCK_PATH, strerror(errno));
+    bool bound = false;
+
+    // Try abstract socket FIRST — works across Flatpak mount namespaces
+    // if Sober uses --share=network (which it must for Roblox)
+    addr.sun_path[0] = '\0';
+    memcpy(addr.sun_path + 1, ABSTRACT_SOCK_NAME, sizeof(ABSTRACT_SOCK_NAME) - 1);
+    socklen_t abstract_len = (socklen_t)(
+        offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(ABSTRACT_SOCK_NAME) - 1);
+
+    if (bind(sfd, (struct sockaddr*)&addr, abstract_len) == 0) {
+        bound = true;
+        plog("[payload] ipc: bound to abstract socket '@%s'\n", ABSTRACT_SOCK_NAME);
+    } else {
+        plog("[payload] ipc: abstract socket bind failed (%s), trying filesystem\n",
+             strerror(errno));
+        // Fallback: filesystem socket (works for same-namespace only)
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+        unlink(SOCK_PATH);
+        if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            bound = true;
+            plog("[payload] ipc: bound to filesystem socket '%s'\n", SOCK_PATH);
+        }
+    }
+
+    if (!bound) {
+        plog("[payload] ipc: all bind attempts failed: %s\n", strerror(errno));
         close(sfd);
         return nullptr;
     }
+
     if (listen(sfd, 4) < 0) {
         plog("[payload] listen failed: %s\n", strerror(errno));
         close(sfd);
         return nullptr;
     }
-    plog("[payload] ipc listening on %s\n", SOCK_PATH);
+    plog("[payload] ipc listening\n");
+
     auto* buf = (char*)malloc(RECV_BUF);
     if (!buf) { close(sfd); return nullptr; }
     while (G.alive.load(std::memory_order_relaxed)) {
@@ -1357,6 +1492,7 @@ static void* ipc_worker(void*) {
     unlink(SOCK_PATH);
     return nullptr;
 }
+// ─────────────────────────────────────────────────────────────────────────────
 
 static void* init_worker(void*) {
     usleep(500000);
@@ -1401,7 +1537,12 @@ static void* init_worker(void*) {
     }
 
     if (!G.compile)
-        plog("[payload] NOTE: luau_compile not found, expecting pre-compiled bytecode\n");
+        plog("[payload] NOTE: luau_compile not found in target, "
+             "expecting pre-compiled bytecode from executor\n");
+
+    if (!G.sandbox)
+        plog("[payload] WARNING: luaL_sandboxthread not found — "
+             "scripts will NOT have access to game, workspace, Players etc.\n");
 
     plog("[payload] installing hook on lua_resume at %lx...\n", (uintptr_t)G.resume);
 
@@ -1414,10 +1555,35 @@ static void* init_worker(void*) {
     G.trampoline = tramp;
     G.hooked.store(true, std::memory_order_release);
 
-    plog("[payload] armed, waiting for scripts\n");
+    plog("[payload] ===== ARMED — ready for scripts =====\n");
+    plog("[payload] IPC channels:\n");
+    plog("[payload]   - Abstract socket: @%s\n", ABSTRACT_SOCK_NAME);
+    plog("[payload]   - Filesystem socket: %s\n", SOCK_PATH);
+    plog("[payload]   - File IPC: %s\n", CMD_PATH);
+    plog("[payload]   - Memory mailbox: %p (%zu bytes)\n",
+         (void*)g_mailbox, sizeof(Mailbox));
     write_status("armed");
     return nullptr;
 }
+
+// ─── FIX #3: Initialize mailbox for /proc/PID/mem IPC ───────────────────────
+static void init_mailbox() {
+    g_mailbox = (Mailbox*)mmap(nullptr, sizeof(Mailbox),
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_mailbox == MAP_FAILED) {
+        g_mailbox = nullptr;
+        plog("[payload] mailbox mmap failed: %s\n", strerror(errno));
+        return;
+    }
+    memset(g_mailbox, 0, sizeof(Mailbox));
+    memcpy(g_mailbox->magic, MAILBOX_MAGIC, 16);
+    __atomic_store_n(&g_mailbox->seq, 0ULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_mailbox->ack, 0ULL, __ATOMIC_RELEASE);
+    plog("[payload] mailbox initialized at %p (%zu bytes)\n",
+         (void*)g_mailbox, sizeof(Mailbox));
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 __attribute__((constructor))
 static void payload_init() {
@@ -1443,9 +1609,28 @@ static void payload_init() {
     unlink("/tmp/oss_payload_status");
 
     plog("[payload] init pid %d log=%s\n", getpid(), g_log_path);
+    G.target_pid = getpid();
 
-    char rbuf[32];
-    int rlen = snprintf(rbuf, sizeof(rbuf), "%d\n", getpid());
+    // FIX #1: Detect if we're in a container
+    {
+        struct stat st1, st2;
+        if (stat("/run/host", &st1) == 0 ||
+            stat("/.flatpak-info", &st2) == 0 ||
+            getenv("FLATPAK_ID") != nullptr) {
+            G.is_containerized = true;
+            plog("[payload] detected Flatpak container environment\n");
+            plog("[payload] NOTE: /tmp inside this container is ISOLATED from host /tmp.\n");
+            plog("[payload]       Executor must use /proc/%d/root/tmp/ or abstract sockets.\n",
+                 G.target_pid);
+        }
+    }
+
+    // FIX #3: Initialize memory mailbox BEFORE ready marker
+    init_mailbox();
+
+    char rbuf[256];
+    int rlen = snprintf(rbuf, sizeof(rbuf), "%d\nmailbox=%p\n",
+                        getpid(), (void*)g_mailbox);
     int rfd = open(READY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (rfd >= 0) {
         ssize_t rw = write(rfd, rbuf, (size_t)rlen);
@@ -1453,7 +1638,8 @@ static void payload_init() {
         close(rfd);
         plog("[payload] ready marker: %s\n", READY_PATH);
     } else {
-        plog("[payload] WARN: cannot create ready marker: %s (errno=%d)\n", strerror(errno), errno);
+        plog("[payload] WARN: cannot create ready marker: %s (errno=%d)\n",
+             strerror(errno), errno);
     }
 
     unlink(CMD_PATH);
@@ -1494,15 +1680,29 @@ static void payload_fini() {
         close(g_mem_fd);
         g_mem_fd = -1;
     }
+    // Poke the socket to unblock accept()
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd >= 0) {
+        // Try abstract socket first
         struct sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
-        connect(fd, (struct sockaddr*)&addr, sizeof(addr));
+        addr.sun_path[0] = '\0';
+        memcpy(addr.sun_path + 1, ABSTRACT_SOCK_NAME, sizeof(ABSTRACT_SOCK_NAME) - 1);
+        socklen_t alen = (socklen_t)(
+            offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(ABSTRACT_SOCK_NAME) - 1);
+        if (connect(fd, (struct sockaddr*)&addr, alen) != 0) {
+            // Try filesystem socket
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+            connect(fd, (struct sockaddr*)&addr, sizeof(addr));
+        }
         close(fd);
+    }
+    if (g_mailbox) {
+        munmap(g_mailbox, sizeof(Mailbox));
+        g_mailbox = nullptr;
     }
     usleep(50000);
     write_status("shutdown");
 }
-                 
