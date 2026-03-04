@@ -1570,16 +1570,26 @@ static void* init_worker(void*) {
     if (!resolved) {
         plog("[payload] FATAL: could not resolve luau functions\n");
         write_status("fatal_no_resolve");
+        elog("INIT FATAL: resolve failed after 10 attempts\n"
+             "  resume=%p load=%p newthread=%p settop=%p\n"
+             "  compile=%p sandbox=%p module=0x%lx (%zuMB)\n",
+             (void*)G.resume, (void*)G.load, (void*)G.newthread,
+             (void*)G.settop, (void*)G.compile, (void*)G.sandbox,
+             G.mod_base, G.mod_size >> 20);
         return nullptr;
     }
 
-    if (!G.compile)
+    if (!G.compile) {
         plog("[payload] NOTE: luau_compile not found in target, "
              "expecting pre-compiled bytecode from executor\n");
+        elog("NOTE: target luau_compile not found, using builtin compiler\n");
+    }
 
-    if (!G.sandbox)
+    if (!G.sandbox) {
         plog("[payload] WARNING: luaL_sandboxthread not found — "
              "scripts will NOT have access to game, workspace, Players etc.\n");
+        elog("WARNING: luaL_sandboxthread not found — scripts may lack game globals\n");
+    }
 
     plog("[payload] installing hook on lua_resume at %lx...\n", (uintptr_t)G.resume);
 
@@ -1608,6 +1618,9 @@ static void* init_worker(void*) {
                  (uintptr_t)G.resume,
                  probe[0], probe[1], probe[2], probe[3]);
             write_status("skip_bad_prologue");
+            elog("INIT: bad prologue at %p: %02x %02x %02x %02x\n",
+                 (void*)(uintptr_t)G.resume,
+                 probe[0], probe[1], probe[2], probe[3]);
             return nullptr;
         }
         size_t decoded = 0; int cnt = 0;
@@ -1629,12 +1642,15 @@ static void* init_worker(void*) {
     if (!install_hook((uintptr_t)G.resume, (void*)resume_detour, tramp)) {
         plog("[payload] FATAL: hook install failed\n");
         write_status("fatal_hook_fail");
+        elog("INIT FATAL: hook install failed at resume=%p\n", (void*)G.resume);
         return nullptr;
     }
     G.trampoline = tramp;
     G.hooked.store(true, std::memory_order_release);
 
     plog("[payload] ===== ARMED — ready for scripts =====\n");
+    elog("ARMED: hook installed at %p, trampoline at %p\n",
+         (void*)G.resume, (void*)tramp);
     plog("[payload] IPC channels:\n");
     plog("[payload]   - Abstract socket: @%s\n", ABSTRACT_SOCK_NAME);
     plog("[payload]   - Filesystem socket: %s\n", SOCK_PATH);
@@ -1706,10 +1722,17 @@ static void payload_init() {
         }
     }
 
+    if (strstr(g_log_path, "/dev/shm/"))
+        g_elog_path = "/dev/shm/oss_lua_error.log";
+    else
+        g_elog_path = "/tmp/oss_lua_error.log";
+
     unlink(g_log_path);
+    unlink(g_elog_path);
     unlink("/tmp/oss_payload_status");
 
     plog("[payload] init pid %d log=%s\n", getpid(), g_log_path);
+    elog("PAYLOAD ALIVE pid=%d log=%s elog=%s\n", getpid(), g_log_path, g_elog_path);
     G.target_pid = getpid();
 
     // FIX #1: Detect if we're in a container
