@@ -126,6 +126,7 @@ target_link_libraries(oss_payload PRIVATE
 target_compile_options(oss_payload PRIVATE
     -Wall -Wextra -Wno-unused-parameter
     -O2 -fno-exceptions
+    -fvisibility=hidden   
 )
 
 set_target_properties(oss_payload PROPERTIES
@@ -133,6 +134,8 @@ set_target_properties(oss_payload PROPERTIES
     PREFIX                    "lib"
     POSITION_INDEPENDENT_CODE ON
     LIBRARY_OUTPUT_DIRECTORY  "${CMAKE_BINARY_DIR}"
+    C_VISIBILITY_PRESET       hidden
+    CXX_VISIBILITY_PRESET     hidden 
 )
 
 add_dependencies(${PROJECT_NAME} oss_payload)
@@ -157,4 +160,5 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
 
