@@ -46,7 +46,7 @@ struct alignas(64) Mailbox {
 static Mailbox* g_mailbox = nullptr;
 // ─────────────────────────────────────────────────────────────────────────────
 
-static const char* g_log_path = "/tmp/oss_payload.log";
+static char g_log_path[512] = "/tmp/oss_payload.log";
 
 static void plog(const char* fmt, ...) {
     va_list ap;
@@ -56,6 +56,7 @@ static void plog(const char* fmt, ...) {
     va_end(ap);
     if (len <= 0) return;
     if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
+    write(STDERR_FILENO, buf, (size_t)len);
     int fd = open(g_log_path, O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
         ssize_t r = write(fd, buf, (size_t)len);
@@ -64,7 +65,8 @@ static void plog(const char* fmt, ...) {
     }
 }
 
-static const char* g_elog_path = "/tmp/oss_lua_error.log";
+static char g_elog_path[512] = "/tmp/oss_lua_error.log";
+static char g_status_path[512] = "/tmp/oss_payload_status";
 
 static void elog(const char* fmt, ...) {
     va_list ap;
@@ -74,6 +76,7 @@ static void elog(const char* fmt, ...) {
     va_end(ap);
     if (len <= 0) return;
     if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
+    write(STDERR_FILENO, buf, (size_t)len);
     int fd = open(g_elog_path, O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
         ssize_t r = write(fd, buf, (size_t)len);
@@ -1348,7 +1351,7 @@ static void write_status(const char* status) {
         (void*)g_mailbox, status);
     if (len <= 0) return;
     if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
-    int fd = open("/tmp/oss_payload_status", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    int fd = open(g_status_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd >= 0) {
         ssize_t r = write(fd, buf, (size_t)len);
         (void)r;
@@ -1729,27 +1732,7 @@ static void init_mailbox() {
          (void*)g_mailbox, sizeof(Mailbox));
 }
 
-__attribute__((constructor(101)))
-static void payload_canary() {
-    static volatile int done = 0;
-    if (done) return;
-    done = 1;
 
-    int fd = open("/tmp/oss_payload_canary", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) {
-        const char tag[] = "canary-alive\n";
-        ssize_t r = write(fd, tag, sizeof(tag) - 1);
-        (void)r;
-        close(fd);
-    }
-    fd = open("/dev/shm/oss_payload_canary", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) {
-        const char tag[] = "canary-shm\n";
-        ssize_t r = write(fd, tag, sizeof(tag) - 1);
-        (void)r;
-        close(fd);
-    }
-}
 // ─────────────────────────────────────────────────────────────────────────────
 
 __attribute__((constructor))
@@ -1758,28 +1741,16 @@ static void payload_init() {
     ssize_t wr = write(STDERR_FILENO, entered, strlen(entered));
     (void)wr;
 
-    int probe = open("/tmp/.oss_probe", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (probe >= 0) {
-        close(probe);
-        unlink("/tmp/.oss_probe");
-        g_log_path = "/tmp/oss_payload.log";
-    } else {
-        probe = open("/dev/shm/.oss_probe", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (probe >= 0) {
-            close(probe);
-            unlink("/dev/shm/.oss_probe");
-            g_log_path = "/dev/shm/oss_payload.log";
-        }
+    const char* home = getenv("HOME");
+    if (home) {
+        snprintf(g_log_path, sizeof(g_log_path), "%s/oss_payload.log", home);
+        snprintf(g_elog_path, sizeof(g_elog_path), "%s/oss_lua_error.log", home);
+        snprintf(g_status_path, sizeof(g_status_path), "%s/oss_payload_status", home);
     }
-
-    if (strstr(g_log_path, "/dev/shm/"))
-        g_elog_path = "/dev/shm/oss_lua_error.log";
-    else
-        g_elog_path = "/tmp/oss_lua_error.log";
 
     unlink(g_log_path);
     unlink(g_elog_path);
-    unlink("/tmp/oss_payload_status");
+    unlink(g_status_path);
 
     plog("[payload] init pid %d log=%s\n", getpid(), g_log_path);
     elog("PAYLOAD ALIVE pid=%d log=%s elog=%s\n", getpid(), g_log_path, g_elog_path);
