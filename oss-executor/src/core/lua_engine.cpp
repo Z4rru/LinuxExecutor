@@ -4,7 +4,7 @@
 #include "utils/crypto.hpp"
 #include "utils/config.hpp"
 #include "api/environment.hpp"
-#include "../utils/logger.hpp"
+#include "utils/logger.hpp"
 
 #include "lua.h"
 #include "lualib.h"
@@ -19,6 +19,10 @@
 #include <array>
 #include <algorithm>
 #include <cstdlib>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 namespace oss {
 
@@ -500,6 +504,130 @@ bool LuaEngine::execute_file(const std::string& path) {
     return execute(content, "@" + path);
 }
 
+
+
+bool LuaEngine::send_to_payload(const std::string& source_code,
+                                 const std::string& chunk_name) {
+    if (source_code.empty()) {
+        LOG_WARN("LuaEngine: send_to_payload called with empty source");
+        return false;
+    }
+
+#ifdef OSS_SEND_RAW_SOURCE
+ 
+    const std::string& data = source_code;
+    LOG_INFO("LuaEngine: Sending raw source to payload ({} bytes, chunk='{}')",
+             data.size(), chunk_name);
+#else
+   
+    std::string data = compile(source_code);
+    if (data.empty()) {
+        LOG_ERROR("LuaEngine: Local compilation failed, not sending to payload");
+        if (error_cb_)
+            error_cb_({last_error_, -1, chunk_name});
+        return false;
+    }
+    LOG_INFO("LuaEngine: Sending compiled bytecode to payload ({} bytes, chunk='{}')",
+             data.size(), chunk_name);
+#endif
+
+    {
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            struct sockaddr_un addr{};
+            addr.sun_family  = AF_UNIX;
+            addr.sun_path[0] = '\0';                      
+            static constexpr char kName[] = "oss_executor_v2";
+            std::memcpy(addr.sun_path + 1, kName, sizeof(kName) - 1);
+            auto alen = static_cast<socklen_t>(
+                offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(kName) - 1);
+
+            if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), alen) == 0) {
+                size_t sent = 0;
+                while (sent < data.size()) {
+                    ssize_t n = ::write(fd, data.data() + sent, data.size() - sent);
+                    if (n <= 0) break;
+                    sent += static_cast<size_t>(n);
+                }
+                ::close(fd);
+                if (sent == data.size()) {
+                    LOG_INFO("LuaEngine: Delivered {} bytes via abstract socket @{}",
+                             sent, kName);
+                    return true;
+                }
+                LOG_WARN("LuaEngine: Abstract socket partial write ({}/{})",
+                         sent, data.size());
+            } else {
+                ::close(fd);
+            }
+        }
+    }
+
+
+    {
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            struct sockaddr_un addr{};
+            addr.sun_family = AF_UNIX;
+            std::strncpy(addr.sun_path, "/tmp/oss_executor.sock",
+                         sizeof(addr.sun_path) - 1);
+
+            if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
+                          sizeof(addr)) == 0) {
+                size_t sent = 0;
+                while (sent < data.size()) {
+                    ssize_t n = ::write(fd, data.data() + sent, data.size() - sent);
+                    if (n <= 0) break;
+                    sent += static_cast<size_t>(n);
+                }
+                ::close(fd);
+                if (sent == data.size()) {
+                    LOG_INFO("LuaEngine: Delivered {} bytes via filesystem socket", sent);
+                    return true;
+                }
+            } else {
+                ::close(fd);
+            }
+        }
+    }
+
+
+    {
+        static constexpr const char* kCmdPath = "/tmp/oss_payload_cmd";
+        std::string cmd_path = kCmdPath;
+
+        // If we know the target PID and it's containerized, try /proc path
+        const char* pid_env = std::getenv("OSS_TARGET_PID");
+        if (pid_env) {
+            std::string proc_path = std::string("/proc/") + pid_env +
+                                    "/root/tmp/oss_payload_cmd";
+            // Prefer /proc path if accessible
+            int probe = ::open(proc_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (probe >= 0) {
+                ::close(probe);
+                cmd_path = proc_path;
+            }
+        }
+
+        std::ofstream f(cmd_path, std::ios::binary | std::ios::trunc);
+        if (f.is_open()) {
+            f.write(data.data(), static_cast<std::streamsize>(data.size()));
+            f.close();
+            if (f.good()) {
+                LOG_INFO("LuaEngine: Delivered {} bytes via file IPC ({})",
+                         data.size(), cmd_path);
+                return true;
+            }
+        }
+    }
+
+    LOG_ERROR("LuaEngine: All payload IPC channels failed — "
+              "is the payload injected and listening?");
+    if (error_cb_)
+        error_cb_({"Payload IPC failed — not injected?", -1, chunk_name});
+    return false;
+}
+
 void LuaEngine::queue_script(const std::string& source,
                               const std::string& name) {
     std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -524,6 +652,21 @@ void LuaEngine::tick() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!L_ || !running_) return;
     current_engine = this;
+
+
+    {
+        std::queue<QueuedScript> to_run;
+        {
+            std::lock_guard<std::mutex> ql(queue_mutex_);
+            std::swap(to_run, script_queue_);
+        }
+        while (!to_run.empty()) {
+            auto& script = to_run.front();
+            execute_internal(script.source, script.name);
+            to_run.pop();
+        }
+    }
+
     process_tasks();
     current_engine = nullptr;
 }
@@ -720,7 +863,7 @@ bool LuaEngine::update_drawing_object(int id,
     if (copy.image_surface)
         cairo_surface_reference(copy.image_surface);
     Overlay::instance().update_object(id,
-        [&copy](DrawingObject& o) {
+        [copy](DrawingObject& o) {
             if (o.image_surface)
                 cairo_surface_destroy(o.image_surface);
             o = copy;
@@ -1996,4 +2139,5 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 } // namespace oss
+
 
