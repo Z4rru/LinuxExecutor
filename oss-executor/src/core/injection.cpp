@@ -27,7 +27,7 @@
 #include <luacode.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <sys/stat.h>
+
 
 namespace fs = std::filesystem;
 
@@ -2554,41 +2554,41 @@ bool Injection::execute_script(const std::string& source) {
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-    LOG_WARN("Socket connect failed ({}): {} — trying file IPC",
-             sock_path, strerror(errno));
-    ::close(fd);
+        LOG_WARN("Socket connect failed ({}): {} — trying file IPC",
+                 sock_path, strerror(errno));
+        ::close(fd);
 
-    // --- File-based IPC fallback (payload watches /tmp/oss_payload_cmd) ---
-    std::string cmd_path = "/tmp/oss_payload_cmd";
-    if (proc_info_.via_flatpak || proc_info_.via_sober) {
-        pid_t pid = memory_.get_pid();
-        if (pid > 0)
-            cmd_path = "/proc/" + std::to_string(pid) +
-                       "/root/tmp/oss_payload_cmd";
-    }
+        
+        std::string cmd_path = "/tmp/oss_payload_cmd";
+        if (proc_info_.via_flatpak || proc_info_.via_sober) {
+            pid_t pid = memory_.get_pid();
+            if (pid > 0)
+                cmd_path = "/proc/" + std::to_string(pid) +
+                           "/root/tmp/oss_payload_cmd";
+        }
 
-    LOG_INFO("File IPC fallback: {}", cmd_path);
-    int cmd_fd = ::open(cmd_path.c_str(),
-                        O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (cmd_fd >= 0) {
-        const char* wd = data_to_send.data();
-        size_t rem = data_to_send.size();
-        bool fok = true;
-        while (rem > 0) {
-            ssize_t n = ::write(cmd_fd, wd, rem);
-            if (n <= 0) { fok = false; break; }
-            wd += n;
-            rem -= static_cast<size_t>(n);
-        }
-        ::close(cmd_fd);
-        if (fok) {
-            set_state(InjectionState::Ready,
-                      "Script dispatched via file IPC");
-            LOG_INFO("Sent {} bytes via file IPC: {}",
-                     data_to_send.size(), cmd_path);
-            return true;
-        }
-        LOG_ERROR("File IPC write error: {}", strerror(errno));
+        LOG_INFO("File IPC fallback: {}", cmd_path);
+        int cmd_fd = ::open(cmd_path.c_str(),
+                            O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (cmd_fd >= 0) {
+            const char* wd = data_to_send.data();
+            size_t rem = data_to_send.size();
+            bool fok = true;
+            while (rem > 0) {
+                ssize_t n = ::write(cmd_fd, wd, rem);
+                if (n <= 0) { fok = false; break; }
+                wd += n;
+                rem -= static_cast<size_t>(n);
+            }
+            ::close(cmd_fd);
+            if (fok) {
+                set_state(InjectionState::Ready,
+                          "Script dispatched via file IPC");
+                LOG_INFO("Sent {} bytes via file IPC: {}",
+                         data_to_send.size(), cmd_path);
+                return true;
+            }
+            LOG_ERROR("File IPC write error: {}", strerror(errno));
         } else {
             LOG_ERROR("Cannot create cmd file {}: {}", cmd_path, strerror(errno));
         }
@@ -2658,6 +2658,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
