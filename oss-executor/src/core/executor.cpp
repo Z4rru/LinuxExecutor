@@ -218,12 +218,14 @@ ExecutionResult Executor::execute_internal(const std::string& script,
 
     auto t0 = std::chrono::steady_clock::now();
 
-    bool attached = Injection::instance().is_attached();
+    auto& inj = Injection::instance();
+    bool attached = inj.is_attached() && inj.is_payload_loaded();
 
     if (attached) {
         result.success = send_to_payload(script);
         if (!result.success) {
             result.error = "IPC failed — could not deliver script to payload";
+            LOG_WARN("Payload IPC failed for '{}', NOT falling back to local VM", name);
         } else {
             LOG_INFO("Script '{}' dispatched to Roblox payload", name);
             usleep(500000);
@@ -477,3 +479,4 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
