@@ -125,6 +125,8 @@ target_link_options(oss_payload PRIVATE
 
 target_compile_options(oss_payload PRIVATE
     -Wall -Wextra -Wno-unused-parameter
+    -Werror          # Catch issues like the rr/op2 bugs at compile time
+    -Wno-error=type-limits   # uint8_t <= 0xFF after fix is removed, but safety net
     -O2 -fno-exceptions
     -fvisibility=hidden   
 )
@@ -160,6 +162,7 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
 
 
 
