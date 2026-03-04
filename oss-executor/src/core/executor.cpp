@@ -113,52 +113,29 @@ bool Executor::send_to_payload(const std::string& source) {
 
     {
         std::string cmd_path = prefix + "/tmp/oss_payload_cmd";
-        std::string tmp_path = cmd_path + ".tmp";
 
-        int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+     
+        int fd = ::open(cmd_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
-            const char* data = source.data();
-            size_t remaining = source.size();
-            bool write_ok = true;
-            while (remaining > 0) {
-                ssize_t n = ::write(fd, data, remaining);
-                if (n <= 0) { write_ok = false; break; }
-                data += n;
-                remaining -= static_cast<size_t>(n);
+            const char* d = source.data();
+            size_t rem = source.size();
+            bool ok = true;
+            while (rem > 0) {
+                ssize_t n = ::write(fd, d, rem);
+                if (n <= 0) { ok = false; break; }
+                d += n;
+                rem -= static_cast<size_t>(n);
             }
             ::close(fd);
-
-            if (write_ok) {
-                if (::rename(tmp_path.c_str(), cmd_path.c_str()) == 0) {
-                    LOG_INFO("Sent {} bytes to payload via file IPC ({})",
-                             source.size(), cmd_path);
-                    return true;
-                }
-                LOG_WARN("rename failed: {}, trying direct write", strerror(errno));
-                ::unlink(tmp_path.c_str());
-
-                fd = ::open(cmd_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (fd >= 0) {
-                    data = source.data();
-                    remaining = source.size();
-                    write_ok = true;
-                    while (remaining > 0) {
-                        ssize_t n = ::write(fd, data, remaining);
-                        if (n <= 0) { write_ok = false; break; }
-                        data += n;
-                        remaining -= static_cast<size_t>(n);
-                    }
-                    ::close(fd);
-                    if (write_ok) {
-                        LOG_INFO("Sent {} bytes to payload via file IPC direct ({})",
-                                 source.size(), cmd_path);
-                        return true;
-                    }
-                }
+            if (ok) {
+                LOG_INFO("Sent {} bytes to payload via file IPC ({})",
+                         source.size(), cmd_path);
+                return true;
             }
-            ::unlink(tmp_path.c_str());
+            LOG_WARN("File IPC write failed: {}", strerror(errno));
+        } else {
+            LOG_WARN("File IPC open failed ({}): {}", cmd_path, strerror(errno));
         }
-        LOG_WARN("File IPC failed ({}): {}, trying socket", cmd_path, strerror(errno));
     }
 
     std::string sock_path = prefix + "/tmp/oss_executor.sock";
@@ -479,4 +456,5 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
 
