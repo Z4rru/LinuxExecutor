@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -504,8 +505,6 @@ bool LuaEngine::execute_file(const std::string& path) {
     return execute(content, "@" + path);
 }
 
-
-
 bool LuaEngine::send_to_payload(const std::string& source_code,
                                  const std::string& chunk_name) {
     if (source_code.empty()) {
@@ -514,12 +513,10 @@ bool LuaEngine::send_to_payload(const std::string& source_code,
     }
 
 #ifdef OSS_SEND_RAW_SOURCE
- 
     const std::string& data = source_code;
     LOG_INFO("LuaEngine: Sending raw source to payload ({} bytes, chunk='{}')",
              data.size(), chunk_name);
 #else
-   
     std::string data = compile(source_code);
     if (data.empty()) {
         LOG_ERROR("LuaEngine: Local compilation failed, not sending to payload");
@@ -536,7 +533,7 @@ bool LuaEngine::send_to_payload(const std::string& source_code,
         if (fd >= 0) {
             struct sockaddr_un addr{};
             addr.sun_family  = AF_UNIX;
-            addr.sun_path[0] = '\0';                      
+            addr.sun_path[0] = '\0';
             static constexpr char kName[] = "oss_executor_v2";
             std::memcpy(addr.sun_path + 1, kName, sizeof(kName) - 1);
             auto alen = static_cast<socklen_t>(
@@ -562,7 +559,6 @@ bool LuaEngine::send_to_payload(const std::string& source_code,
             }
         }
     }
-
 
     {
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -591,17 +587,14 @@ bool LuaEngine::send_to_payload(const std::string& source_code,
         }
     }
 
-
     {
         static constexpr const char* kCmdPath = "/tmp/oss_payload_cmd";
         std::string cmd_path = kCmdPath;
 
-        // If we know the target PID and it's containerized, try /proc path
         const char* pid_env = std::getenv("OSS_TARGET_PID");
         if (pid_env) {
             std::string proc_path = std::string("/proc/") + pid_env +
                                     "/root/tmp/oss_payload_cmd";
-            // Prefer /proc path if accessible
             int probe = ::open(proc_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (probe >= 0) {
                 ::close(probe);
@@ -621,11 +614,32 @@ bool LuaEngine::send_to_payload(const std::string& source_code,
         }
     }
 
-    LOG_ERROR("LuaEngine: All payload IPC channels failed — "
-              "is the payload injected and listening?");
+    LOG_ERROR("LuaEngine: All payload IPC channels failed");
     if (error_cb_)
-        error_cb_({"Payload IPC failed — not injected?", -1, chunk_name});
+        error_cb_({"Payload IPC failed", -1, chunk_name});
     return false;
+}
+
+bool LuaEngine::is_payload_connected() const {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    struct sockaddr_un addr{};
+    addr.sun_family  = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    static constexpr char kName[] = "oss_executor_v2";
+    std::memcpy(addr.sun_path + 1, kName, sizeof(kName) - 1);
+    auto alen = static_cast<socklen_t>(
+        offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(kName) - 1);
+
+    bool reachable = (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
+                                alen) == 0);
+    ::close(fd);
+
+    if (reachable) return true;
+
+    struct stat st;
+    return (::stat("/tmp/oss_payload_ready", &st) == 0);
 }
 
 void LuaEngine::queue_script(const std::string& source,
@@ -652,7 +666,6 @@ void LuaEngine::tick() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!L_ || !running_) return;
     current_engine = this;
-
 
     {
         std::queue<QueuedScript> to_run;
@@ -2138,6 +2151,4 @@ int LuaEngine::lua_sha256(lua_State* L) {
     return 1;
 }
 
-} // namespace oss
-
-
+}
