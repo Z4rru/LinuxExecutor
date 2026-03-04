@@ -1748,7 +1748,6 @@ static void payload_init() {
     G.alive.store(true, std::memory_order_release);
     write_status("initializing");
 
-    pthread_t file_t;
     if (pthread_create(&g_file_t, nullptr, file_cmd_worker, nullptr) != 0) {
         g_file_t = 0;
         plog("[payload] WARN: file_cmd_worker thread failed\n");
@@ -1764,7 +1763,7 @@ static void payload_init() {
         plog("[payload] WARN: init_worker thread failed\n");
     }
 }
-}
+
 
 __attribute__((destructor))
 static void payload_fini() {
