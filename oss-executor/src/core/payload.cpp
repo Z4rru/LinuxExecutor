@@ -64,6 +64,24 @@ static void plog(const char* fmt, ...) {
     }
 }
 
+static const char* g_elog_path = "/tmp/oss_lua_error.log";
+
+static void elog(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char buf[2048];
+    int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (len <= 0) return;
+    if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
+    int fd = open(g_elog_path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) {
+        ssize_t r = write(fd, buf, (size_t)len);
+        (void)r;
+        close(fd);
+    }
+}
+
 static constexpr const char* SOCK_PATH    = "/tmp/oss_executor.sock";
 // FIX #2: Abstract socket name (bypasses mount-namespace isolation)
 static constexpr const char  ABSTRACT_SOCK_NAME[] = "oss_executor_v2";
