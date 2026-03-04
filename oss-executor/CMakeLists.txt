@@ -84,6 +84,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     APP_VERSION="${PROJECT_VERSION}"
+ 
+    OSS_SEND_RAW_SOURCE=1
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -158,6 +160,7 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
 
 
 
