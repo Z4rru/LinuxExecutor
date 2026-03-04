@@ -21,6 +21,11 @@
 #include <cstdarg>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include "luacode.h"
+
+static pthread_t g_file_t = 0, g_ipc_t = 0, g_init_t = 0;
+
+// ─── FIX #3: Memory-mapped mailbox for cross-namespace IPC ───────────────────
 
 // ─── FIX #3: Memory-mapped mailbox for cross-namespace IPC ───────────────────
 // The executor can find this via /proc/PID/mem scanning and write scripts
@@ -193,6 +198,14 @@ static void set_identity(lua_State* L) {
 }
 
 static void drain_queue(lua_State* L) {
+    if (!G.load || !G.newthread || !G.settop || !G.original_resume) {
+        plog("[payload] Cannot drain queue: critical functions missing "
+             "(load=%p newthread=%p settop=%p resume=%p)\n",
+             (void*)G.load, (void*)G.newthread,
+             (void*)G.settop, (void*)G.original_resume);
+        return;
+    }
+
     std::deque<std::string> batch;
     {
         std::lock_guard<std::mutex> lk(G.mtx);
@@ -207,8 +220,6 @@ static void drain_queue(lua_State* L) {
         char* compiled = nullptr;
 
         uint8_t first_byte = static_cast<uint8_t>(src[0]);
-        // FIX #5: Accept Roblox bytecode versions (may differ from open-source Luau)
-        // Roblox uses bytecode version 3-6 typically; open-source Luau uses 3-5
         bool is_bytecode = (first_byte >= 1 && first_byte <= 9 && src.size() > 4);
 
         if (is_bytecode) {
@@ -224,13 +235,19 @@ static void drain_queue(lua_State* L) {
             }
             bc_data = compiled;
             bc_sz = out_sz;
-            plog("[payload] compiled %zu src -> %zu bc (target compiler)\n",
-                 src.size(), bc_sz);
+            plog("[payload] compiled %zu src -> %zu bc (target compiler)\n", src.size(), bc_sz);
         } else {
-            plog("[payload] source code (%zu bytes) but no compiler — "
-                 "executor must send bytecode matching target Luau version\n",
-                 src.size());
-            continue;
+            plog("[payload] target compiler missing, using builtin static compiler\n");
+            size_t out_sz = 0;
+            compiled = luau_compile(src.c_str(), src.size(), nullptr, &out_sz);
+            if (!compiled || out_sz == 0 || compiled[0] == '\0') {
+                plog("[payload] builtin compile failed: %s\n", compiled ? compiled + 1 : "unknown");
+                if (compiled) { free(compiled); compiled = nullptr; }
+                continue;
+            }
+            bc_data = compiled;
+            bc_sz = out_sz;
+            plog("[payload] compiled %zu src -> %zu bc (builtin compiler)\n", src.size(), bc_sz);
         }
 
         lua_State* th = G.newthread(L);
@@ -278,6 +295,7 @@ static void drain_queue(lua_State* L) {
             plog("[payload] script executed OK (result=%d)\n", rr);
         }
         G.settop(L, -2);
+        if (compiled) { free(compiled); compiled = nullptr; }
     }
 }
 
@@ -916,8 +934,7 @@ static uintptr_t find_lea_xref(uintptr_t string_addr) {
         uint8_t opc = (mode == 0) ? 0x8D : 0x8B;
         for (auto& r : regions) {
             if (!r.r || !r.x) continue;
-            if (G.mod_base && (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size))
-                continue;
+            // Scan all executable regions including Sober anonymous mappings
             for (size_t off = 0; off < r.size; off += PAGE) {
                 size_t avail = r.size - off;
                 size_t chunk = avail;
@@ -1245,7 +1262,7 @@ static bool resolve_functions() {
                  "bytecode from executor (MUST match target Luau version)\n");
     }
 
-    if (!G.resume && G.mod_base) {
+    if (!G.resume) {
         static const uint8_t pat1[] = {0xF3, 0x0F, 0x1E, 0xFA, 0x55, 0x48, 0x89, 0xE5,
                                        0x41, 0x57, 0x41, 0x56};
         static const char mask1[]   = "xxxxxxxxxxxx";
@@ -1254,7 +1271,7 @@ static bool resolve_functions() {
         auto regions = get_regions();
         for (auto& r : regions) {
             if (!r.r || !r.x) continue;
-            if (r.base < G.mod_base || r.base >= G.mod_base + G.mod_size) continue;
+            // Scan all executable regions including Sober anonymous maps
             uintptr_t a = aob_scan(r.base, r.size, pat1, mask1, sizeof(pat1));
             if (!a) a = aob_scan(r.base, r.size, pat2, mask2, sizeof(pat2));
             if (a) {
@@ -1510,12 +1527,12 @@ static void* ipc_worker(void*) {
 
 static void* init_worker(void*) {
       
-    for (int w = 0; w < 20; w++) {
+    for (int w = 0; w < 4; w++) {
         usleep(500000);
         if (!G.alive.load(std::memory_order_relaxed)) return nullptr;
     }
 
-    plog("[payload] init_worker: resolving module (after 10s safety delay)...\n");
+    plog("[payload] init_worker: resolving module (after 2s safety delay)...\n");
     if (!find_module()) {
         plog("[payload] WARN: module not found, relaxed scan...\n");
         auto regions = get_regions();
@@ -1539,13 +1556,15 @@ static void* init_worker(void*) {
 
     bool resolved = false;
     for (int attempt = 0; attempt < 10; attempt++) {
+        if (!G.alive.load(std::memory_order_relaxed)) return nullptr;
         if (resolve_functions()) {
             resolved = true;
             break;
         }
         plog("[payload] resolve attempt %d/10 failed, retrying...\n", attempt + 1);
         write_status("resolving");
-        usleep(1000000);
+        for (int s = 0; s < 10 && G.alive.load(std::memory_order_relaxed); s++)
+            usleep(100000);
     }
 
     if (!resolved) {
@@ -1630,7 +1649,7 @@ static void* init_worker(void*) {
 static void init_mailbox() {
     g_mailbox = (Mailbox*)mmap(nullptr, sizeof(Mailbox),
         PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (g_mailbox == MAP_FAILED) {
         g_mailbox = nullptr;
         plog("[payload] mailbox mmap failed: %s\n", strerror(errno));
@@ -1730,22 +1749,21 @@ static void payload_init() {
     write_status("initializing");
 
     pthread_t file_t;
-    if (pthread_create(&file_t, nullptr, file_cmd_worker, nullptr) == 0)
-        pthread_detach(file_t);
-    else
+    if (pthread_create(&g_file_t, nullptr, file_cmd_worker, nullptr) != 0) {
+        g_file_t = 0;
         plog("[payload] WARN: file_cmd_worker thread failed\n");
+    }
 
-    pthread_t ipc_t;
-    if (pthread_create(&ipc_t, nullptr, ipc_worker, nullptr) == 0)
-        pthread_detach(ipc_t);
-    else
+    if (pthread_create(&g_ipc_t, nullptr, ipc_worker, nullptr) != 0) {
+        g_ipc_t = 0;
         plog("[payload] WARN: ipc_worker thread failed\n");
+    }
 
-    pthread_t init_t;
-    if (pthread_create(&init_t, nullptr, init_worker, nullptr) == 0)
-        pthread_detach(init_t);
-    else
+    if (pthread_create(&g_init_t, nullptr, init_worker, nullptr) != 0) {
+        g_init_t = 0;
         plog("[payload] WARN: init_worker thread failed\n");
+    }
+}
 }
 
 __attribute__((destructor))
@@ -1754,6 +1772,11 @@ static void payload_fini() {
     G.alive.store(false, std::memory_order_release);
     unlink(READY_PATH);
     unlink(CMD_PATH);
+
+    void* retval;
+    if (g_file_t) { pthread_join(g_file_t, &retval); g_file_t = 0; }
+    if (g_init_t) { pthread_join(g_init_t, &retval); g_init_t = 0; }
+
     if (G.hooked.load()) {
         restore_hook();
         G.hooked.store(false);
@@ -1765,7 +1788,6 @@ static void payload_fini() {
     // Poke the socket to unblock accept()
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd >= 0) {
-        // Try abstract socket first
         struct sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
         addr.sun_path[0] = '\0';
@@ -1773,7 +1795,6 @@ static void payload_fini() {
         socklen_t alen = (socklen_t)(
             offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(ABSTRACT_SOCK_NAME) - 1);
         if (connect(fd, (struct sockaddr*)&addr, alen) != 0) {
-            // Try filesystem socket
             memset(&addr, 0, sizeof(addr));
             addr.sun_family = AF_UNIX;
             strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
@@ -1781,10 +1802,12 @@ static void payload_fini() {
         }
         close(fd);
     }
+
+    if (g_ipc_t) { pthread_join(g_ipc_t, &retval); g_ipc_t = 0; }
+
     if (g_mailbox) {
         munmap(g_mailbox, sizeof(Mailbox));
         g_mailbox = nullptr;
     }
-    usleep(50000);
     write_status("shutdown");
 }
