@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <luacode.h>
+#include <cstdlib>
 
 static constexpr const char* PAYLOAD_SOCK = "/tmp/oss_executor.sock";
 
@@ -115,7 +117,8 @@ bool Executor::send_to_payload(const std::string& source) {
         std::string cmd_path = prefix + "/tmp/oss_payload_cmd";
 
      
-        int fd = ::open(cmd_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        std::string tmp_path = cmd_path + ".tmp";
+        int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
             const char* d = source.data();
             size_t rem = source.size();
@@ -127,14 +130,15 @@ bool Executor::send_to_payload(const std::string& source) {
                 rem -= static_cast<size_t>(n);
             }
             ::close(fd);
-            if (ok) {
+            if (ok && ::rename(tmp_path.c_str(), cmd_path.c_str()) == 0) {
                 LOG_INFO("Sent {} bytes to payload via file IPC ({})",
                          source.size(), cmd_path);
                 return true;
             }
-            LOG_WARN("File IPC write failed: {}", strerror(errno));
+            LOG_WARN("File IPC write/rename failed: {}", strerror(errno));
+            ::unlink(tmp_path.c_str());
         } else {
-            LOG_WARN("File IPC open failed ({}): {}", cmd_path, strerror(errno));
+            LOG_WARN("File IPC open failed ({}): {}", tmp_path, strerror(errno));
         }
     }
 
@@ -199,30 +203,43 @@ ExecutionResult Executor::execute_internal(const std::string& script,
     bool attached = inj.is_attached() && inj.is_payload_loaded();
 
     if (attached) {
-        result.success = send_to_payload(script);
-        if (!result.success) {
-            result.error = "IPC failed — could not deliver script to payload";
-            LOG_WARN("Payload IPC failed for '{}', NOT falling back to local VM", name);
+        size_t bc_len = 0;
+        char* bc = luau_compile(script.c_str(), script.size(), nullptr, &bc_len);
+        if (!bc || bc_len == 0 || static_cast<uint8_t>(bc[0]) == 0) {
+            std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
+            free(bc);
+            result.success = false;
+            result.error = "Compile error: " + ce;
+            LOG_ERROR("Compile failed for '{}': {}", name, ce);
         } else {
-            LOG_INFO("Script '{}' dispatched to Roblox payload", name);
-            usleep(500000);
-            std::string prefix;
-            const auto& pinfo = Injection::instance().process_info();
-            if (pinfo.via_flatpak || pinfo.via_sober) {
-                pid_t tpid = Injection::instance().target_pid();
-                if (tpid > 0) prefix = "/proc/" + std::to_string(tpid) + "/root";
-            }
-            std::ifstream sf(prefix + "/tmp/oss_payload_status");
-            if (sf.is_open()) {
-                std::string status;
-                std::getline(sf, status);
-                LOG_INFO("Payload status: {}", status);
-            }
-            std::ifstream lf(prefix + "/tmp/oss_payload.log");
-            if (lf.is_open()) {
-                std::string line;
-                while (std::getline(lf, line))
-                    LOG_DEBUG("[payload-log] {}", line);
+            std::string bytecode(bc, bc_len);
+            free(bc);
+            LOG_INFO("Compiled '{}': {} -> {} bytes bytecode", name, script.size(), bytecode.size());
+            result.success = send_to_payload(bytecode);
+            if (!result.success) {
+                result.error = "IPC failed \u2014 could not deliver bytecode to payload";
+                LOG_WARN("Payload IPC failed for '{}', NOT falling back to local VM", name);
+            } else {
+                LOG_INFO("Bytecode for '{}' dispatched to Roblox payload", name);
+                usleep(500000);
+                std::string prefix;
+                const auto& pinfo = Injection::instance().process_info();
+                if (pinfo.via_flatpak || pinfo.via_sober) {
+                    pid_t tpid = Injection::instance().target_pid();
+                    if (tpid > 0) prefix = "/proc/" + std::to_string(tpid) + "/root";
+                }
+                std::ifstream sf(prefix + "/tmp/oss_payload_status");
+                if (sf.is_open()) {
+                    std::string status;
+                    std::getline(sf, status);
+                    LOG_INFO("Payload status: {}", status);
+                }
+                std::ifstream lf(prefix + "/tmp/oss_payload.log");
+                if (lf.is_open()) {
+                    std::string line;
+                    while (std::getline(lf, line))
+                        LOG_DEBUG("[payload-log] {}", line);
+                }
             }
         }
     } else {
@@ -456,5 +473,6 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
 
 
