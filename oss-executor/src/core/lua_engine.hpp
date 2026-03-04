@@ -66,6 +66,13 @@ public:
     bool execute_bytecode(const std::string& bytecode,
                           const std::string& chunk_name = "=bytecode");
 
+ 
+    bool send_to_payload(const std::string& source_code,
+                         const std::string& chunk_name = "=remote");
+
+  
+    bool is_payload_connected() const;
+
     std::string compile(const std::string& source);
 
     void queue_script(const std::string& source,
@@ -239,3 +246,4 @@ private:
 };
 
 }
+
