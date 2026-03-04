@@ -109,18 +109,16 @@ add_library(oss_payload SHARED src/core/payload.cpp)
 
 target_include_directories(oss_payload PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${Luau_SOURCE_DIR}/Compiler/include
-    ${Luau_SOURCE_DIR}/Ast/include
-    ${Luau_SOURCE_DIR}/VM/include
-    ${Luau_SOURCE_DIR}/Common/include
 )
 
 target_link_libraries(oss_payload PRIVATE
-    Luau.Compiler
-    Luau.Ast
-    Luau.VM
     Threads::Threads
     ${CMAKE_DL_LIBS}
+)
+
+target_link_options(oss_payload PRIVATE
+    -static-libstdc++
+    -static-libgcc
 )
 
 target_compile_options(oss_payload PRIVATE
@@ -160,5 +158,6 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
 
 
