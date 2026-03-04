@@ -2316,14 +2316,31 @@ bool Injection::attach() {
 }
 
 bool Injection::detach() {
+    if (state_ == InjectionState::Detached && !memory_.is_valid())
+        return true;
+
     stop_elevated_helper();
-    set_state(InjectionState::Detached, "Detached");
+
+    
+    if (state_ != InjectionState::Detached) {
+        try {
+            set_state(InjectionState::Detached, "Detached");
+        } catch (...) {}
+    }
+    state_ = InjectionState::Detached;
+
     memory_.set_pid(0);
     mode_            = InjectionMode::None;
     vm_marker_addr_  = 0;
     vm_scan_         = {};
     proc_info_       = {};
     payload_loaded_  = false;
+
+
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        status_cb_ = nullptr;
+    }
     return true;
 }
 
@@ -2542,8 +2559,50 @@ bool Injection::execute_script(const std::string& source) {
         }
         data_to_send.assign(bc, bc_len);
         free(bc);
-        LOG_DEBUG("Compiled {} -> {} bytes bytecode", source.size(), data_to_send.size());
+        LOG_INFO("Compiled 'user_script': {} -> {} bytes bytecode (format v{})",
+                 source.size(), data_to_send.size(),
+                 static_cast<int>(static_cast<uint8_t>(data_to_send[0])));
     }
+
+    {
+        int afd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (afd >= 0) {
+            struct timeval atv{};
+            atv.tv_sec = 2;
+            setsockopt(afd, SOL_SOCKET, SO_SNDTIMEO, &atv, sizeof(atv));
+
+            struct sockaddr_un abs_addr{};
+            abs_addr.sun_family = AF_UNIX;
+            abs_addr.sun_path[0] = '\0';
+            static constexpr char ABS_SOCK[] = "oss_executor_v2";
+            memcpy(abs_addr.sun_path + 1, ABS_SOCK, sizeof(ABS_SOCK) - 1);
+            socklen_t abs_len = static_cast<socklen_t>(
+                offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(ABS_SOCK) - 1);
+
+            if (::connect(afd, reinterpret_cast<struct sockaddr*>(&abs_addr), abs_len) == 0) {
+                const char* wd = data_to_send.data();
+                size_t rem = data_to_send.size();
+                bool wok = true;
+                while (rem > 0) {
+                    ssize_t n = ::write(afd, wd, rem);
+                    if (n <= 0) { wok = false; break; }
+                    wd += n;
+                    rem -= static_cast<size_t>(n);
+                }
+                ::shutdown(afd, SHUT_WR);
+                ::close(afd);
+                if (wok) {
+                    set_state(InjectionState::Ready, "Script dispatched to payload");
+                    LOG_INFO("Sent {} bytes to payload via abstract socket @{}",
+                             data_to_send.size(), ABS_SOCK);
+                    return true;
+                }
+            } else {
+                ::close(afd);
+            }
+        }
+    }
+  
 
     std::string sock_path = PAYLOAD_SOCK;
     if (proc_info_.via_flatpak || proc_info_.via_sober) {
@@ -2674,6 +2733,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
