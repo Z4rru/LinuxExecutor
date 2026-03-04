@@ -1544,6 +1544,28 @@ static void init_mailbox() {
     plog("[payload] mailbox initialized at %p (%zu bytes)\n",
          (void*)g_mailbox, sizeof(Mailbox));
 }
+
+__attribute__((constructor(101)))
+static void payload_canary() {
+    static volatile int done = 0;
+    if (done) return;
+    done = 1;
+
+    int fd = open("/tmp/oss_payload_canary", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) {
+        const char tag[] = "canary-alive\n";
+        ssize_t r = write(fd, tag, sizeof(tag) - 1);
+        (void)r;
+        close(fd);
+    }
+    fd = open("/dev/shm/oss_payload_canary", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) {
+        const char tag[] = "canary-shm\n";
+        ssize_t r = write(fd, tag, sizeof(tag) - 1);
+        (void)r;
+        close(fd);
+    }
+}
 // ─────────────────────────────────────────────────────────────────────────────
 
 __attribute__((constructor))
