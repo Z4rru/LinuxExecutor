@@ -1,6 +1,9 @@
 #include "editor.hpp"
 #include "utils/config.hpp"
 
+#include <regex>
+#include <string>
+#include <vector>
 namespace oss {
 
 Editor::Editor() {
@@ -267,18 +270,24 @@ void Editor::handle_auto_indent(GtkTextBuffer* buffer, GtkTextIter* location, co
     }
     
     if (!indent.empty()) {
-        g_signal_handler_block(buffer, changed_handler_id_);
-        auto* indent_data = new std::pair<GtkTextBuffer*, std::string>(buffer, indent);
+     
+        struct IndentData {
+            GtkTextBuffer* buffer;
+            std::string    indent;
+            gulong         handler_id;
+        };
+        auto* id = new IndentData{buffer, indent, changed_handler_id_};
         g_idle_add([](gpointer data) -> gboolean {
-            auto* d = static_cast<std::pair<GtkTextBuffer*, std::string>*>(data);
+            auto* d = static_cast<IndentData*>(data);
+            g_signal_handler_block(d->buffer, d->handler_id);
             GtkTextIter iter;
-            GtkTextMark* insert_mark = gtk_text_buffer_get_insert(d->first);
-            gtk_text_buffer_get_iter_at_mark(d->first, &iter, insert_mark);
-            gtk_text_buffer_insert(d->first, &iter, d->second.c_str(), -1);
+            GtkTextMark* insert_mark = gtk_text_buffer_get_insert(d->buffer);
+            gtk_text_buffer_get_iter_at_mark(d->buffer, &iter, insert_mark);
+            gtk_text_buffer_insert(d->buffer, &iter, d->indent.c_str(), -1);
+            g_signal_handler_unblock(d->buffer, d->handler_id);
             delete d;
             return G_SOURCE_REMOVE;
-        }, indent_data);
-        g_signal_handler_unblock(buffer, changed_handler_id_);
+        }, id);
     }
 }
 
@@ -351,3 +360,4 @@ int Editor::get_cursor_column() const {
 }
 
 }
+
