@@ -124,17 +124,25 @@ target_link_libraries(oss_payload PRIVATE
     ${CMAKE_DL_LIBS}
 )
 
+# Generate version script to hide ALL exported symbols from static Luau
+file(WRITE ${CMAKE_BINARY_DIR}/payload.map "{ local: *; };\n")
+
 target_link_options(oss_payload PRIVATE
     -static-libstdc++
     -static-libgcc
+    -Wl,--exclude-libs,ALL
+    -Wl,--version-script=${CMAKE_BINARY_DIR}/payload.map
+    -Wl,-z,nodelete
+    -Wl,--no-undefined
 )
 
 target_compile_options(oss_payload PRIVATE
     -Wall -Wextra -Wno-unused-parameter
-    -Werror          # Catch issues like the rr/op2 bugs at compile time
-    -Wno-error=type-limits   # uint8_t <= 0xFF after fix is removed, but safety net
+    -Werror
+    -Wno-error=type-limits
     -O2 -fno-exceptions
-    -fvisibility=hidden   
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
 )
 
 set_target_properties(oss_payload PROPERTIES
@@ -168,6 +176,7 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
 
 
 
