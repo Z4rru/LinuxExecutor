@@ -214,29 +214,8 @@ static void drain_queue(lua_State* L) {
         if (is_bytecode) {
             bc_data = src.data();
             bc_sz = src.size();
-            plog("[payload] received pre-compiled bytecode (%zu bytes, version=%d)\n",
-                 bc_sz, first_byte);
-        } else if (G.compile) {
-            // FIX #5: Log which compiler we're using (payload's static or target's)
-            compiled = nullptr;
-            bc_sz = 0;
-            compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
-            if (!compiled || bc_sz == 0 ||
-                (bc_sz > 0 && ((uint8_t)compiled[0] < 1 || (uint8_t)compiled[0] > 9))) {
-                plog("[payload] compile failed (sz=%zu first=0x%02X). "
-                     "NOTE: payload's static Luau compiler may produce bytecode "
-                     "incompatible with Roblox's VM. Send pre-compiled bytecode "
-                     "from the executor instead.\n",
-                     bc_sz, compiled ? (uint8_t)compiled[0] : 0);
-                free(compiled);
-                continue;
-            }
-            plog("[payload] compiled source (%zu bytes) → bytecode (%zu bytes, ver=%d)\n",
-                 src.size(), bc_sz, (uint8_t)compiled[0]);
-            bc_data = compiled;
         } else {
-            plog("[payload] FATAL: no compiler available, cannot execute "
-                 "source (%zu bytes). Send pre-compiled bytecode.\n", src.size());
+            plog("[payload] received source code (%zu bytes), executor must send bytecode\n", src.size());
             continue;
         }
 
@@ -1026,7 +1005,7 @@ static uintptr_t walk_back_to_func(uintptr_t addr) {
 
 static bool resolve_functions() {
     void* h = RTLD_DEFAULT;
-    G.compile   = (fn_compile)dlsym(h, "luau_compile");
+    G.compile   = nullptr;
     G.load      = (fn_load)dlsym(h, "luau_load");
     G.pcall     = (fn_pcall)dlsym(h, "lua_pcall");
     G.resume    = (fn_resume)dlsym(h, "lua_resume");
@@ -1076,7 +1055,6 @@ static bool resolve_functions() {
         return true;
 
     struct { const char* name; void** ptr; } syms[] = {
-        {"luau_compile",       (void**)&G.compile},
         {"luau_load",          (void**)&G.load},
         {"lua_pcall",          (void**)&G.pcall},
         {"lua_resume",         (void**)&G.resume},
