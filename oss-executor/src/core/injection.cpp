@@ -10,6 +10,7 @@
 #include <sstream>
 #include <cctype>
 #include <cstring>
+#include <cstdlib>
 #include <csignal>
 #include <unistd.h>
 #include <dirent.h>
@@ -2528,8 +2529,21 @@ bool Injection::execute_script(const std::string& source) {
               "Executing (" + std::to_string(source.size()) + " bytes)...");
 
   
-    std::string data_to_send = source;
-    LOG_DEBUG("Sending {} bytes source (payload will compile in-process)", source.size());
+    std::string data_to_send;
+    {
+        size_t bc_len = 0;
+        char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_len);
+        if (!bc || bc_len == 0 || static_cast<uint8_t>(bc[0]) == 0) {
+            std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
+            free(bc);
+            set_state(InjectionState::Ready, "Compile error: " + ce);
+            LOG_ERROR("Compile failed: {}", ce);
+            return false;
+        }
+        data_to_send.assign(bc, bc_len);
+        free(bc);
+        LOG_DEBUG("Compiled {} -> {} bytes bytecode", source.size(), data_to_send.size());
+    }
 
     std::string sock_path = PAYLOAD_SOCK;
     if (proc_info_.via_flatpak || proc_info_.via_sober) {
@@ -2568,7 +2582,8 @@ bool Injection::execute_script(const std::string& source) {
         }
 
         LOG_INFO("File IPC fallback: {}", cmd_path);
-        int cmd_fd = ::open(cmd_path.c_str(),
+        std::string tmp_cmd = cmd_path + ".tmp";
+        int cmd_fd = ::open(tmp_cmd.c_str(),
                             O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (cmd_fd >= 0) {
             const char* wd = data_to_send.data();
@@ -2581,16 +2596,17 @@ bool Injection::execute_script(const std::string& source) {
                 rem -= static_cast<size_t>(n);
             }
             ::close(cmd_fd);
-            if (fok) {
+            if (fok && ::rename(tmp_cmd.c_str(), cmd_path.c_str()) == 0) {
                 set_state(InjectionState::Ready,
-                          "Script dispatched via file IPC");
+                          "Bytecode dispatched via file IPC");
                 LOG_INFO("Sent {} bytes via file IPC: {}",
                          data_to_send.size(), cmd_path);
                 return true;
             }
-            LOG_ERROR("File IPC write error: {}", strerror(errno));
+            LOG_ERROR("File IPC write/rename error: {}", strerror(errno));
+            ::unlink(tmp_cmd.c_str());
         } else {
-            LOG_ERROR("Cannot create cmd file {}: {}", cmd_path, strerror(errno));
+            LOG_ERROR("Cannot create cmd file {}: {}", tmp_cmd, strerror(errno));
         }
 
         payload_loaded_ = false;
@@ -2658,6 +2674,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
