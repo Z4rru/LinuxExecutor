@@ -56,7 +56,7 @@ static void plog(const char* fmt, ...) {
     va_end(ap);
     if (len <= 0) return;
     if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
-    write(STDERR_FILENO, buf, (size_t)len);
+    (void)!write(STDERR_FILENO, buf, (size_t)len);
     int fd = open(g_log_path, O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
         ssize_t r = write(fd, buf, (size_t)len);
@@ -76,7 +76,7 @@ static void elog(const char* fmt, ...) {
     va_end(ap);
     if (len <= 0) return;
     if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
-    write(STDERR_FILENO, buf, (size_t)len);
+    (void)!write(STDERR_FILENO, buf, (size_t)len);
     int fd = open(g_elog_path, O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
         ssize_t r = write(fd, buf, (size_t)len);
