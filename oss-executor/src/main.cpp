@@ -16,6 +16,7 @@ static void fix_gio_before_anything() {
 
 #include "ui/app.hpp"
 #include "core/executor.hpp"
+#include "core/injection.hpp"
 #include "utils/logger.hpp"
 #include "utils/config.hpp"
 
@@ -121,8 +122,9 @@ int main(int argc, char** argv) {
         oss::Injection::instance().stop_auto_scan();
         oss::Injection::instance().detach();
         executor.shutdown();
+        oss::Injection::instance().detach();
         LOG_INFO("OSS Executor shut down cleanly");
-        oss::Logger::shutdown(); 
+        oss::Logger::shutdown();
 
     } catch (const std::exception& e) {
         std::cerr << "[FATAL] " << e.what() << std::endl;
@@ -134,4 +136,5 @@ int main(int argc, char** argv) {
 
     return exit_code;
 }
+
 
