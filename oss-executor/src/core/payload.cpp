@@ -214,8 +214,22 @@ static void drain_queue(lua_State* L) {
         if (is_bytecode) {
             bc_data = src.data();
             bc_sz = src.size();
+        } else if (G.compile) {
+            size_t out_sz = 0;
+            compiled = G.compile(src.c_str(), src.size(), nullptr, &out_sz);
+            if (!compiled || out_sz == 0) {
+                plog("[payload] in-process compile failed (%zu bytes src)\n", src.size());
+                if (compiled) { free(compiled); compiled = nullptr; }
+                continue;
+            }
+            bc_data = compiled;
+            bc_sz = out_sz;
+            plog("[payload] compiled %zu src -> %zu bc (target compiler)\n",
+                 src.size(), bc_sz);
         } else {
-            plog("[payload] received source code (%zu bytes), executor must send bytecode\n", src.size());
+            plog("[payload] source code (%zu bytes) but no compiler — "
+                 "executor must send bytecode matching target Luau version\n",
+                 src.size());
             continue;
         }
 
@@ -246,10 +260,11 @@ static void drain_queue(lua_State* L) {
                          "Update the Luau version in CMakeLists.txt or use "
                          "Roblox's own compiler.\n");
                 }
-            } else {
-                plog("[payload] load error (code %d)\n", lr);
-            }
-            G.settop(L, -2);
+        } else {
+            plog("[payload] script executed OK (result=%d)\n", rr);
+        }
+        if (compiled) { free(compiled); compiled = nullptr; }
+        G.settop(L, -2);
             continue;
         }
         plog("[payload] executing script (%zu bytes bc)...\n", bc_sz);
@@ -1003,7 +1018,7 @@ static uintptr_t walk_back_to_func(uintptr_t addr) {
 
 static bool resolve_functions() {
     void* h = RTLD_DEFAULT;
-    G.compile   = nullptr;
+    G.compile   = (fn_compile)dlsym(h, "luau_compile");
     G.load      = (fn_load)dlsym(h, "luau_load");
     G.pcall     = (fn_pcall)dlsym(h, "lua_pcall");
     G.resume    = (fn_resume)dlsym(h, "lua_resume");
@@ -1040,11 +1055,18 @@ static bool resolve_functions() {
                 // Keep compile — we can use ours as fallback compiler
             }
         }
-        // Also check load
+                // Also check load
         if (G.load && dladdr((void*)G.load, &di) && di.dli_fname) {
             if (strstr(di.dli_fname, "liboss_payload")) {
                 plog("[payload] WARNING: dlsym resolved luau_load from payload. Clearing.\n");
                 G.load = nullptr;
+            }
+        }
+    
+        if (G.compile && dladdr((void*)G.compile, &di) && di.dli_fname) {
+            if (strstr(di.dli_fname, "liboss_payload")) {
+                plog("[payload] WARNING: dlsym resolved luau_compile from payload. Clearing.\n");
+                G.compile = nullptr;
             }
         }
     }
@@ -1053,6 +1075,7 @@ static bool resolve_functions() {
         return true;
 
     struct { const char* name; void** ptr; } syms[] = {
+        {"luau_compile",       (void**)&G.compile},
         {"luau_load",          (void**)&G.load},
         {"lua_pcall",          (void**)&G.pcall},
         {"lua_resume",         (void**)&G.resume},
@@ -1194,8 +1217,35 @@ static bool resolve_functions() {
     }
 
     if (!G.compile) {
-        plog("[payload] luau_compile not in target; "
-             "source scripts require pre-compiled bytecode from the executor\n");
+        static const char* compile_strings[] = {
+            "compile option",
+            "CompileError",
+            "broken string",
+            nullptr
+        };
+        for (int i = 0; compile_strings[i] && !G.compile; i++) {
+            size_t slen = strlen(compile_strings[i]);
+            uintptr_t str_addr = scan_for_string(compile_strings[i], slen);
+            if (!str_addr) continue;
+            plog("[payload] found compile string '%s' at %lx\n",
+                 compile_strings[i], str_addr);
+            uintptr_t xref = find_lea_xref(str_addr);
+            if (!xref) continue;
+            uintptr_t func = walk_back_to_func(xref);
+            if (func) {
+                Dl_info di;
+                if (dladdr((void*)func, &di) && di.dli_fname &&
+                    strstr(di.dli_fname, "liboss_payload")) {
+                    plog("[payload] compile candidate %lx is in payload, skip\n", func);
+                    continue;
+                }
+                G.compile = (fn_compile)func;
+                plog("[payload] string-ref: luau_compile at %lx\n", func);
+            }
+        }
+        if (!G.compile)
+            plog("[payload] luau_compile not found — need pre-compiled "
+                 "bytecode from executor (MUST match target Luau version)\n");
     }
 
     if (!G.resume && G.mod_base) {
@@ -1341,10 +1391,16 @@ static void* file_cmd_worker(void*) {
             if (!G.queue.empty()) {
                 stale_ticks++;
                 if (stale_ticks % 40 == 0) {
-                    plog("[payload] WARNING: %zu scripts queued for %ds without drain. "
-                         "hooked=%d captured_L=%p\n",
+                    plog("[payload] WARNING: %zu scripts queued for %ds without drain.\n"
+                         "  hooked=%d captured_L=%p original_resume=%p\n"
+                         "  load=%p newthread=%p settop=%p compile=%p\n"
+                         "  hook_addr=%lx trampoline=%p\n",
                          G.queue.size(), stale_ticks / 20,
-                         G.hooked.load() ? 1 : 0, G.captured_L);
+                         G.hooked.load() ? 1 : 0, G.captured_L,
+                         (void*)G.original_resume,
+                         (void*)G.load, (void*)G.newthread,
+                         (void*)G.settop, (void*)G.compile,
+                         G.hook_addr, (void*)G.trampoline);
                     write_status("stale");
                 }
                 if (!G.hooked.load() && stale_ticks >= 100 && reinit_attempts < 5) {
@@ -1456,9 +1512,13 @@ static void* ipc_worker(void*) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void* init_worker(void*) {
-    usleep(500000);
+      
+    for (int w = 0; w < 20; w++) {
+        usleep(500000);
+        if (!G.alive.load(std::memory_order_relaxed)) return nullptr;
+    }
 
-    plog("[payload] init_worker: resolving module...\n");
+    plog("[payload] init_worker: resolving module (after 10s safety delay)...\n");
     if (!find_module()) {
         plog("[payload] WARN: module not found, relaxed scan...\n");
         auto regions = get_regions();
@@ -1506,6 +1566,48 @@ static void* init_worker(void*) {
              "scripts will NOT have access to game, workspace, Players etc.\n");
 
     plog("[payload] installing hook on lua_resume at %lx...\n", (uintptr_t)G.resume);
+
+    // Validate prologue before modifying code
+    {
+        uint8_t probe[32];
+        if (!safe_read((uintptr_t)G.resume, probe, sizeof(probe))) {
+            plog("[payload] FATAL: cannot read target at %lx\n", (uintptr_t)G.resume);
+            write_status("fatal_unreadable");
+            return nullptr;
+        }
+        bool ok = false;
+        if (probe[0] == 0xF3 && probe[1] == 0x0F &&
+            probe[2] == 0x1E && probe[3] == 0xFA)         ok = true; // endbr64
+        else if (probe[0] == 0x55)                         ok = true; // push rbp
+        else if (probe[0] == 0x53)                         ok = true; // push rbx
+        else if (probe[0] >= 0x41 && probe[0] <= 0x43 &&
+                 probe[1] >= 0x54 && probe[1] <= 0x57)     ok = true; // push r12-r15
+        else if (probe[0] == 0x48 && probe[1] == 0x83 &&
+                 probe[2] == 0xEC)                         ok = true; // sub rsp,imm8
+        else if (probe[0] == 0x48 && probe[1] == 0x89 &&
+                 probe[2] == 0xE5)                         ok = true; // mov rbp,rsp
+        if (!ok) {
+            plog("[payload] BAD PROLOGUE at %lx: %02x %02x %02x %02x — "
+                 "not hooking (would crash)\n",
+                 (uintptr_t)G.resume,
+                 probe[0], probe[1], probe[2], probe[3]);
+            write_status("skip_bad_prologue");
+            return nullptr;
+        }
+        size_t decoded = 0; int cnt = 0;
+        while (decoded < 16 && cnt < 5) {
+            size_t il = insn_len(probe + decoded);
+            if (il == 0) break;
+            decoded += il; cnt++;
+        }
+        if (cnt < 3 || decoded < 5) {
+            plog("[payload] cannot decode enough prologue bytes "
+                 "(%zu bytes, %d insns) — not hooking\n", decoded, cnt);
+            write_status("skip_undecoded");
+            return nullptr;
+        }
+        plog("[payload] prologue OK: %d insns, %zu bytes\n", cnt, decoded);
+    }
 
     uint8_t* tramp = nullptr;
     if (!install_hook((uintptr_t)G.resume, (void*)resume_detour, tramp)) {
