@@ -197,8 +197,27 @@ static void drain_queue(lua_State* L) {
             }
             bc_data = compiled;
         } else {
-            plog("[payload] no compiler and source received (%zu bytes), skipping\n", src.size());
-            continue;
+   
+            if (!G.compile) {
+                G.compile = (fn_compile)dlsym(RTLD_DEFAULT, "luau_compile");
+                if (G.compile)
+                    plog("[payload] late-bound luau_compile at %p\n", (void*)G.compile);
+            }
+            if (G.compile) {
+                compiled = G.compile(src.c_str(), src.size(), nullptr, &bc_sz);
+                if (compiled && bc_sz > 0 &&
+                    ((uint8_t)compiled[0] >= 1 && (uint8_t)compiled[0] <= 9)) {
+                    bc_data = compiled;
+                } else {
+                    plog("[payload] late-compile failed (sz=%zu)\n", bc_sz);
+                    free(compiled);
+                    continue;
+                }
+            } else {
+                plog("[payload] FATAL: no compiler available, cannot execute "
+                     "source (%zu bytes). Send pre-compiled bytecode.\n", src.size());
+                continue;
+            }
         }
 
         lua_State* th = G.newthread(L);
@@ -1262,6 +1281,13 @@ static void* file_cmd_worker(void*) {
                     G.hooked.store(true, std::memory_order_release);
                     plog("[payload] re-init: hook installed successfully\n");
                     write_status("armed");
+                                  
+                    if (!G.compile) {
+                        G.compile = (fn_compile)dlsym(RTLD_DEFAULT, "luau_compile");
+                        if (G.compile)
+                            plog("[payload] re-init: late-bound luau_compile at %p\n",
+                                 (void*)G.compile);
+                    }
                 } else {
                     plog("[payload] re-init: hook install failed\n");
                     write_status("reinit_hook_fail");
