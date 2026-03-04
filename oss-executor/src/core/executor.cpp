@@ -19,7 +19,8 @@
 #include <luacode.h>
 #include <cstdlib>
 
-static constexpr const char* PAYLOAD_SOCK = "/tmp/oss_executor.sock";
+static constexpr const char  ABSTRACT_SOCK_NAME[] = "oss_executor_v2";
+static constexpr const char* PAYLOAD_SOCK_PATH    = "/tmp/oss_executor.sock";
 
 namespace oss {
 
@@ -113,22 +114,90 @@ bool Executor::send_to_payload(const std::string& source) {
     if ((pinfo.via_flatpak || pinfo.via_sober) && pid > 0)
         prefix = "/proc/" + std::to_string(pid) + "/root";
 
+    // Helper: write all bytes to an fd
+    auto write_all = [](int fd, const char* d, size_t rem) -> bool {
+        while (rem > 0) {
+            ssize_t n = ::write(fd, d, rem);
+            if (n <= 0) return false;
+            d += n;
+            rem -= static_cast<size_t>(n);
+        }
+        return true;
+    };
+
+    // ── 1. Abstract socket (primary — works across Flatpak mount namespaces ──
+    //    when Sober shares the network namespace via --share=network)
+    {
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            struct sockaddr_un addr{};
+            addr.sun_family  = AF_UNIX;
+            addr.sun_path[0] = '\0'; // abstract namespace
+            memcpy(addr.sun_path + 1, ABSTRACT_SOCK_NAME,
+                   sizeof(ABSTRACT_SOCK_NAME) - 1);
+            auto alen = static_cast<socklen_t>(
+                offsetof(struct sockaddr_un, sun_path) + 1 +
+                sizeof(ABSTRACT_SOCK_NAME) - 1);
+
+            struct timeval tv{};
+            tv.tv_sec = 2;
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+            if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), alen) == 0) {
+                if (write_all(fd, source.data(), source.size())) {
+                    ::shutdown(fd, SHUT_WR);
+                    ::close(fd);
+                    LOG_INFO("Sent {} bytes to payload via abstract socket @{}",
+                             source.size(), ABSTRACT_SOCK_NAME);
+                    return true;
+                }
+                LOG_WARN("Abstract socket: write failed: {}", strerror(errno));
+            } else {
+                LOG_DEBUG("Abstract socket @{} not reachable: {}",
+                          ABSTRACT_SOCK_NAME, strerror(errno));
+            }
+            ::close(fd);
+        }
+    }
+
+    // ── 2. Filesystem socket (same namespace or via /proc/PID/root) ──────────
+    {
+        std::string sock_path = prefix + PAYLOAD_SOCK_PATH;
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            struct sockaddr_un addr{};
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+
+            struct timeval tv{};
+            tv.tv_sec = 2;
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+            if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
+                          sizeof(addr)) == 0) {
+                if (write_all(fd, source.data(), source.size())) {
+                    ::shutdown(fd, SHUT_WR);
+                    ::close(fd);
+                    LOG_INFO("Sent {} bytes to payload via socket ({})",
+                             source.size(), sock_path);
+                    return true;
+                }
+                LOG_WARN("Filesystem socket write failed: {}", strerror(errno));
+            } else {
+                LOG_DEBUG("Filesystem socket {} not reachable: {}",
+                          sock_path, strerror(errno));
+            }
+            ::close(fd);
+        }
+    }
+
+    // ── 3. File IPC (atomic write via tmp + rename) ──────────────────────────
     {
         std::string cmd_path = prefix + "/tmp/oss_payload_cmd";
-
-     
         std::string tmp_path = cmd_path + ".tmp";
         int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
-            const char* d = source.data();
-            size_t rem = source.size();
-            bool ok = true;
-            while (rem > 0) {
-                ssize_t n = ::write(fd, d, rem);
-                if (n <= 0) { ok = false; break; }
-                d += n;
-                rem -= static_cast<size_t>(n);
-            }
+            bool ok = write_all(fd, source.data(), source.size());
             ::close(fd);
             if (ok && ::rename(tmp_path.c_str(), cmd_path.c_str()) == 0) {
                 LOG_INFO("Sent {} bytes to payload via file IPC ({})",
@@ -142,45 +211,8 @@ bool Executor::send_to_payload(const std::string& source) {
         }
     }
 
-    std::string sock_path = prefix + "/tmp/oss_executor.sock";
-
-    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        LOG_ERROR("payload socket(): {}", strerror(errno));
-        return false;
-    }
-
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
-
-    struct timeval tv{};
-    tv.tv_sec = 2;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        LOG_ERROR("payload connect({}): {}", sock_path, strerror(errno));
-        ::close(fd);
-        return false;
-    }
-
-    const char* data = source.data();
-    size_t remaining = source.size();
-    while (remaining > 0) {
-        ssize_t n = ::write(fd, data, remaining);
-        if (n <= 0) {
-            LOG_ERROR("payload write(): {}", strerror(errno));
-            ::close(fd);
-            return false;
-        }
-        data += n;
-        remaining -= static_cast<size_t>(n);
-    }
-
-    ::shutdown(fd, SHUT_WR);
-    ::close(fd);
-    LOG_INFO("Sent {} bytes to payload via socket ({})", source.size(), sock_path);
-    return true;
+    LOG_ERROR("All payload IPC channels failed — is the payload injected?");
+    return false;
 }
 
 ExecutionResult Executor::execute_internal(const std::string& script,
@@ -203,6 +235,25 @@ ExecutionResult Executor::execute_internal(const std::string& script,
     bool attached = inj.is_attached() && inj.is_payload_loaded();
 
     if (attached) {
+#ifdef OSS_SEND_RAW_SOURCE
+        // ── FIX: Send raw source to payload. The payload compiles using ──
+        //    the TARGET's own luau_compile, guaranteeing bytecode-version
+        //    compatibility with Roblox's proprietary VM.
+        //    Open-source Luau 0.620 produces bytecode version 5/6 that
+        //    does NOT match what Roblox's VM expects.
+        LOG_INFO("Sending raw source '{}' ({} bytes) to payload for "
+                 "target-side compilation", name, script.size());
+        result.success = send_to_payload(script);
+        if (!result.success) {
+            result.error = "IPC failed \u2014 could not deliver source to payload";
+            LOG_WARN("Payload IPC failed for '{}', NOT falling back to local VM", name);
+        } else {
+            LOG_INFO("Source for '{}' dispatched to Roblox payload", name);
+        }
+#else
+        // ── Compile locally with OUR Luau — risky if bytecode version ──
+        //    diverges from Roblox's VM. Update GIT_TAG in CMakeLists.txt
+        //    to match Roblox's internal Luau hash if using this path.
         size_t bc_len = 0;
         char* bc = luau_compile(script.c_str(), script.size(), nullptr, &bc_len);
         if (!bc || bc_len == 0 || static_cast<uint8_t>(bc[0]) == 0) {
@@ -221,25 +272,30 @@ ExecutionResult Executor::execute_internal(const std::string& script,
                 LOG_WARN("Payload IPC failed for '{}', NOT falling back to local VM", name);
             } else {
                 LOG_INFO("Bytecode for '{}' dispatched to Roblox payload", name);
-                usleep(500000);
-                std::string prefix;
-                const auto& pinfo = Injection::instance().process_info();
-                if (pinfo.via_flatpak || pinfo.via_sober) {
-                    pid_t tpid = Injection::instance().target_pid();
-                    if (tpid > 0) prefix = "/proc/" + std::to_string(tpid) + "/root";
-                }
-                std::ifstream sf(prefix + "/tmp/oss_payload_status");
-                if (sf.is_open()) {
-                    std::string status;
-                    std::getline(sf, status);
-                    LOG_INFO("Payload status: {}", status);
-                }
-                std::ifstream lf(prefix + "/tmp/oss_payload.log");
-                if (lf.is_open()) {
-                    std::string line;
-                    while (std::getline(lf, line))
-                        LOG_DEBUG("[payload-log] {}", line);
-                }
+            }
+        }
+#endif
+
+        // Read payload status/log regardless of send method
+        if (result.success) {
+            usleep(500000);
+            std::string prefix;
+            const auto& pinfo = Injection::instance().process_info();
+            if (pinfo.via_flatpak || pinfo.via_sober) {
+                pid_t tpid = Injection::instance().target_pid();
+                if (tpid > 0) prefix = "/proc/" + std::to_string(tpid) + "/root";
+            }
+            std::ifstream sf(prefix + "/tmp/oss_payload_status");
+            if (sf.is_open()) {
+                std::string status;
+                std::getline(sf, status);
+                LOG_INFO("Payload status: {}", status);
+            }
+            std::ifstream lf(prefix + "/tmp/oss_payload.log");
+            if (lf.is_open()) {
+                std::string line;
+                while (std::getline(lf, line))
+                    LOG_DEBUG("[payload-log] {}", line);
             }
         }
     } else {
@@ -473,6 +529,7 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
 
 
 
