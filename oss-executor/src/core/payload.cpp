@@ -362,7 +362,30 @@ static bool make_rwx(void* addr, size_t len) {
     uintptr_t page = (uintptr_t)addr & ~0xFFFULL;
     size_t span = ((uintptr_t)addr + len) - page + 0xFFF;
     span &= ~0xFFFULL;
-    return mprotect((void*)page, span, PROT_READ|PROT_WRITE|PROT_EXEC) == 0;
+    if (mprotect((void*)page, span, PROT_READ|PROT_WRITE|PROT_EXEC) == 0)
+        return true;
+    int e1 = errno;
+    if (mprotect((void*)page, span, PROT_READ|PROT_WRITE) == 0)
+        return true;
+    plog("[payload] mprotect failed at %p: RWX=%s RW=%s — seccomp likely blocking\n",
+         addr, strerror(e1), strerror(errno));
+    return false;
+}
+
+static bool self_mem_write(uintptr_t addr, const void* data, size_t len) {
+    int fd = open("/proc/self/mem", O_RDWR);
+    if (fd < 0) {
+        plog("[payload] self_mem_write: open failed: %s\n", strerror(errno));
+        return false;
+    }
+    ssize_t w = pwrite(fd, data, len, (off_t)addr);
+    close(fd);
+    if (w != (ssize_t)len) {
+        plog("[payload] self_mem_write: pwrite 0x%lx failed (%zd/%zu): %s\n",
+             addr, w, len, strerror(errno));
+        return false;
+    }
+    return true;
 }
 
 static uint8_t* alloc_near(uintptr_t target, size_t sz) {
@@ -375,6 +398,25 @@ static uint8_t* alloc_near(uintptr_t target, size_t sz) {
                  PROT_READ|PROT_WRITE|PROT_EXEC,
                  MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
         if (p != MAP_FAILED) return (uint8_t*)p;
+    }
+    plog("[payload] alloc_near: RWX mmap failed, trying RW then mprotect\n");
+    for (intptr_t off = 0x1000; off < 0x7FFF0000LL; off += 0x1000) {
+        void* p = mmap((void*)(target - off), sz,
+                       PROT_READ|PROT_WRITE,
+                       MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED) {
+            if (mprotect(p, sz, PROT_READ|PROT_WRITE|PROT_EXEC) == 0)
+                return (uint8_t*)p;
+            munmap(p, sz);
+        }
+        p = mmap((void*)(target + off), sz,
+                 PROT_READ|PROT_WRITE,
+                 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED) {
+            if (mprotect(p, sz, PROT_READ|PROT_WRITE|PROT_EXEC) == 0)
+                return (uint8_t*)p;
+            munmap(p, sz);
+        }
     }
     return nullptr;
 }
@@ -638,26 +680,33 @@ static bool install_hook(uintptr_t target, void* detour, uint8_t*& tramp_out) {
     G.stolen_len = total;
     G.hook_addr  = target;
 
-    if (!make_rwx((void*)target, total)) {
-        plog("[payload] hook: mprotect failed on target\n");
-        return false;
-    }
+    bool can_direct = make_rwx((void*)target, total);
+    if (!can_direct)
+        plog("[payload] hook: mprotect failed, using /proc/self/mem fallback\n");
+
+    auto write_code = [&](uintptr_t addr, const void* data, size_t len) -> bool {
+        if (can_direct) { memcpy((void*)addr, data, len); return true; }
+        return self_mem_write(addr, data, len);
+    };
 
     int64_t rel64 = (int64_t)((uintptr_t)detour - (target + 5));
     if (rel64 >= INT32_MIN && rel64 <= INT32_MAX) {
         int32_t rel = (int32_t)rel64;
-        auto* code = (uint8_t*)target;
-        code[0] = 0xE9;
-        memcpy(code + 1, &rel, 4);
-        for (size_t j = 5; j < total; ++j) code[j] = 0x90;
-        plog("[payload] hook: direct E9 jump installed (rel=%d)\n", rel);
+        uint8_t patch[MAX_STOLEN];
+        patch[0] = 0xE9;
+        memcpy(patch + 1, &rel, 4);
+        for (size_t j = 5; j < total; ++j) patch[j] = 0x90;
+        if (!write_code(target, patch, total)) {
+            plog("[payload] hook: FATAL — cannot write patch via any method\n");
+            return false;
+        }
+        plog("[payload] hook: E9 jump installed (rel=%d via %s)\n",
+             rel, can_direct ? "direct" : "/proc/self/mem");
     } else {
         plog("[payload] hook: detour too far (delta=%ld), using relay\n", (long)rel64);
-
         uint8_t* relay = alloc_near(target, 14);
         if (!relay) {
             plog("[payload] hook: relay alloc failed\n");
-            memcpy((void*)target, G.stolen, G.stolen_len);
             return false;
         }
         relay[0] = 0xFF;
@@ -668,15 +717,19 @@ static bool install_hook(uintptr_t target, void* detour, uint8_t*& tramp_out) {
         int64_t relay_rel64 = (int64_t)((uintptr_t)relay - (target + 5));
         if (relay_rel64 < INT32_MIN || relay_rel64 > INT32_MAX) {
             plog("[payload] hook: even relay is too far, abort\n");
-            memcpy((void*)target, G.stolen, G.stolen_len);
             return false;
         }
         int32_t relay_rel = (int32_t)relay_rel64;
-        auto* code = (uint8_t*)target;
-        code[0] = 0xE9;
-        memcpy(code + 1, &relay_rel, 4);
-        for (size_t j = 5; j < total; ++j) code[j] = 0x90;
-        plog("[payload] hook: relay jump installed at %p\n", relay);
+        uint8_t patch[MAX_STOLEN];
+        patch[0] = 0xE9;
+        memcpy(patch + 1, &relay_rel, 4);
+        for (size_t j = 5; j < total; ++j) patch[j] = 0x90;
+        if (!write_code(target, patch, total)) {
+            plog("[payload] hook: FATAL — cannot write relay patch\n");
+            return false;
+        }
+        plog("[payload] hook: relay jump installed at %p (via %s)\n",
+             relay, can_direct ? "direct" : "/proc/self/mem");
     }
 
     return true;
@@ -684,8 +737,11 @@ static bool install_hook(uintptr_t target, void* detour, uint8_t*& tramp_out) {
 
 static void restore_hook() {
     if (G.hook_addr && G.stolen_len) {
-        make_rwx((void*)G.hook_addr, G.stolen_len);
-        memcpy((void*)G.hook_addr, G.stolen, G.stolen_len);
+        if (make_rwx((void*)G.hook_addr, G.stolen_len)) {
+            memcpy((void*)G.hook_addr, G.stolen, G.stolen_len);
+        } else {
+            self_mem_write(G.hook_addr, G.stolen, G.stolen_len);
+        }
         plog("[payload] hook restored\n");
     }
 }
@@ -1488,13 +1544,11 @@ static void* file_cmd_worker(void*) {
             }
         }
 
-        // Direct drain: if hook is armed and we have a captured lua_State
-        // but the queue is stuck (resume_detour not firing), drain from here
-        if (G.hooked.load(std::memory_order_relaxed) && G.captured_L &&
+        if (G.captured_L &&
             G.queue_count.load(std::memory_order_relaxed) > 0 && stale_ticks >= 10) {
-            plog("[payload] direct drain attempt (stale %d ticks, captured_L=%p)\n",
-                 stale_ticks, G.captured_L);
-            g_in = true;   // block re-entrancy from the hook
+            plog("[payload] direct drain attempt (stale %d ticks, captured_L=%p hooked=%d)\n",
+                 stale_ticks, G.captured_L, G.hooked.load() ? 1 : 0);
+            g_in = true;
             drain_queue(G.captured_L);
             g_in = false;
             stale_ticks = 0;
