@@ -45,6 +45,7 @@ struct alignas(64) Mailbox {
 };
 static Mailbox* g_mailbox = nullptr;
 static void plog(const char* fmt, ...);
+static void write_status(const char* status);
 static uintptr_t g_payload_lo = 0, g_payload_hi = 0;
 
 static void detect_payload_range() {
