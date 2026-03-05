@@ -208,6 +208,7 @@ struct {
 static thread_local bool g_in = false;
 
 static void set_identity(lua_State* L) {
+    if (!L) return;
     uint8_t* extra = *reinterpret_cast<uint8_t**>(L);
     if (!extra) return;
 
@@ -249,6 +250,7 @@ static void set_identity(lua_State* L) {
 }
 
 static void drain_queue(lua_State* L) {
+    if (!L) return;
     if (!G.load || !G.newthread || !G.settop || !G.original_resume) {
         plog("[payload] Cannot drain queue: critical functions missing "
              "(load=%p newthread=%p settop=%p resume=%p)\n",
@@ -361,22 +363,26 @@ static void drain_queue(lua_State* L) {
         G.settop(L, -2);
         if (compiled) { free(compiled); compiled = nullptr; }
     }
+    write_status("drained");
 }
 
 static int resume_detour(lua_State* L, lua_State* from, int nargs) {
     // Capture L as well when from is null — first valid state we see
-    if (!G.captured_L) {
-        G.captured_L = from ? from : L;
-        plog("[payload] captured lua_State* = %p (from=%p L=%p)\n",
-             G.captured_L, from, L);
+    lua_State* candidate = from ? from : L;
+    if (candidate) {
+        if (!G.captured_L)
+            plog("[payload] captured lua_State* = %p (from=%p L=%p)\n",
+                 candidate, from, L);
+        G.captured_L = candidate;
     }
 
+    if (!G.original_resume) return -1;
     int ret = G.original_resume(L, from, nargs);
     if (g_in) return ret;
     g_in = true;
 
     // Use captured_L as ultimate fallback if both from and L are null
-    lua_State* parent = from ? from : (L ? L : G.captured_L);
+    lua_State* parent = from ? from : (G.captured_L ? G.captured_L : L);
     if (parent && G.queue_count.load(std::memory_order_relaxed) > 0)
         drain_queue(parent);
 
@@ -1541,7 +1547,7 @@ static void* file_cmd_worker(void*) {
                          G.hook_addr, (void*)G.trampoline);
                     write_status("stale");
                 }
-                if (!G.hooked.load() && stale_ticks >= 100 && reinit_attempts < 5) {
+                if (!G.hooked.load() && stale_ticks >= 40 && reinit_attempts < 5) {
                     need_reinit = true;
                     reinit_attempts++;
                     stale_ticks = 0;
@@ -1658,7 +1664,7 @@ static void* ipc_worker(void*) {
 
 static void* init_worker(void*) {
       
-    for (int w = 0; w < 4; w++) {
+    for (int w = 0; w < 2; w++) {
         usleep(500000);
         if (!G.alive.load(std::memory_order_relaxed)) return nullptr;
     }
