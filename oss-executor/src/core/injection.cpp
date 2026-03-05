@@ -1204,48 +1204,80 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         pos = 4;
     }
 
+    auto decode_modrm_len = [&](int base) -> int {
+        uint8_t modrm = orig_prologue[base];
+        int mod = (modrm >> 6) & 3;
+        int rm = modrm & 7;
+        int extra = 1;
+        if (mod == 0 && rm == 5) extra += 4;
+        else if (mod == 0 && rm == 4) { extra += 1; uint8_t sib = orig_prologue[base+1]; if ((sib & 7) == 5) extra += 4; }
+        else if (mod == 1) { extra += (rm == 4) ? 2 : 1; }
+        else if (mod == 2) { extra += (rm == 4) ? 5 : 4; }
+        else if (mod == 3) { }
+        else if (rm == 4) extra += 1;
+        return extra;
+    };
+
     while (pos < 5 && pos < 14) {
         uint8_t b = orig_prologue[pos];
         bool has_rex = (b >= 0x40 && b <= 0x4F);
         int rex_off = has_rex ? 1 : 0;
-        uint8_t next = orig_prologue[pos + rex_off];
+        uint8_t op = orig_prologue[pos + rex_off];
 
-        if (!has_rex && b >= 0x50 && b <= 0x5F) {
-            pos += 1;
-        } else if (b == 0x41 && (next >= 0x50 && next <= 0x57)) {
-            pos += 2;
-        } else if (has_rex && next == 0x89 && orig_prologue[pos + rex_off + 1] == 0xE5) {
-            pos += rex_off + 2;
-        } else if (has_rex && next == 0x83 && orig_prologue[pos + rex_off + 1] == 0xEC) {
-            pos += rex_off + 3;
-        } else if (has_rex && next == 0x81 && orig_prologue[pos + rex_off + 1] == 0xEC) {
-            pos += rex_off + 6;
-        } else if (b == 0x31 && orig_prologue[pos + 1] == 0xC0) {
-            pos += 2;
-        } else if (has_rex && next == 0x8D) {
+        if (!has_rex && b >= 0x50 && b <= 0x5F) { pos += 1; }
+        else if (has_rex && op >= 0x50 && op <= 0x5F) { pos += rex_off + 1; }
+        else if (b == 0x55) { pos += 1; }
+        else if (b == 0x90 || b == 0xCC) { pos += 1; }
+        else if (b == 0xC3) { break; }
+        else if (b == 0x31 && orig_prologue[pos+1] == 0xC0) { pos += 2; }
+        else if (b == 0x33 && orig_prologue[pos+1] == 0xC0) { pos += 2; }
+        else if (has_rex && op == 0x89) { pos += rex_off + 1 + decode_modrm_len(pos + rex_off + 1); }
+        else if (has_rex && op == 0x8B) { pos += rex_off + 1 + decode_modrm_len(pos + rex_off + 1); }
+        else if (has_rex && op == 0x8D) {
             uint8_t modrm = orig_prologue[pos + rex_off + 1];
             int mod = (modrm >> 6) & 3;
             int rm = modrm & 7;
-            pos += rex_off + 2;
-            if (rm == 4) pos += 1;
-            if (mod == 1) pos += 1;
-            else if (mod == 2 || (mod == 0 && rm == 5)) pos += 4;
-        } else if (b == 0x55) {
-            pos += 1;
-        } else if (b == 0x90 || b == 0xCC) {
-            pos += 1;
-        } else {
-            LOG_WARN("Unknown opcode 0x{:02X} at prologue offset {}, assuming 1 byte", b, pos);
-            pos += 1;
+            if (mod == 0 && rm == 5) { LOG_WARN("RIP-relative LEA at offset {} — skipping function", pos); pos = 0; break; }
+            pos += rex_off + 1 + decode_modrm_len(pos + rex_off + 1);
+        }
+        else if (has_rex && op == 0x83) { pos += rex_off + 1 + decode_modrm_len(pos + rex_off + 1) + 1; }
+        else if (has_rex && op == 0x81) { pos += rex_off + 1 + decode_modrm_len(pos + rex_off + 1) + 4; }
+        else if (!has_rex && op == 0x83) { pos += 1 + decode_modrm_len(pos + 1) + 1; }
+        else if (!has_rex && op == 0x81) { pos += 1 + decode_modrm_len(pos + 1) + 4; }
+        else if (b == 0x89) { pos += 1 + decode_modrm_len(pos + 1); }
+        else if (b == 0x8B) { pos += 1 + decode_modrm_len(pos + 1); }
+        else if (b == 0xB8 || b == 0xB9 || b == 0xBA || b == 0xBB ||
+                 b == 0xBC || b == 0xBD || b == 0xBE || b == 0xBF) { pos += 5; }
+        else if (has_rex && op >= 0xB8 && op <= 0xBF) { pos += rex_off + 1 + ((b & 0x08) ? 8 : 4); }
+        else {
+            LOG_WARN("Unknown opcode 0x{:02X} at offset {} — trying next function", b, pos);
+            pos = 0;
+            break;
         }
     }
     steal_size = pos;
 
     if (steal_size < 5) {
-        error_ = "Cannot determine safe steal size for " + std::string(hooked_name) +
-                 " (got " + std::to_string(steal_size) + " bytes)";
-        LOG_ERROR("{}", error_);
-        return false;
+        LOG_WARN("Steal size {} too small for {} — trying next candidate", steal_size, hooked_name);
+        hook_func_addr = 0;
+        hooked_name = nullptr;
+        for (size_t ci = 0; ci < sizeof(candidates)/sizeof(candidates[0]); ci++) {
+            if (candidates[ci] == hooked_name) continue;
+            uintptr_t a2 = find_remote_symbol(pid, "c", candidates[ci]);
+            if (a2 == 0 || a2 == hook_func_addr) continue;
+            hook_func_addr = a2;
+            hooked_name = candidates[ci];
+            if (!proc_mem_read(pid, hook_func_addr, orig_prologue, sizeof(orig_prologue))) continue;
+            pos = 0;
+            if (orig_prologue[0]==0xF3 && orig_prologue[1]==0x0F && orig_prologue[2]==0x1E && orig_prologue[3]==0xFA) pos=4;
+            steal_size = 0;
+            break;
+        }
+        if (steal_size < 5 && hook_func_addr == 0) {
+            error_ = "No hookable function with sufficient prologue found";
+            LOG_ERROR("{}", error_);
+            return false;
+        }
     }
     LOG_DEBUG("Stealing {} bytes from prologue of {}", steal_size, hooked_name);
 
@@ -1960,10 +1992,23 @@ void Injection::stop_elevated_helper() {
         LOG_DEBUG("Thawing tracer PID {} before resuming target...", tracer);
         thaw_tracer(tracer);
         tracer_frozen = false;
-        usleep(20000);
+        usleep(50000);
     }
 
     kill(pid, SIGCONT);
+
+    for (int retry = 0; retry < 20; retry++) {
+        usleep(25000);
+        ProcessDetails rpd = get_process_details(pid);
+        if (rpd.state == 'S' || rpd.state == 'R' || rpd.state == 'D') {
+            LOG_DEBUG("Target running (state='{}')", rpd.state);
+            break;
+        }
+        if (rpd.state == 'T' || rpd.state == 't') {
+            LOG_DEBUG("Target still stopped (state='{}'), sending SIGCONT", rpd.state);
+            kill(pid, SIGCONT);
+        }
+    }
     LOG_DEBUG("Process resumed, waiting for dlopen...");
 
     bool completed = false;
@@ -2012,20 +2057,20 @@ void Injection::stop_elevated_helper() {
     if (tracer_frozen) {
         thaw_tracer(tracer);
         tracer_frozen = false;
-        usleep(20000);
+        usleep(50000);
     }
     kill(pid, SIGCONT);
-    usleep(200000);
+    for (int retry = 0; retry < 20; retry++) {
+        usleep(25000);
+        ProcessDetails rpd = get_process_details(pid);
+        if (rpd.state == 'S' || rpd.state == 'R' || rpd.state == 'D') break;
+        if (rpd.state == 'T' || rpd.state == 't') kill(pid, SIGCONT);
+    }
 
-    if (tracer > 0) tracer_frozen = freeze_tracer(tracer);
-    kill(pid, SIGSTOP);
-    usleep(50000);
+    usleep(300000);
 
     proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
     proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
-
-    kill(pid, SIGCONT);
-    if (tracer_frozen) thaw_tracer(tracer);
 
     stop_elevated_helper();
     LOG_INFO("inject_via_procmem: complete, process restored");
@@ -2499,26 +2544,51 @@ bool Injection::verify_payload_alive() {
             break;
         }
     }
-    if (!mapped) {
-        return false;
-    }
+    if (!mapped) return false;
 
-       
     std::string prefix;
-    if (proc_info_.via_flatpak || proc_info_.via_sober) {
-        pid_t pid = memory_.get_pid();
-        if (pid > 0)
-            prefix = "/proc/" + std::to_string(pid) + "/root";
-    }
+    pid_t pid = memory_.get_pid();
+    if ((proc_info_.via_flatpak || proc_info_.via_sober) && pid > 0)
+        prefix = "/proc/" + std::to_string(pid) + "/root";
 
-    std::string ready_path = prefix + "/tmp/oss_payload_ready";
     struct stat st;
-    bool reachable = (::stat(ready_path.c_str(), &st) == 0);
+    if (::stat((prefix + "/tmp/oss_payload_ready").c_str(), &st) == 0)
+        return true;
 
-    if (!reachable) {
-        LOG_WARN("Payload mapped but ready marker not found at {}", ready_path);
+    int afd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (afd >= 0) {
+        struct sockaddr_un abs_addr{};
+        abs_addr.sun_family = AF_UNIX;
+        abs_addr.sun_path[0] = '\0';
+        static constexpr char ABS_SOCK[] = "oss_executor_v2";
+        memcpy(abs_addr.sun_path + 1, ABS_SOCK, sizeof(ABS_SOCK) - 1);
+        socklen_t abs_len = static_cast<socklen_t>(
+            offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(ABS_SOCK) - 1);
+        struct timeval tv{}; tv.tv_usec = 500000;
+        setsockopt(afd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        bool ok = (::connect(afd, reinterpret_cast<struct sockaddr*>(&abs_addr), abs_len) == 0);
+        ::close(afd);
+        if (ok) return true;
     }
-    return reachable;
+
+    std::string sock_path = prefix + PAYLOAD_SOCK;
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        struct sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+        struct timeval tv{}; tv.tv_usec = 500000;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        bool ok = (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+        ::close(fd);
+        if (ok) return true;
+    }
+
+    if (::stat((prefix + "/tmp/oss_payload_cmd").c_str(), &st) == 0)
+        return true;
+
+    LOG_WARN("Payload mapped but no IPC channel reachable");
+    return mapped;
 }
 
 bool Injection::execute_script(const std::string& source) {
@@ -2733,6 +2803,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
