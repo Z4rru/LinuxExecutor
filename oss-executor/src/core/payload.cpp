@@ -44,6 +44,7 @@ struct alignas(64) Mailbox {
     char                   data[MAILBOX_DATA_CAP];
 };
 static Mailbox* g_mailbox = nullptr;
+static void plog(const char* fmt, ...);
 static uintptr_t g_payload_lo = 0, g_payload_hi = 0;
 
 static void detect_payload_range() {
@@ -1285,7 +1286,6 @@ static bool resolve_functions() {
             if (!str_addr) continue;
             uintptr_t xref = find_lea_xref(str_addr);
             if (!xref) continue;
-            uintptr_t func = walk_back_to_func(xref);
             uintptr_t func = walk_back_to_func(xref);
             if (func && !is_in_payload(func)) {
                 G.newthread = (fn_newthread)func;
