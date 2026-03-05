@@ -21,7 +21,7 @@ find_package(Threads REQUIRED)
 include(FetchContent)
 FetchContent_Declare(Luau
     GIT_REPOSITORY https://github.com/luau-lang/luau.git
-    GIT_TAG        0.620
+    GIT_TAG        0.710
     GIT_SHALLOW    TRUE)
 set(LUAU_BUILD_CLI   OFF CACHE BOOL "" FORCE)
 set(LUAU_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -176,6 +176,7 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
 
 
 
