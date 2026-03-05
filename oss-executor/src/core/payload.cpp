@@ -44,6 +44,28 @@ struct alignas(64) Mailbox {
     char                   data[MAILBOX_DATA_CAP];
 };
 static Mailbox* g_mailbox = nullptr;
+static uintptr_t g_payload_lo = 0, g_payload_hi = 0;
+
+static void detect_payload_range() {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find("liboss_payload") != std::string::npos) {
+            uintptr_t lo, hi;
+            if (sscanf(line.c_str(), "%lx-%lx", &lo, &hi) == 2) {
+                if (g_payload_lo == 0 || lo < g_payload_lo) g_payload_lo = lo;
+                if (hi > g_payload_hi) g_payload_hi = hi;
+            }
+        }
+    }
+    if (g_payload_lo)
+        plog("[payload] self-range: %lx-%lx (%zu KB)\n",
+             g_payload_lo, g_payload_hi, (g_payload_hi - g_payload_lo) >> 10);
+}
+
+static bool is_in_payload(uintptr_t addr) {
+    return g_payload_lo && addr >= g_payload_lo && addr < g_payload_hi;
+}
 // ─────────────────────────────────────────────────────────────────────────────
 
 static char g_log_path[512] = "/tmp/oss_payload.log";
@@ -287,6 +309,9 @@ static void drain_queue(lua_State* L) {
             plog("[payload] no bytecode produced, skipping script\n");
             continue;
         }
+
+        plog("[payload] bytecode version byte: %d (size=%zu)\n",
+             (int)(uint8_t)bc_data[0], bc_sz);
 
         lua_State* th = G.newthread(L);
         if (!th) {
@@ -1002,6 +1027,7 @@ static uintptr_t scan_for_string(const char* str, size_t slen) {
     for (int pass = 0; pass < 2; pass++) {
         for (auto& r : regions) {
             if (!r.r) continue;
+            if (is_in_payload(r.base)) continue;
             bool in_mod = G.mod_base && r.base >= G.mod_base &&
                           r.base < G.mod_base + G.mod_size;
             if (pass == 0 && !in_mod && G.mod_base) continue;
@@ -1031,7 +1057,7 @@ static uintptr_t find_lea_xref(uintptr_t string_addr) {
         uint8_t opc = (mode == 0) ? 0x8D : 0x8B;
         for (auto& r : regions) {
             if (!r.r || !r.x) continue;
-            // Scan all executable regions including Sober anonymous mappings
+            if (is_in_payload(r.base)) continue;
             for (size_t off = 0; off < r.size; off += PAGE) {
                 size_t avail = r.size - off;
                 size_t chunk = avail;
@@ -1240,7 +1266,7 @@ static bool resolve_functions() {
             if (!xref) continue;
             plog("[payload] xref at %lx\n", xref);
             uintptr_t func = walk_back_to_func(xref);
-            if (func) {
+            if (func && !is_in_payload(func)) {
                 G.resume = (fn_resume)func;
                 plog("[payload] string-ref: lua_resume at %lx\n", func);
             }
@@ -1260,7 +1286,8 @@ static bool resolve_functions() {
             uintptr_t xref = find_lea_xref(str_addr);
             if (!xref) continue;
             uintptr_t func = walk_back_to_func(xref);
-            if (func) {
+            uintptr_t func = walk_back_to_func(xref);
+            if (func && !is_in_payload(func)) {
                 G.newthread = (fn_newthread)func;
                 plog("[payload] string-ref: lua_newthread at %lx\n", func);
             }
@@ -1275,7 +1302,7 @@ static bool resolve_functions() {
             uintptr_t xref = find_lea_xref(str_addr);
             if (xref) {
                 uintptr_t func = walk_back_to_func(xref);
-                if (func) {
+                if (func && !is_in_payload(func)) {
                     G.settop = (fn_settop)func;
                     plog("[payload] string-ref: lua_settop at %lx\n", func);
                 }
@@ -1296,7 +1323,7 @@ static bool resolve_functions() {
             uintptr_t xref = find_lea_xref(str_addr);
             if (!xref) continue;
             uintptr_t func = walk_back_to_func(xref);
-            if (func) {
+            if (func && !is_in_payload(func)) {
                 G.load = (fn_load)func;
                 plog("[payload] string-ref: luau_load at %lx\n", func);
             }
@@ -1320,7 +1347,7 @@ static bool resolve_functions() {
             uintptr_t xref = find_lea_xref(str_addr);
             if (!xref) continue;
             uintptr_t func = walk_back_to_func(xref);
-            if (func) {
+            if (func && !is_in_payload(func)) {
                 G.tolstring = (fn_tolstring)func;
                 plog("[payload] string-ref: lua_tolstring at %lx\n", func);
             }
@@ -1368,7 +1395,7 @@ static bool resolve_functions() {
         auto regions = get_regions();
         for (auto& r : regions) {
             if (!r.r || !r.x) continue;
-            // Scan all executable regions including Sober anonymous maps
+            if (is_in_payload(r.base)) continue;
             uintptr_t a = aob_scan(r.base, r.size, pat1, mask1, sizeof(pat1));
             if (!a) a = aob_scan(r.base, r.size, pat2, mask2, sizeof(pat2));
             if (a) {
@@ -1546,11 +1573,8 @@ static void* file_cmd_worker(void*) {
 
         if (G.captured_L &&
             G.queue_count.load(std::memory_order_relaxed) > 0 && stale_ticks >= 10) {
-            plog("[payload] direct drain attempt (stale %d ticks, captured_L=%p hooked=%d)\n",
-                 stale_ticks, G.captured_L, G.hooked.load() ? 1 : 0);
-            g_in = true;
-            drain_queue(G.captured_L);
-            g_in = false;
+            plog("[payload] queue pending %d ticks, hook=%d captured_L=%p — waiting for hook-thread drain\n",
+                 stale_ticks, G.hooked.load() ? 1 : 0, G.captured_L);
             stale_ticks = 0;
         }
 
@@ -1698,6 +1722,27 @@ static void* init_worker(void*) {
         elog("WARNING: luaL_sandboxthread not found — scripts may lack game globals\n");
     }
 
+    if (is_in_payload((uintptr_t)G.resume)) {
+        plog("[payload] FATAL: lua_resume at %lx is inside payload library! "
+             "Resolution found our own Luau, not the target's. Aborting hook.\n",
+             (uintptr_t)G.resume);
+        write_status("fatal_self_resolve");
+        elog("FATAL: all resolution paths returned payload's own lua_resume at %lx. "
+             "Target Luau symbols not found.\n", (uintptr_t)G.resume);
+        return nullptr;
+    }
+    if (is_in_payload((uintptr_t)G.load)) {
+        plog("[payload] FATAL: luau_load at %lx is inside payload. Aborting.\n",
+             (uintptr_t)G.load);
+        write_status("fatal_self_resolve");
+        return nullptr;
+    }
+    if (is_in_payload((uintptr_t)G.newthread)) {
+        plog("[payload] FATAL: lua_newthread at %lx is inside payload. Aborting.\n",
+             (uintptr_t)G.newthread);
+        write_status("fatal_self_resolve");
+        return nullptr;
+    }
     plog("[payload] installing hook on lua_resume at %lx...\n", (uintptr_t)G.resume);
 
     // Validate prologue before modifying code
@@ -1809,6 +1854,7 @@ static void payload_init() {
     plog("[payload] init pid %d log=%s\n", getpid(), g_log_path);
     elog("PAYLOAD ALIVE pid=%d log=%s elog=%s\n", getpid(), g_log_path, g_elog_path);
     G.target_pid = getpid();
+    detect_payload_range();
 
     // FIX #1: Detect if we're in a container
     {
