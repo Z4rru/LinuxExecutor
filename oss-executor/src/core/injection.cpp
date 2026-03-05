@@ -2627,11 +2627,10 @@ bool Injection::execute_script(const std::string& source) {
             LOG_ERROR("Compile failed: {}", ce);
             return false;
         }
-        data_to_send.assign(bc, bc_len);
         free(bc);
-        LOG_INFO("Compiled 'user_script': {} -> {} bytes bytecode (format v{})",
-                 source.size(), data_to_send.size(),
-                 static_cast<int>(static_cast<uint8_t>(data_to_send[0])));
+        data_to_send = source;
+        LOG_INFO("Syntax verified, sending {} bytes source to payload for target-side compilation",
+                 data_to_send.size());
     }
 
     {
@@ -2803,6 +2802,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
