@@ -2809,8 +2809,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     return true;
 }
 
+template <typename AddrsType>
 static std::vector<uint8_t> gen_resume_trampoline(
-    const Injection::DirectHookAddrs& a, uintptr_t mailbox_addr,
+    const AddrsType& a, uintptr_t mailbox_addr,
     uintptr_t cave_addr, const uint8_t* stolen, size_t stolen_len)
 {
     std::vector<uint8_t> c;
@@ -3609,6 +3610,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
