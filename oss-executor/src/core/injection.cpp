@@ -2641,6 +2641,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         {"luau_load",           &out.load},
         {"lua_settop",          &out.settop},
         {"luaL_sandboxthread",  &out.sandbox},
+        {"luau_compile",        &out.compile},
     };
 
     if (!real_path.empty() && exe_base) {
@@ -2685,6 +2686,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         {"lua_newthread",  &out.newthread, {"lua_newthread", "too many C calls", nullptr}},
         {"luau_load",      &out.load,      {"bytecode version mismatch", "truncated", nullptr}},
         {"lua_settop",     &out.settop,    {"stack overflow", nullptr}},
+        {"luau_compile",   &out.compile,   {"CompileError", "broken string", nullptr}},
     };
 
     auto regions = memory_.get_regions();
@@ -2859,10 +2861,13 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     best_fsz = fsz; best_calls = calls;
                 }
             }
-            if (best_addr) {
+            if (best_addr && best_score >= 10) {
                 out.newthread = best_addr;
-                LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={}, tt9={})",
-                         best_addr, best_fsz, best_calls, best_score, best_score >= 10);
+                LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={})",
+                         best_addr, best_fsz, best_calls, best_score);
+            } else if (best_addr) {
+                LOG_WARN("[direct-hook] proximity: best candidate score {} too low (need tt9, min 10) — rejecting 0x{:X}",
+                         best_score, best_addr);
             } else {
                 LOG_WARN("[direct-hook] proximity: 0 candidates in 48KB around lua_settop");
             }
@@ -2870,6 +2875,12 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
     
+    if (!out.free_fn) {
+        out.free_fn = find_remote_symbol(pid, "c", "free");
+        if (out.free_fn)
+            LOG_INFO("[direct-hook] libc free at 0x{:X}", out.free_fn);
+    }
+
     if (!out.resume || !out.newthread || !out.load || !out.settop) {
         LOG_ERROR("[direct-hook] missing functions: resume={:#x} newthread={:#x} load={:#x} settop={:#x}",
                   out.resume, out.newthread, out.load, out.settop);
@@ -2881,7 +2892,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 template <typename AddrsType>
 static std::vector<uint8_t> gen_resume_trampoline(
     const AddrsType& a, uintptr_t mailbox_addr,
-    uintptr_t cave_addr, const uint8_t* stolen, size_t stolen_len)
+    uintptr_t cave_addr, const uint8_t* stolen, size_t stolen_len,
+    uintptr_t compile_addr = 0, uintptr_t free_addr = 0)
 {
     std::vector<uint8_t> c;
     c.reserve(512);
@@ -2917,6 +2929,7 @@ static std::vector<uint8_t> gen_resume_trampoline(
     e({0x81,0xFB}); e32(16336);
     size_t ja_ack = c.size(); e({0x0F,0x87}); e32(0);
 
+    e({0x89,0x1C,0x24});          // mov [rsp], ebx  — save data_size before rbx clobber
     e({0x4C,0x89,0xEF});
     e({0x48,0x85,0xFF});
     e({0x49,0x0F,0x44,0xFC});
@@ -2934,25 +2947,93 @@ static std::vector<uint8_t> gen_resume_trampoline(
         e({0xFF,0xD0});
     }
 
-    e({0x48,0x89,0xEF});
+       // r13 (original 'from') is consumed — reuse as compiled-bytecode pointer
+    // 0 = using mailbox data directly, nonzero = must free after
+    e({0x45,0x31,0xED});          // xor r13d, r13d  — no compiled alloc yet
+
+    size_t jmp_skip_compile = 0;
+    if (compile_addr && free_addr) {
+        // Compile source on target side: luau_compile(src, len, NULL, &outsize)
+        e({0x48,0x83,0xEC,0x10});      // sub rsp, 16  (outsize var + alignment)
+        e({0x48,0xC7,0x04,0x24,0x00,0x00,0x00,0x00}); // mov qword [rsp], 0
+        e({0x49,0x8D,0x7F,0x30});      // lea rdi, [r15+0x30]  (source)
+        e({0x8B,0x74,0x24,0x10});      // mov esi, [rsp+16]  (data_size from saved slot)
+        e({0x31,0xD2});                // xor edx, edx  (options=NULL)
+        e({0x48,0x89,0xE1});           // mov rcx, rsp  (&outsize)
+        e({0x48,0xB8}); e64(compile_addr);
+        e({0xFF,0xD0});                // call luau_compile
+        e({0x48,0x85,0xC0});           // test rax, rax
+        size_t jz_compile_fail = c.size(); e({0x0F,0x84}); e32(0);
+        e({0x80,0x38,0x00});           // cmp byte [rax], 0  (error check)
+        size_t je_compile_err = c.size(); e({0x0F,0x84}); e32(0);
+        e({0x49,0x89,0xC5});           // mov r13, rax  (save compiled ptr)
+        e({0x8B,0x1C,0x24});           // mov ebx, [rsp]  (compiled size → ebx)
+        e({0x89,0x5C,0x24,0x10});      // mov [rsp+16], ebx  (update saved data_size)
+        e({0x48,0x83,0xC4,0x10});      // add rsp, 16
+        jmp_skip_compile = c.size(); e({0xEB,0x00}); // jmp past fail handlers (patched)
+
+        // compile_err: free and fall through to fail
+        size_t compile_err_label = c.size();
+        e({0x48,0x89,0xC7});           // mov rdi, rax
+        e({0x48,0xB8}); e64(free_addr);
+        e({0xFF,0xD0});
+        // compile_fail: add rsp, ack
+        size_t compile_fail_label = c.size();
+        e({0x48,0x83,0xC4,0x10});      // add rsp, 16
+        size_t jmp_ack_from_compile = c.size(); e({0xE9}); e32(0); // jmp ack (patched later)
+
+        patch(jz_compile_fail + 2, compile_fail_label);
+        patch(je_compile_err + 2, compile_err_label);
+        c[jmp_skip_compile + 1] = static_cast<uint8_t>(c.size() - (jmp_skip_compile + 2));
+    }
+
+    // luau_load(thread, chunkname, data, datalen, env)
+    e({0x48,0x89,0xEF});          // mov rdi, rbp  (L = thread)
     size_t chunk_movabs = c.size();
-    e({0x48,0xBE}); e64(0);
-    e({0x49,0x8D,0x57,0x30});
-    e({0x89,0xD9});
-    e({0x45,0x31,0xC0});
+    e({0x48,0xBE}); e64(0);      // mov rsi, <chunkname>
+
+    // data pointer: r13 if compiled, else mailbox+0x30
+    e({0x4D,0x85,0xED});          // test r13, r13
+    size_t jz_use_mb = c.size(); e({0x74}); e8(0);
+    e({0x4C,0x89,0xEA});          // mov rdx, r13
+    size_t jmp_past_mb = c.size(); e({0xEB}); e8(0);
+    size_t use_mb_label = c.size();
+    e({0x49,0x8D,0x57,0x30});    // lea rdx, [r15+0x30]
+    size_t past_mb_label = c.size();
+    c[jz_use_mb + 1] = static_cast<uint8_t>(use_mb_label - (jz_use_mb + 2));
+    c[jmp_past_mb + 1] = static_cast<uint8_t>(past_mb_label - (jmp_past_mb + 2));
+
+    e({0x8B,0x0C,0x24});          // mov ecx, [rsp]  — restored data_size
+    e({0x45,0x31,0xC0});          // xor r8d, r8d  (env=0)
     e({0x48,0xB8}); e64(a.load);
     e({0xFF,0xD0});
     e({0x85,0xC0});
     size_t jnz_settop = c.size(); e({0x0F,0x85}); e32(0);
 
-    e({0x48,0x89,0xEF});
-    e({0x31,0xF6});
-    e({0x31,0xD2});
+    // lua_resume(thread, NULL, 0)
+    e({0x48,0x89,0xEF});          // mov rdi, rbp
+    e({0x31,0xF6});               // xor esi, esi
+    e({0x31,0xD2});               // xor edx, edx
     size_t stolen_call = c.size();
     e({0x48,0xB8}); e64(0);
     e({0xFF,0xD0});
 
+    // Free compiled bytecode if r13 != 0
     size_t settop_label = c.size();
+    if (free_addr) {
+        e({0x4D,0x85,0xED});      // test r13, r13
+        size_t jz_no_free = c.size(); e({0x74}); e8(0);
+        e({0x50});                // push rax  (save resume result)
+        e({0x4C,0x89,0xEF});      // mov rdi, r13
+        e({0x48,0xB8}); e64(free_addr);
+        e({0xFF,0xD0});
+        e({0x58});                // pop rax
+        e({0x45,0x31,0xED});      // xor r13d, r13d
+        size_t no_free_label = c.size();
+        c[jz_no_free + 1] = static_cast<uint8_t>(no_free_label - (jz_no_free + 2));
+    }
+
+    // settop(parent, -2)
     e({0x48,0x89,0xDF});
     e8(0xBE); e32(0xFFFFFFFE);
     e({0x48,0xB8}); e64(a.settop);
@@ -2961,6 +3042,12 @@ static std::vector<uint8_t> gen_resume_trampoline(
     size_t ack_label = c.size();
     e({0x49,0x8B,0x4F,0x10});
     e({0x49,0x89,0x4F,0x18});
+
+    if (compile_addr && free_addr) {
+        // Patch jmp_ack_from_compile to point here
+        int32_t rel = static_cast<int32_t>(ack_label - (jmp_ack_from_compile + 5));
+        memcpy(&c[jmp_ack_from_compile + 1], &rel, 4);
+    }
 
     size_t cleanup_label = c.size();
     e({0x48,0xB8}); e64(guard_addr);
@@ -2984,8 +3071,44 @@ static std::vector<uint8_t> gen_resume_trampoline(
             while (pfx < il && (stolen[off+pfx]==0x66||(stolen[off+pfx]>=0x40&&stolen[off+pfx]<=0x4F))) pfx++;
             if (pfx < il) {
                 uint8_t op = stolen[off+pfx];
+
+                // Handle E8 (call) and E9 (jmp) with rel32
+                if ((op == 0xE8 || op == 0xE9) && pfx + 5 <= il) {
+                    size_t disp_off = pfx + 1;
+                    int32_t disp;
+                    memcpy(&disp, &c[stolen_label + off + disp_off], 4);
+                    uintptr_t abs_target = a.resume + off + il + (int64_t)disp;
+                    int64_t new_disp = (int64_t)abs_target - (int64_t)(cave_addr + stolen_label + off + il);
+                    if (new_disp >= INT32_MIN && new_disp <= INT32_MAX) {
+                        int32_t nd = (int32_t)new_disp;
+                        memcpy(&c[stolen_label + off + disp_off], &nd, 4);
+                    }
+                    off += il;
+                    continue;
+                }
+
+                // Handle 0F 80-8F (conditional jmp rel32)
+                if (op == 0x0F && pfx + 1 < il) {
+                    uint8_t op2 = stolen[off + pfx + 1];
+                    if (op2 >= 0x80 && op2 <= 0x8F && pfx + 6 <= il) {
+                        size_t disp_off = pfx + 2;
+                        int32_t disp;
+                        memcpy(&disp, &c[stolen_label + off + disp_off], 4);
+                        uintptr_t abs_target = a.resume + off + il + (int64_t)disp;
+                        int64_t new_disp = (int64_t)abs_target - (int64_t)(cave_addr + stolen_label + off + il);
+                        if (new_disp >= INT32_MIN && new_disp <= INT32_MAX) {
+                            int32_t nd = (int32_t)new_disp;
+                            memcpy(&c[stolen_label + off + disp_off], &nd, 4);
+                        }
+                        off += il;
+                        continue;
+                    }
+                }
+
+                // Handle ModR/M RIP-relative
                 size_t modrm_pos = pfx + 1;
-                bool has_modrm = (op==0x8D||op==0x8B||op==0x89||(op&0xFC)==0x88||op==0x63);
+                bool has_modrm = (op==0x8D||op==0x8B||op==0x89||(op&0xFC)==0x88||op==0x63||
+                                  op==0x80||op==0x81||op==0x83||op==0xC7||op==0x86||op==0x87);
                 if (op == 0x0F && pfx+1 < il) { modrm_pos = pfx+2; has_modrm = true; }
                 if (has_modrm && modrm_pos < il) {
                     uint8_t modrm = c[stolen_label + off + modrm_pos];
@@ -3123,7 +3246,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     }
     LOG_INFO("[direct-hook] code cave at 0x{:X} ({} bytes)", cave.padding_start, cave.padding_size);
 
-    auto tramp = gen_resume_trampoline(addrs, mb_addr, cave.padding_start, prologue, steal);
+    auto tramp = gen_resume_trampoline(addrs, mb_addr, cave.padding_start, prologue, steal,
+                                       addrs.compile, addrs.free_fn);
     if (tramp.size() > 512) {
         LOG_ERROR("[direct-hook] trampoline too large: {} bytes", tramp.size());
         return false;
@@ -3163,6 +3287,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     dhook_.mailbox_addr = mb_addr;
     dhook_.cave_size = tramp.size();
     dhook_.stolen_len = steal;
+    dhook_.resume_addr = addrs.resume;
     memcpy(dhook_.stolen_bytes, prologue, steal);
     memcpy(dhook_.orig_patch, prologue, patch_len);
     dhook_.patch_len = patch_len;
@@ -3178,9 +3303,8 @@ void Injection::cleanup_direct_hook() {
     if (!dhook_.active) return;
     pid_t pid = memory_.get_pid();
     if (pid > 0 && kill(pid, 0) == 0) {
-        DirectHookAddrs addrs;
-        if (find_remote_luau_functions(pid, addrs) && addrs.resume) {
-            proc_mem_write(pid, addrs.resume, dhook_.orig_patch, dhook_.patch_len);
+        if (dhook_.resume_addr) {
+            proc_mem_write(pid, dhook_.resume_addr, dhook_.orig_patch, dhook_.patch_len);
         }
         DirectMailbox mb{};
         proc_mem_write(pid, dhook_.mailbox_addr, &mb, sizeof(DirectMailbox));
@@ -3474,20 +3598,25 @@ bool Injection::execute_script(const std::string& source) {
               "Executing (" + std::to_string(source.size()) + " bytes)...");
 
     if (dhook_.active) {
-        size_t bc_len = 0;
-        char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_len);
-        if (!bc || bc_len == 0 || static_cast<uint8_t>(bc[0]) == 0) {
-            std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
+        {
+            size_t bc_len = 0;
+            char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_len);
+            bool syntax_ok = bc && bc_len > 0 && static_cast<uint8_t>(bc[0]) != 0;
+            if (!syntax_ok) {
+                std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
+                free(bc);
+                set_state(InjectionState::Ready, "Compile error: " + ce);
+                LOG_ERROR("Compile failed: {}", ce);
+                return false;
+            }
             free(bc);
-            set_state(InjectionState::Ready, "Compile error: " + ce);
-            LOG_ERROR("Compile failed: {}", ce);
-            return false;
         }
-        bool ok = send_via_mailbox(bc, bc_len, 1);
-        free(bc);
+        LOG_INFO("Sending raw source '{}' ({} bytes) to payload for target-side compilation",
+                 "user_script", source.size());
+        bool ok = send_via_mailbox(source.data(), source.size(), 0);
         if (ok) {
-            set_state(InjectionState::Ready, "Script dispatched via direct hook");
-            LOG_INFO("Sent {} bytes bytecode via direct hook mailbox", bc_len);
+            set_state(InjectionState::Ready, "Source dispatched to Roblox payload");
+            LOG_INFO("Source for 'user_script' dispatched to Roblox payload");
             return true;
         }
         LOG_WARN("Direct hook mailbox send failed, trying IPC fallback");
@@ -3679,6 +3808,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
