@@ -210,10 +210,9 @@ static thread_local bool g_in = false;
 
 static void set_identity(lua_State* L) {
     if (!L) return;
-    uint8_t* extra = *reinterpret_cast<uint8_t**>(L);
-    if (!extra) return;
+    uint8_t* extra = nullptr;
+    if (!safe_read((uintptr_t)L, &extra, sizeof(extra)) || !extra) return;
 
-    // Validate the extra pointer is in a readable region
     uint8_t probe_byte;
     if (!safe_read((uintptr_t)extra, &probe_byte, 1)) {
         plog("[payload] set_identity: extra pointer %p unreadable\n", extra);
@@ -317,9 +316,11 @@ static void drain_queue(lua_State* L) {
         plog("[payload] bytecode version byte: %d (size=%zu)\n",
              (int)(uint8_t)bc_data[0], bc_sz);
 
+        int top_before = G.gettop ? G.gettop(L) : -1;
         lua_State* th = G.newthread(L);
         if (!th) {
             plog("[payload] FATAL: lua_newthread returned NULL (L=%p)\n", L);
+            if (top_before >= 0 && G.gettop) G.settop(L, top_before);
             continue;
         }
 
@@ -345,7 +346,8 @@ static void drain_queue(lua_State* L) {
                 }
             }
             if (compiled) { free(compiled); compiled = nullptr; }
-            G.settop(L, -2);
+            if (top_before >= 0 && G.gettop) G.settop(L, top_before);
+            else G.settop(L, -2);
             continue;
         }
         plog("[payload] executing script (%zu bytes bc)...\n", bc_sz);
@@ -361,7 +363,8 @@ static void drain_queue(lua_State* L) {
         } else {
             plog("[payload] script executed OK (result=%d)\n", rr);
         }
-        G.settop(L, -2);
+        if (top_before >= 0 && G.gettop) G.settop(L, top_before);
+        else G.settop(L, -2);
         if (compiled) { free(compiled); compiled = nullptr; }
     }
     write_status("drained");
@@ -369,12 +372,13 @@ static void drain_queue(lua_State* L) {
 
 static int resume_detour(lua_State* L, lua_State* from, int nargs) {
     // Capture L as well when from is null — first valid state we see
-    lua_State* candidate = from ? from : L;
-    if (candidate) {
-        if (!G.captured_L)
+    if (!G.captured_L) {
+        lua_State* candidate = from ? from : L;
+        if (candidate) {
+            G.captured_L = candidate;
             plog("[payload] captured lua_State* = %p (from=%p L=%p)\n",
                  candidate, from, L);
-        G.captured_L = candidate;
+        }
     }
 
     if (!G.original_resume) return -1;
@@ -383,8 +387,8 @@ static int resume_detour(lua_State* L, lua_State* from, int nargs) {
     g_in = true;
 
     // Use captured_L as ultimate fallback if both from and L are null
-    lua_State* parent = from ? from : (G.captured_L ? G.captured_L : L);
-    if (parent && G.queue_count.load(std::memory_order_relaxed) > 0)
+    lua_State* parent = G.captured_L ? G.captured_L : (from ? from : L);
+    if (parent && parent != L && G.queue_count.load(std::memory_order_relaxed) > 0)
         drain_queue(parent);
 
     g_in = false;
@@ -573,6 +577,10 @@ static size_t insn_len(const uint8_t* p) {
     if (op >= 0xD0 && op <= 0xD3) return modrm_len(p, i);
     if (op == 0xFE || op == 0xFF) return modrm_len(p, i);
     if (op == 0x8F) return modrm_len(p, i);
+    if (op >= 0xD8 && op <= 0xDF) return modrm_len(p, i);
+    if (op == 0xA4 || op == 0xA5 || op == 0xA6 || op == 0xA7 ||
+        op == 0xAA || op == 0xAB || op == 0xAC || op == 0xAD ||
+        op == 0xAE || op == 0xAF) return i;
 
     plog("[payload] insn_len: unknown opcode 0x%02X at offset %zu\n", op, i - 1);
     return 0;
@@ -1513,14 +1521,16 @@ static void poll_mailbox() {
     uint64_t ack = __atomic_load_n(&g_mailbox->ack, __ATOMIC_ACQUIRE);
     if (seq <= ack) return; // nothing new
 
-    uint32_t sz = g_mailbox->data_size;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    uint32_t sz = __atomic_load_n(&g_mailbox->data_size, __ATOMIC_RELAXED);
     if (sz == 0 || sz > MAILBOX_DATA_CAP) {
-        // Invalid, just ack it
         __atomic_store_n(&g_mailbox->ack, seq, __ATOMIC_RELEASE);
         return;
     }
 
-    std::string script(g_mailbox->data, sz);
+    char local_buf[MAILBOX_DATA_CAP];
+    memcpy(local_buf, g_mailbox->data, sz);
+    std::string script(local_buf, sz);
     plog("[payload] mailbox: received %u bytes (seq=%lu flags=%u)\n",
          sz, (unsigned long)seq, g_mailbox->flags);
 
@@ -1899,8 +1909,7 @@ static void init_mailbox() {
 
 extern "C" __attribute__((visibility("default")))
 void oss_payload_entry() {
-    static std::atomic<bool> entered{false};
-    if (entered.exchange(true)) return;
+    if (g_initialized.exchange(true)) return;
     
     if (!g_mailbox) init_mailbox();
     G.alive.store(true, std::memory_order_release);
@@ -1921,8 +1930,11 @@ void* oss_payload_get_mailbox() {
     return g_mailbox;
 }
 
+static std::atomic<bool> g_initialized{false};
+
 __attribute__((constructor))
 static void payload_init() {
+    if (g_initialized.exchange(true)) return;
     const char* entered = "[payload] constructor entered\n";
     ssize_t wr = write(STDERR_FILENO, entered, strlen(entered));
     (void)wr;
