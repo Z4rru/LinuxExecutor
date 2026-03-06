@@ -4,6 +4,10 @@
 #include <poll.h>
 #include <thread>
 #include <chrono>
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
 
 
 namespace fs = std::filesystem;
@@ -3584,5 +3588,6 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
