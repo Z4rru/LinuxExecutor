@@ -1283,14 +1283,40 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
 
     auto regions = memory_.get_regions();
     uintptr_t data_addr = 0;
-    for (const auto& r : regions) {
-        if (!r.writable() || !r.readable()) continue;
-        if (r.size() < 4096) continue;
-        if (r.path.find("[stack") != std::string::npos) continue;
-        if (r.path.find("[vvar") != std::string::npos) continue;
-        if (r.path.find("[vdso") != std::string::npos) continue;
-        data_addr = r.end - 4096;
-        break;
+    // Pass 1: prefer anonymous/heap regions — named binary segments contain live variables
+    {
+        size_t best_size = 0;
+        for (const auto& r : regions) {
+            if (!r.writable() || !r.readable()) continue;
+            if (r.size() < 8192) continue;
+            if (r.path.find("[stack") != std::string::npos) continue;
+            if (r.path.find("[vvar") != std::string::npos) continue;
+            if (r.path.find("[vdso") != std::string::npos) continue;
+            // Skip file-backed mappings (binary/library data segments)
+            if (!r.path.empty() && r.path[0] == '/') continue;
+            if (r.size() > best_size) {
+                best_size = r.size();
+                data_addr = r.end - 4096;
+            }
+        }
+        if (data_addr != 0) {
+            LOG_DEBUG("Data region (anonymous, {} KB) at 0x{:X}",
+                      best_size / 1024, data_addr);
+        }
+    }
+    // Pass 2: fall back to any writable region if no anonymous region found
+    if (data_addr == 0) {
+        for (const auto& r : regions) {
+            if (!r.writable() || !r.readable()) continue;
+            if (r.size() < 8192) continue;
+            if (r.path.find("[stack") != std::string::npos) continue;
+            if (r.path.find("[vvar") != std::string::npos) continue;
+            if (r.path.find("[vdso") != std::string::npos) continue;
+            data_addr = r.end - 4096;
+            LOG_WARN("Data region (named fallback) at 0x{:X} from '{}'",
+                     data_addr, r.path.empty() ? "[anon]" : r.path);
+            break;
+        }
     }
     if (data_addr == 0) {
         error_ = "No writable data region for inline hook";
@@ -1319,9 +1345,22 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         return false;
     }
 
+    static constexpr uint64_t GUARD_MAGIC = 0x4F53534755415244ULL; // "OSSGUARD"
     uint64_t zero = 0;
+    uint64_t magic = GUARD_MAGIC;
     proc_mem_write(pid, result_addr, &zero, 8);
-    proc_mem_write(pid, guard_addr, &zero, 8);
+    proc_mem_write(pid, guard_addr, &magic, 8);
+
+    // Verify writes survived — detect if target threads are corrupting this region
+    usleep(2000);
+    uint64_t verify_guard = 0, verify_result = 0;
+    proc_mem_read(pid, guard_addr, &verify_guard, 8);
+    proc_mem_read(pid, result_addr, &verify_result, 8);
+    if (verify_guard != GUARD_MAGIC || verify_result != 0) {
+        LOG_WARN("Data region at 0x{:X} is actively written by target threads "
+                 "(guard: wrote 0x{:X}, read 0x{:X}; result: wrote 0, read 0x{:X})",
+                 data_addr, GUARD_MAGIC, verify_guard, verify_result);
+    }
 
     size_t sc_needed = 256;
 
@@ -1380,16 +1419,21 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xE4; sc[off++] = 0xF0;
 
 
+        // mov rdx, guard_addr
     sc[off++] = 0x48; sc[off++] = 0xBA;
     memcpy(sc + off, &guard_addr, 8); off += 8;
 
-    sc[off++] = 0xB8; sc[off++] = 0x01; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
-   
-    sc[off++] = 0xF0; sc[off++] = 0x87; sc[off++] = 0x02;
-   
-    sc[off++] = 0x85; sc[off++] = 0xC0;
+    // mov rax, GUARD_MAGIC (expected old value for cmpxchg)
+    sc[off++] = 0x48; sc[off++] = 0xB8;
+    memcpy(sc + off, &magic, 8); off += 8;
 
- 
+    // mov ecx, 1 (desired new value; zero-extends to rcx)
+    sc[off++] = 0xB9; sc[off++] = 0x01; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
+
+    // lock cmpxchg [rdx], rcx — if [rdx]==rax then [rdx]=rcx, ZF=1; else rax=[rdx], ZF=0
+    sc[off++] = 0xF0; sc[off++] = 0x48; sc[off++] = 0x0F; sc[off++] = 0xB1; sc[off++] = 0x0A;
+
+    // jnz skip_dlopen (guard was corrupted or already consumed)
     sc[off++] = 0x0F; sc[off++] = 0x85;
     int jnz_patch_offset = off;
     off += 4;
@@ -1537,6 +1581,29 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         error_ = "Inline hook dlopen timed out after 10s";
         LOG_ERROR("{}", error_);
         return false;
+    }
+
+    // Verify the library actually loaded by checking /proc/PID/maps
+    {
+        bool lib_mapped = false;
+        std::ifstream maps_check("/proc/" + std::to_string(pid) + "/maps");
+        std::string maps_line;
+        while (std::getline(maps_check, maps_line)) {
+            if (maps_line.find("liboss_payload") != std::string::npos) {
+                lib_mapped = true;
+                LOG_INFO("Verified: liboss_payload mapped in target: {}",
+                         maps_line.substr(0, maps_line.find(' ')));
+                break;
+            }
+        }
+        if (!lib_mapped) {
+            error_ = "dlopen returned handle 0x" +
+                     (std::ostringstream() << std::hex << result).str() +
+                     " but library not found in /proc/maps — "
+                     "result_addr contained stale data (false positive)";
+            LOG_ERROR("{}", error_);
+            return false;
+        }
     }
 
     payload_loaded_ = true;
@@ -1746,16 +1813,39 @@ void Injection::stop_elevated_helper() {
     }
 
     uintptr_t data_addr = 0;
-    for (const auto& r : regions) {
-        if (!r.writable() || !r.readable()) continue;
-        if (r.size() < 4096) continue;
-        if (r.path.find("[stack") != std::string::npos) continue;
-        if (r.path.find("[vvar")  != std::string::npos) continue;
-        if (r.path.find("[vdso")  != std::string::npos) continue;
-        data_addr = r.end - 4096;
-        LOG_DEBUG("Data region at 0x{:X} from '{}'", data_addr,
-                  r.path.empty() ? "[anon]" : r.path);
-        break;
+    // Pass 1: prefer anonymous/heap regions — named binary segments contain live variables
+    {
+        size_t best_size = 0;
+        for (const auto& r : regions) {
+            if (!r.writable() || !r.readable()) continue;
+            if (r.size() < 8192) continue;
+            if (r.path.find("[stack") != std::string::npos) continue;
+            if (r.path.find("[vvar")  != std::string::npos) continue;
+            if (r.path.find("[vdso")  != std::string::npos) continue;
+            if (!r.path.empty() && r.path[0] == '/') continue;
+            if (r.size() > best_size) {
+                best_size = r.size();
+                data_addr = r.end - 4096;
+            }
+        }
+        if (data_addr != 0) {
+            LOG_DEBUG("Data region (anonymous, {} KB) at 0x{:X}",
+                      best_size / 1024, data_addr);
+        }
+    }
+    // Pass 2: fall back to any writable region
+    if (data_addr == 0) {
+        for (const auto& r : regions) {
+            if (!r.writable() || !r.readable()) continue;
+            if (r.size() < 8192) continue;
+            if (r.path.find("[stack") != std::string::npos) continue;
+            if (r.path.find("[vvar")  != std::string::npos) continue;
+            if (r.path.find("[vdso")  != std::string::npos) continue;
+            data_addr = r.end - 4096;
+            LOG_WARN("Data region (named fallback) at 0x{:X} from '{}'",
+                     data_addr, r.path.empty() ? "[anon]" : r.path);
+            break;
+        }
     }
     if (data_addr == 0) {
         error_ = "No suitable writable region found";
@@ -2071,6 +2161,28 @@ void Injection::stop_elevated_helper() {
 
     proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
     proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+
+    // Verify the library actually loaded by checking /proc/PID/maps
+    {
+        bool lib_mapped = false;
+        std::ifstream maps_check("/proc/" + std::to_string(pid) + "/maps");
+        std::string maps_line;
+        while (std::getline(maps_check, maps_line)) {
+            if (maps_line.find("liboss_payload") != std::string::npos) {
+                lib_mapped = true;
+                LOG_INFO("Verified: liboss_payload mapped in target: {}",
+                         maps_line.substr(0, maps_line.find(' ')));
+                break;
+            }
+        }
+        if (!lib_mapped) {
+            error_ = "dlopen appeared to succeed but library not found in /proc/maps — "
+                     "injection produced false positive";
+            LOG_ERROR("{}", error_);
+            stop_elevated_helper();
+            return false;
+        }
+    }
 
     stop_elevated_helper();
     LOG_INFO("inject_via_procmem: complete, process restored");
@@ -2802,6 +2914,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
