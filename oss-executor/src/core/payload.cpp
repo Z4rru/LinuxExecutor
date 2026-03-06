@@ -1841,6 +1841,30 @@ static void init_mailbox() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+extern "C" __attribute__((visibility("default")))
+void oss_payload_entry() {
+    static std::atomic<bool> entered{false};
+    if (entered.exchange(true)) return;
+    
+    if (!g_mailbox) init_mailbox();
+    G.alive.store(true, std::memory_order_release);
+    detect_payload_range();
+
+    if (pthread_create(&g_file_t, nullptr, file_cmd_worker, nullptr) != 0)
+        g_file_t = 0;
+    if (pthread_create(&g_ipc_t, nullptr, ipc_worker, nullptr) != 0)
+        g_ipc_t = 0;
+    if (pthread_create(&g_init_t, nullptr, init_worker, nullptr) != 0)
+        g_init_t = 0;
+
+    write_status("entry_called");
+}
+
+extern "C" __attribute__((visibility("default")))
+void* oss_payload_get_mailbox() {
+    return g_mailbox;
+}
+
 __attribute__((constructor))
 static void payload_init() {
     const char* entered = "[payload] constructor entered\n";
