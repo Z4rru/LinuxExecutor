@@ -2897,7 +2897,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     best_fsz = fsz; best_calls = calls;
                 }
             }
-            if (best_addr && best_score >= 8) {
+            if (best_addr && best_score >= 6) {
                 out.newthread = best_addr;
                 LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={})",
                          best_addr, best_fsz, best_calls, best_score);
@@ -3846,6 +3846,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
