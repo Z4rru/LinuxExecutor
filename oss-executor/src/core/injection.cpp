@@ -26,6 +26,7 @@
 #include <sys/un.h>
 #include <elf.h>
 #include <luacode.h>
+#include <cstdio>
 #include <fcntl.h>
 #include <poll.h>
 
@@ -2558,6 +2559,7 @@ bool Injection::detach() {
     if (state_ == InjectionState::Detached && !memory_.is_valid())
         return true;
 
+    cleanup_direct_hook();
     stop_elevated_helper();
 
     
@@ -2583,8 +2585,182 @@ bool Injection::detach() {
     return true;
 }
 
-bool Injection::inject() {
-    if (!attach()) return false;
+static size_t dh_insn_len(const uint8_t* p) {
+    if (p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA) return 4;
+    size_t i = 0;
+    while (i < 4 && (p[i]==0x66||p[i]==0x67||p[i]==0xF0||p[i]==0xF2||p[i]==0xF3||
+                     p[i]==0x26||p[i]==0x2E||p[i]==0x36||p[i]==0x3E||p[i]==0x64||p[i]==0x65)) i++;
+    bool rex_w = false;
+    if (p[i] >= 0x40 && p[i] <= 0x4F) { rex_w = (p[i] & 0x08) != 0; i++; }
+    uint8_t op = p[i++];
+    if ((op>=0x50&&op<=0x5F)||op==0x90||op==0xC3||op==0xCC||op==0xC9) return i;
+    if (op==0xC2) return i+2;
+    if (op>=0xB0&&op<=0xB7) return i+1;
+    if (op>=0xB8&&op<=0xBF) return i+(rex_w?8:4);
+    if (op==0xE8||op==0xE9) return i+4;
+    if (op==0xEB||(op>=0x70&&op<=0x7F)) return i+1;
+    auto mlen = [&](size_t s) -> size_t {
+        size_t j = s;
+        uint8_t m = p[j++];
+        uint8_t mod = (m>>6)&3, rm = m&7;
+        if (mod!=3&&rm==4) { uint8_t sib=p[j++]; if(mod==0&&(sib&7)==5) j+=4; }
+        if (mod==0&&rm==5) j+=4;
+        else if (mod==1) j+=1;
+        else if (mod==2) j+=4;
+        return j;
+    };
+    if (op==0x80||op==0x82||op==0x83||op==0xC0||op==0xC1) return mlen(i)+1;
+    if (op==0x81||op==0xC7||op==0x69) return mlen(i)+4;
+    if (op==0xC6||op==0x6B) return mlen(i)+1;
+    if (op==0x0F) {
+        uint8_t op2=p[i++];
+        if (op2>=0x80&&op2<=0x8F) return i+4;
+        return mlen(i);
+    }
+    if ((op&0xC4)==0x00||(op&0xFE)==0x84||(op&0xFC)==0x88||op==0x8C||op==0x8E||
+        op==0x8D||op==0x63||op==0x86||op==0x87||op==0x8F) return mlen(i);
+    if (op>=0xD0&&op<=0xD3) return mlen(i);
+    if (op==0xFE||op==0xFF) return mlen(i);
+    if (op==0xF6) { uint8_t m=p[i]; return ((m&0x38)==0)?mlen(i)+1:mlen(i); }
+    if (op==0xF7) { uint8_t m=p[i]; return ((m&0x38)==0)?mlen(i)+4:mlen(i); }
+    return 0;
+}
+
+static uintptr_t dh_find_elf_sym_sections(const std::string& filepath,
+                                           const std::string& name,
+                                           uintptr_t load_bias) {
+    FILE* ef = fopen(filepath.c_str(), "rb");
+    if (!ef) return 0;
+    Elf64_Ehdr ehdr;
+    if (fread(&ehdr, sizeof(ehdr), 1, ef) != 1 ||
+        memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_shnum == 0) { fclose(ef); return 0; }
+    std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
+    fseek(ef, static_cast<long>(ehdr.e_shoff), SEEK_SET);
+    if (fread(shdrs.data(), sizeof(Elf64_Shdr), ehdr.e_shnum, ef) != ehdr.e_shnum)
+        { fclose(ef); return 0; }
+    for (size_t si = 0; si < shdrs.size(); si++) {
+        if (shdrs[si].sh_type != SHT_SYMTAB && shdrs[si].sh_type != SHT_DYNSYM) continue;
+        uint32_t str_idx = shdrs[si].sh_link;
+        if (str_idx >= shdrs.size()) continue;
+        size_t strsz = shdrs[str_idx].sh_size;
+        if (strsz == 0) continue;
+        std::vector<char> strtab(strsz);
+        fseek(ef, static_cast<long>(shdrs[str_idx].sh_offset), SEEK_SET);
+        if (fread(strtab.data(), 1, strsz, ef) != strsz) continue;
+        size_t entsize = shdrs[si].sh_entsize;
+        if (entsize < sizeof(Elf64_Sym)) entsize = sizeof(Elf64_Sym);
+        size_t nsyms = shdrs[si].sh_size / entsize;
+        for (size_t j = 0; j < nsyms; j++) {
+            Elf64_Sym sym;
+            fseek(ef, static_cast<long>(shdrs[si].sh_offset + j * entsize), SEEK_SET);
+            if (fread(&sym, sizeof(sym), 1, ef) != 1) break;
+            if (sym.st_name == 0 || sym.st_name >= strsz) continue;
+            if (sym.st_shndx == SHN_UNDEF) continue;
+            if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC) continue;
+            if (strcmp(strtab.data() + sym.st_name, name.c_str()) == 0) {
+                fclose(ef);
+                return load_bias + sym.st_value;
+            }
+        }
+    }
+    fclose(ef);
+    return 0;
+}
+
+bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
+    LOG_INFO("[direct-hook] locating Luau functions in PID {}", pid);
+
+    char exe_link[512];
+    std::string exe_path;
+    {
+        std::string link = "/proc/" + std::to_string(pid) + "/exe";
+        ssize_t len = readlink(link.c_str(), exe_link, sizeof(exe_link) - 1);
+        if (len > 0) { exe_link[len] = '\0'; exe_path = exe_link; }
+    }
+
+    uintptr_t exe_base = 0;
+    {
+        std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            if (line.find(exe_path) == std::string::npos &&
+                line.find("sober") == std::string::npos) continue;
+            uintptr_t lo; unsigned long off; char perms[5]{};
+            if (sscanf(line.c_str(), "%lx-%*x %4s %lx", &lo, perms, &off) == 3 && off == 0) {
+                exe_base = lo;
+                break;
+            }
+        }
+    }
+
+    std::string real_path;
+    {
+        std::string ns = "/proc/" + std::to_string(pid) + "/root" + exe_path;
+        struct stat st;
+        if (::stat(ns.c_str(), &st) == 0) real_path = ns;
+        else if (::stat(exe_path.c_str(), &st) == 0) real_path = exe_path;
+    }
+
+    struct { const char* name; uintptr_t* dst; } syms[] = {
+        {"lua_resume",          &out.resume},
+        {"lua_newthread",       &out.newthread},
+        {"luau_load",           &out.load},
+        {"lua_settop",          &out.settop},
+        {"luaL_sandboxthread",  &out.sandbox},
+    };
+
+    if (!real_path.empty() && exe_base) {
+        uintptr_t first_vaddr = 0;
+        {
+            FILE* f = fopen(real_path.c_str(), "rb");
+            if (f) {
+                Elf64_Ehdr eh;
+                if (fread(&eh, sizeof(eh), 1, f) == 1 && memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0) {
+                    for (int i = 0; i < eh.e_phnum; i++) {
+                        Elf64_Phdr ph;
+                        fseek(f, static_cast<long>(eh.e_phoff + i * eh.e_phentsize), SEEK_SET);
+                        if (fread(&ph, sizeof(ph), 1, f) != 1) break;
+                        if (ph.p_type == PT_LOAD) { first_vaddr = ph.p_vaddr; break; }
+                    }
+                }
+                fclose(f);
+            }
+        }
+        uintptr_t bias = exe_base - first_vaddr;
+        for (auto& s : syms) {
+            uintptr_t addr = dh_find_elf_sym_sections(real_path, s.name, bias);
+            if (addr) {
+                *s.dst = addr;
+                LOG_INFO("[direct-hook] ELF: {} at 0x{:X}", s.name, addr);
+            }
+        }
+    }
+
+    for (auto& s : syms) {
+        if (*s.dst) continue;
+        uintptr_t addr = find_remote_symbol(pid, "c", s.name);
+        if (!addr) addr = find_remote_symbol(pid, "dl", s.name);
+        if (addr) {
+            *s.dst = addr;
+            LOG_INFO("[direct-hook] dlsym: {} at 0x{:X}", s.name, addr);
+        }
+    }
+
+    struct { const char* func_name; uintptr_t* dst; const char* strings[4]; } fallbacks[] = {
+        {"lua_resume",     &out.resume,    {"cannot resume dead coroutine", "cannot resume running coroutine", nullptr, nullptr}},
+        {"lua_newthread",  &out.newthread, {"lua_newthread", "too many C calls", nullptr, nullptr}},
+        {"luau_load",      &out.load,      {"bytecode version mismatch", "truncated", nullptr, nullptr}},
+        {"lua_settop",     &out.settop,    {"stack overflow", nullptr, nullptr, nullptr}},
+    };
+
+    auto regions = memory_.get_regions();
+
+    for (auto& fb : fallbacks) {
+        if (*fb.dst) continue;
+        for (int si = 0; fb.strings[si]; si++) {
+            const char* needle = 
 
     if (!process_alive()) {
         set_state(InjectionState::Failed, "Process died during injection");
@@ -2996,6 +3172,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
