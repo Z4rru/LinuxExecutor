@@ -8,6 +8,16 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
+#include <sys/stat.h>
+#include <dlfcn.h>
+#include <fstream>
+#include <cstring>
+#include <filesystem>
+
+// Ensure your project's class headers are also included to fix the undeclared 'Injection', 'Memory', and 'LOG_INFO' types:
+#include "injection.hpp" 
+#include "memory.hpp"
 
 
 namespace fs = std::filesystem;
@@ -3588,6 +3598,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
