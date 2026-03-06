@@ -2801,6 +2801,92 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         next_func:;
     }
 
+        // FIX: lua_newthread has NO string literals in Luau — proximity scan near lua_settop
+    // Both live in lapi.cpp. Look for: no string refs, 2-5 calls, 40-200 bytes, stores LUA_TTHREAD=9
+    if (!out.newthread && out.settop) {
+        LOG_INFO("[direct-hook] lua_newthread: no strings found, proximity scan near lua_settop 0x{:X}", out.settop);
+        for (const auto& r : regions) {
+            if (!r.readable() || !r.executable()) continue;
+            if (out.settop < r.start || out.settop >= r.end) continue;
+
+            uintptr_t scan_lo = (out.settop > r.start + 32768) ? out.settop - 32768 : r.start;
+            uintptr_t scan_hi = std::min(out.settop + 16384, r.end);
+            size_t scan_sz = scan_hi - scan_lo;
+            if (scan_sz < 512) break;
+
+            std::vector<uint8_t> code(scan_sz);
+            struct iovec li = {code.data(), scan_sz};
+            struct iovec ri = {reinterpret_cast<void*>(scan_lo), scan_sz};
+            if (process_vm_readv(pid, &li, 1, &ri, 1, 0) != (ssize_t)scan_sz) break;
+
+            int best_score = -1;
+            uintptr_t best_addr = 0;
+            size_t best_fsz = 0;
+            int best_calls = 0;
+
+            for (size_t off = 1; off + 260 < scan_sz; off++) {
+                uintptr_t addr = scan_lo + off;
+                if (addr == out.resume || addr == out.settop ||
+                    addr == out.load || addr == out.sandbox) continue;
+
+                uint8_t prev = code[off - 1];
+                if (prev != 0xC3 && prev != 0xCC && prev != 0x90) continue;
+
+                size_t p = off;
+                if (p + 3 < scan_sz && code[p]==0xF3 && code[p+1]==0x0F &&
+                    code[p+2]==0x1E && code[p+3]==0xFA) p += 4;
+                if (p >= scan_sz) continue;
+                if (!(code[p]==0x55 || code[p]==0x53 ||
+                      (code[p]==0x41 && p+1<scan_sz && code[p+1]>=0x54 && code[p+1]<=0x57) ||
+                      (code[p]==0x48 && p+2<scan_sz && code[p+1]==0x83 && code[p+2]==0xEC)))
+                    continue;
+
+                int calls = 0, leas = 0;
+                size_t fsz = 0;
+                bool has_tt9 = false;
+
+                for (size_t j = 0; j < 250 && off+j+8 < scan_sz; j++) {
+                    size_t i = off + j;
+                    if (code[i] == 0xE8) calls++;
+                    if (i+6 < scan_sz) {
+                        if ((code[i]==0x48||code[i]==0x4C) && code[i+1]==0x8D && (code[i+2]&0xC7)==0x05) leas++;
+                        if (code[i]==0x8D && (code[i+1]&0xC7)==0x05) leas++;
+                    }
+                    if (i+7 < scan_sz && code[i]==0xC7 && (code[i+1]&0xC0)==0x40 && (code[i+1]&0x38)==0x00) {
+                        size_t disp = 1;
+                        size_t sib = ((code[i+1]&7)==4) ? 1 : 0;
+                        size_t imm_off = 2 + sib + disp;
+                        if (i+imm_off+4 <= scan_sz) {
+                            int32_t imm; memcpy(&imm, &code[i+imm_off], 4);
+                            if (imm == 9) has_tt9 = true;
+                        }
+                    }
+                    if (code[i]==0xC3 && j >= 30) { fsz = j + 1; break; }
+                }
+                if (fsz < 40 || fsz > 200 || leas > 0 || calls < 2 || calls > 6) continue;
+
+                int score = 0;
+                if (has_tt9) score += 10;
+                if (calls >= 2 && calls <= 4) score += 3;
+                if (fsz >= 60 && fsz <= 150) score += 2;
+                if (addr < out.settop) score += 1;
+
+                if (score > best_score) {
+                    best_score = score; best_addr = addr;
+                    best_fsz = fsz; best_calls = calls;
+                }
+            }
+            if (best_addr) {
+                out.newthread = best_addr;
+                LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={}, tt9={})",
+                         best_addr, best_fsz, best_calls, best_score, best_score >= 10);
+            } else {
+                LOG_WARN("[direct-hook] proximity: 0 candidates in 48KB around lua_settop");
+            }
+            break;
+        }
+    }
+    
     if (!out.resume || !out.newthread || !out.load || !out.settop) {
         LOG_ERROR("[direct-hook] missing functions: resume={:#x} newthread={:#x} load={:#x} settop={:#x}",
                   out.resume, out.newthread, out.load, out.settop);
@@ -3610,6 +3696,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
