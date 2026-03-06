@@ -2948,10 +2948,10 @@ static std::vector<uint8_t> gen_resume_trampoline(
     size_t ja_ack = c.size(); e({0x0F,0x87}); e32(0);
 
     e({0x89,0x1C,0x24});          // mov [rsp], ebx  — save data_size before rbx clobber
-    e({0x4C,0x89,0xEF});
-    e({0x48,0x85,0xFF});
-    e({0x49,0x0F,0x44,0xFC});
-    e({0x48,0x89,0xFB});
+    e({0x4C,0x89,0xEF});          // mov rdi, r13 (from)
+    e({0x48,0x85,0xFF});          // test rdi, rdi
+    e({0x49,0x0F,0x44,0xFC});     // cmovz rdi, r12 (L)
+    e({0x48,0x89,0xFB});          // mov rbx, rdi  (parent = from ? from : L)
 
     e({0x48,0xB8}); e64(a.newthread);
     e({0xFF,0xD0});
@@ -3828,6 +3828,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
