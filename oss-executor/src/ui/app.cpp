@@ -101,7 +101,12 @@ void App::build_ui(GtkApplication* app) {
         if (L) {
             Environment::instance().setup(L);
             Closures::register_all(L);
-            LOG_INFO("Lua API registered ({} globals)", lua_gettop(L));
+            int count = 0;
+            lua_pushvalue(L, LUA_GLOBALSINDEX);
+            lua_pushnil(L);
+            while (lua_next(L, -2) != 0) { ++count; lua_pop(L, 1); }
+            lua_pop(L, 1);
+            LOG_INFO("Lua API registered ({} globals)", count);
         } else {
             LOG_ERROR("Lua state is null — skipping API registration");
         }
@@ -336,7 +341,7 @@ void App::build_ui(GtkApplication* app) {
         return G_SOURCE_REMOVE;
     }, console_revealer_);
 
-    LOG_INFO("UI initialized — executor %s",
+    LOG_INFO("UI initialized — executor {}",
              Executor::instance().is_initialized() ? "online" : "OFFLINE");
 }
 
@@ -548,3 +553,4 @@ gboolean App::on_tick(gpointer data) {
 }
 
 }
+
