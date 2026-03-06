@@ -1163,6 +1163,8 @@ void Injection::thaw_tracer(pid_t tracer_pid) {
     LOG_INFO("Resumed tracer PID {}", tracer_pid);
 }
 
+static size_t dh_insn_len(const uint8_t* p);
+
 bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
                                         uintptr_t dlopen_addr, uint64_t dlopen_flags) {
     LOG_INFO("Attempting inline hook injection into PID {}...", pid);
@@ -2947,10 +2949,16 @@ static std::vector<uint8_t> gen_resume_trampoline(
         e({0xFF,0xD0});
     }
 
-       // r13 (original 'from') is consumed — reuse as compiled-bytecode pointer
+    // r13 (original 'from') is consumed — reuse as compiled-bytecode pointer
     // 0 = using mailbox data directly, nonzero = must free after
     e({0x45,0x31,0xED});          // xor r13d, r13d  — no compiled alloc yet
 
+    auto patch = [&](size_t poff, size_t target) {
+        int32_t rel = (int32_t)(target - (poff + 4));
+        memcpy(&c[poff], &rel, 4);
+    };
+
+    size_t jmp_ack_from_compile = 0;
     size_t jmp_skip_compile = 0;
     if (compile_addr && free_addr) {
         // Compile source on target side: luau_compile(src, len, NULL, &outsize)
@@ -3142,10 +3150,6 @@ static std::vector<uint8_t> gen_resume_trampoline(
     size_t chunk_name_label = c.size();
     e({0x3D,0x6F,0x73,0x73,0x00});
 
-    auto patch = [&](size_t poff, size_t target) {
-        int32_t rel = (int32_t)(target - (poff + 4));
-        memcpy(&c[poff], &rel, 4);
-    };
     patch(jne_stolen + 2, stolen_label);
     patch(jle_cleanup + 2, cleanup_label);
     patch(jz_ack1 + 2, ack_label);
@@ -3808,6 +3812,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
