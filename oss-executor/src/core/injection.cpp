@@ -2839,48 +2839,27 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if ((code[i]==0x48||code[i]==0x4C) && code[i+1]==0x8D && (code[i+2]&0xC7)==0x05) leas++;
                         if (code[i]==0x8D && (code[i+1]&0xC7)==0x05) leas++;
                     }
-                                        // mov dword [reg+disp8], imm32: C7 4x xx 09000000
-                    if (!has_tt9) {
-                        size_t ci = i;
-                        if (ci < scan_sz && (code[ci] >= 0x40 && code[ci] <= 0x4F)) ci++;
-                        if (ci + 2 < scan_sz && (code[ci] == 0xC7 || code[ci] == 0xC6)) {
-                            uint8_t modrm = code[ci + 1];
-                            uint8_t mod = (modrm >> 6) & 3;
-                            uint8_t reg_ext = (modrm >> 3) & 7;
-                            uint8_t rm = modrm & 7;
-                            if (mod != 3 && reg_ext == 0) {
-                                size_t imm_start = ci + 2;
-                                if (rm == 4 && mod != 3) {
-                                    imm_start++;
-                                    if (mod == 0 && ci + 2 < scan_sz && (code[ci+2] & 7) == 5) imm_start += 4;
-                                }
-                                if (mod == 0 && rm == 5) imm_start += 4;
-                                else if (mod == 1) imm_start += 1;
-                                else if (mod == 2) imm_start += 4;
-                                if (code[ci] == 0xC7 && imm_start + 4 <= scan_sz) {
-                                    int32_t imm; memcpy(&imm, &code[imm_start], 4);
-                                    if (imm == 9) has_tt9 = true;
-                                } else if (code[ci] == 0xC6 && imm_start + 1 <= scan_sz) {
-                                    if (code[imm_start] == 9) has_tt9 = true;
-                                }
-                            }
-                        }
+                    // Broad tt9 scan: look for 09 00 00 00 as 32-bit immediate anywhere
+                    if (!has_tt9 && i+3 < scan_sz &&
+                        code[i] == 0x09 && code[i+1] == 0x00 &&
+                        code[i+2] == 0x00 && code[i+3] == 0x00 && j >= 4) {
+                        size_t k = i;
+                        // C7/C6 mem-immediate: C7 xx ... 09000000
+                        if (k >= 3 && (code[k-3] == 0xC7 || code[k-3] == 0xC6)) has_tt9 = true;
+                        if (!has_tt9 && k >= 4 && (code[k-4] >= 0x40 && code[k-4] <= 0x4F) &&
+                            (code[k-3] == 0xC7 || code[k-3] == 0xC6)) has_tt9 = true;
+                        // mov r32, 9: Bx 09000000
+                        if (!has_tt9 && k >= 1 && code[k-1] >= 0xB8 && code[k-1] <= 0xBF) has_tt9 = true;
+                        if (!has_tt9 && k >= 2 && (code[k-2] >= 0x40 && code[k-2] <= 0x4F) &&
+                            code[k-1] >= 0xB8 && code[k-1] <= 0xBF) has_tt9 = true;
                     }
-                    // mov byte [reg+disp8], imm8: C6 4x xx 09
-                    if (!has_tt9 && i+4 < scan_sz && code[i]==0xC6 && (code[i+1]&0xC0)==0x40 && (code[i+1]&0x38)==0x00) {
-                        size_t sib = ((code[i+1]&7)==4) ? 1 : 0;
-                        size_t imm_off = 2 + sib + 1;
-                        if (i+imm_off+1 <= scan_sz && code[i+imm_off] == 9)
-                            has_tt9 = true;
-                    }
-                    // mov dword [reg+disp32], imm32: C7 8x ... 09000000
-                    if (!has_tt9 && i+10 < scan_sz && code[i]==0xC7 && (code[i+1]&0xC0)==0x80 && (code[i+1]&0x38)==0x00) {
-                        size_t sib = ((code[i+1]&7)==4) ? 1 : 0;
-                        size_t imm_off = 2 + sib + 4;
-                        if (i+imm_off+4 <= scan_sz) {
-                            int32_t imm; memcpy(&imm, &code[i+imm_off], 4);
-                            if (imm == 9) has_tt9 = true;
-                        }
+                    // Single-byte immediate: C6 xx xx 09 or 83 xx 09 or 6A 09
+                    if (!has_tt9 && code[i] == 0x09 && j >= 1) {
+                        if (i >= 1 && code[i-1] == 0x6A) has_tt9 = true; // push 9
+                        if (i >= 2 && code[i-2] == 0x83) has_tt9 = true; // add/or/cmp reg, 9
+                        if (i >= 2 && code[i-2] == 0xC6) has_tt9 = true; // mov byte [reg+disp8], 9
+                        if (i >= 3 && (code[i-3] >= 0x40 && code[i-3] <= 0x4F) &&
+                            code[i-2] == 0xC6) has_tt9 = true; // REX + mov byte
                     }
                     if (code[i]==0xC3 && j >= 30) { fsz = j + 1; break; }
                 }
@@ -2892,10 +2871,31 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (fsz >= 60 && fsz <= 150) score += 2;
                 if (addr < out.settop) score += 1;
 
-                if (score > best_score) {
-                    best_score = score; best_addr = addr;
-                    best_fsz = fsz; best_calls = calls;
+                // Cross-validate: check if candidate shares call targets with lua_resume
+                if (out.resume && score >= 5) {
+                    uint8_t resume_code[256];
+                    struct iovec rl = {resume_code, 256};
+                    struct iovec rr_v = {reinterpret_cast<void*>(out.resume), 256};
+                    if (process_vm_readv(pid, &rl, 1, &rr_v, 1, 0) == 256) {
+                        for (size_t cj = 0; cj < fsz && off+cj+5 < scan_sz; cj++) {
+                            if (code[off+cj] != 0xE8) continue;
+                            int32_t cdisp; memcpy(&cdisp, &code[off+cj+1], 4);
+                            uintptr_t ctarget = scan_lo + off + cj + 5 + (int64_t)cdisp;
+                            for (size_t rj = 0; rj + 5 <= 256; rj++) {
+                                if (resume_code[rj] != 0xE8) continue;
+                                int32_t rdisp; memcpy(&rdisp, &resume_code[rj+1], 4);
+                                uintptr_t rtarget = out.resume + rj + 5 + (int64_t)rdisp;
+                                if (ctarget == rtarget) {
+                                    score += 5;
+                                    goto done_xref;
+                                }
+                            }
+                        }
+                        done_xref:;
+                    }
                 }
+
+                if (score > best_score) { best_score=score; best_addr=addr; best_fsz=fsz; best_calls=calls; }
             }
             if (best_addr && best_score >= 6) {
                 out.newthread = best_addr;
