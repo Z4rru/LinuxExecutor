@@ -1,23 +1,34 @@
+#include "injection.hpp"
+#include "memory.hpp"
+#include "utils/logger.hpp"
+
+#include <chrono>
+#include <algorithm>
+#include <fstream>
+#include <filesystem>
+#include <string>
+#include <sstream>
+#include <cctype>
+#include <cstring>
+#include <cstdlib>
+#include <csignal>
+#include <unistd.h>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/user.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <sys/un.h>
 #include <elf.h>
 #include <luacode.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <thread>
-#include <chrono>
-#include <sys/ptrace.h>
-#include <sys/user.h>
-#include <sys/wait.h>
-#include <sys/mman.h>
-#include <sys/uio.h>
-#include <sys/stat.h>
-#include <dlfcn.h>
-#include <fstream>
-#include <cstring>
-#include <filesystem>
 
-// Ensure your project's class headers are also included to fix the undeclared 'Injection', 'Memory', and 'LOG_INFO' types:
-#include "injection.hpp" 
-#include "memory.hpp"
 
 
 namespace fs = std::filesystem;
@@ -3598,6 +3609,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
