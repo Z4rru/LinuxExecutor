@@ -1296,7 +1296,7 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
             if (!r.path.empty() && r.path[0] == '/') continue;
             if (r.size() > best_size) {
                 best_size = r.size();
-                data_addr = r.end - 4096;
+                data_addr = r.start + ((r.size() / 2) & ~static_cast<size_t>(0xFFF));
             }
         }
         if (data_addr != 0) {
@@ -1312,7 +1312,7 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
             if (r.path.find("[stack") != std::string::npos) continue;
             if (r.path.find("[vvar") != std::string::npos) continue;
             if (r.path.find("[vdso") != std::string::npos) continue;
-            data_addr = r.end - 4096;
+            data_addr = r.start + ((r.size() / 2) & ~static_cast<size_t>(0xFFF));
             LOG_WARN("Data region (named fallback) at 0x{:X} from '{}'",
                      data_addr, r.path.empty() ? "[anon]" : r.path);
             break;
@@ -1331,9 +1331,10 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         return false;
     }
 
-    uintptr_t path_addr   = data_addr;
-    uintptr_t result_addr = data_addr + 512;
-    uintptr_t guard_addr  = data_addr + 520;
+    uintptr_t path_addr       = data_addr;
+    uintptr_t result_addr     = data_addr + 512;
+    uintptr_t guard_addr      = data_addr + 520;
+    uintptr_t completion_addr = data_addr + 528;
 
     uint8_t path_buf[512] = {};
     size_t plen = std::min(lib_path.size(), sizeof(path_buf) - 1);
@@ -1345,21 +1346,28 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         return false;
     }
 
-    static constexpr uint64_t GUARD_MAGIC = 0x4F53534755415244ULL; // "OSSGUARD"
+static constexpr uint64_t GUARD_MAGIC      = 0x4F53534755415244ULL; // "OSSGUARD"
+static constexpr uint64_t COMPLETION_MAGIC = 0x4F5353444F4E4521ULL; // "OSSDONE!"
     uint64_t zero = 0;
     uint64_t magic = GUARD_MAGIC;
     proc_mem_write(pid, result_addr, &zero, 8);
     proc_mem_write(pid, guard_addr, &magic, 8);
+    proc_mem_write(pid, completion_addr, &zero, 8);
 
-    // Verify writes survived — detect if target threads are corrupting this region
-    usleep(2000);
-    uint64_t verify_guard = 0, verify_result = 0;
+        // Verify writes survived — detect if target threads are corrupting this region
+    usleep(20000);  // Increased to 20ms for better detection
+    uint64_t verify_guard = 0, verify_result = 0, verify_completion = 0;
     proc_mem_read(pid, guard_addr, &verify_guard, 8);
     proc_mem_read(pid, result_addr, &verify_result, 8);
-    if (verify_guard != GUARD_MAGIC || verify_result != 0) {
-        LOG_WARN("Data region at 0x{:X} is actively written by target threads "
-                 "(guard: wrote 0x{:X}, read 0x{:X}; result: wrote 0, read 0x{:X})",
-                 data_addr, GUARD_MAGIC, verify_guard, verify_result);
+    proc_mem_read(pid, completion_addr, &verify_completion, 8);
+    if (verify_guard != GUARD_MAGIC || verify_result != 0 || verify_completion != 0) {
+        LOG_ERROR("Data region at 0x{:X} is actively written by target threads "
+                  "(guard: wrote 0x{:X}, read 0x{:X}; result: wrote 0, read 0x{:X}; "
+                  "completion: wrote 0, read 0x{:X}) — aborting inline hook",
+                  data_addr, GUARD_MAGIC, verify_guard, verify_result, verify_completion);
+        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+        error_ = "Data region unstable — target process is actively using this memory";
+        return false;
     }
 
     size_t sc_needed = 256;
@@ -1452,11 +1460,19 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     sc[off++] = 0xFF; sc[off++] = 0xD0;
 
 
+        // mov rdx, result_addr
     sc[off++] = 0x48; sc[off++] = 0xBA;
     memcpy(sc + off, &result_addr, 8); off += 8;
-    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x02;
+    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x02;  // mov [rdx], rax
 
+    // Write completion marker: mov rdx, completion_addr; mov rax, COMPLETION_MAGIC; mov [rdx], rax
+    sc[off++] = 0x48; sc[off++] = 0xBA;
+    memcpy(sc + off, &completion_addr, 8); off += 8;
+    sc[off++] = 0x48; sc[off++] = 0xB8;
+    memcpy(sc + off, &COMPLETION_MAGIC, 8); off += 8;
+    sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x02;  // mov [rdx], rax
 
+    // skip_target label lands here
     int skip_target = off;
     int32_t jnz_rel = skip_target - (jnz_patch_offset + 4);
     memcpy(sc + jnz_patch_offset, &jnz_rel, 4);
@@ -1550,18 +1566,36 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     LOG_INFO("Inline hook installed on {} ({} bytes patched)", hooked_name, hook_size);
 
     uint64_t result = 0;
+    uint64_t completion = 0;
+    uint64_t guard_status = 0;
     bool completed = false;
     for (int i = 0; i < 100; i++) {
         usleep(100000);
-        if (proc_mem_read(pid, result_addr, &result, 8) && result != 0) {
-            LOG_INFO("Inline hook dlopen completed, handle=0x{:X}", result);
-            completed = true;
-            break;
-        }
+        
+        // Check if process is still alive
         if (kill(pid, 0) != 0) {
             error_ = "Process died during inline hook injection";
             LOG_ERROR("{}", error_);
             return false;
+        }
+        
+        // Read all status values
+        proc_mem_read(pid, completion_addr, &completion, 8);
+        proc_mem_read(pid, result_addr, &result, 8);
+        proc_mem_read(pid, guard_addr, &guard_status, 8);
+        
+        // Check for completion marker (definitive success signal)
+        if (completion == COMPLETION_MAGIC) {
+            LOG_INFO("Inline hook dlopen completed, handle=0x{:X}", result);
+            completed = true;
+            break;
+        }
+        
+        // Check if guard was corrupted (data region is unstable)
+        if (guard_status != GUARD_MAGIC && guard_status != 1) {
+            LOG_WARN("Guard value corrupted during wait (0x{:X}), data region unstable", 
+                     guard_status);
+            // Don't break — completion marker is authoritative
         }
     }
 
@@ -1578,7 +1612,32 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
 
     if (!completed) {
-        error_ = "Inline hook dlopen timed out after 10s";
+        // Read final state for diagnostics
+        proc_mem_read(pid, guard_addr, &guard_status, 8);
+        proc_mem_read(pid, result_addr, &result, 8);
+        proc_mem_read(pid, completion_addr, &completion, 8);
+        
+        if (guard_status == GUARD_MAGIC) {
+            error_ = "Inline hook timed out — nanosleep was never called (guard unconsumed)";
+        } else if (guard_status == 1 && result == 0) {
+            error_ = "Inline hook executed but dlopen returned NULL — "
+                     "library load failed (check Flatpak seccomp/dependencies)";
+        } else if (guard_status == 1 && result != 0 && completion != COMPLETION_MAGIC) {
+            error_ = "Inline hook started but crashed before completion marker was written";
+        } else {
+            std::ostringstream oss;
+            oss << "Inline hook timed out — guard=0x" << std::hex << guard_status 
+                << " result=0x" << result << " completion=0x" << completion;
+            error_ = oss.str();
+        }
+        LOG_ERROR("{}", error_);
+        return false;
+    }
+    
+    // Handle dlopen returning NULL (library load failed)
+    if (result == 0) {
+        error_ = "dlopen returned NULL — library failed to load in target "
+                 "(likely Flatpak sandbox restrictions or missing dependencies)";
         LOG_ERROR("{}", error_);
         return false;
     }
@@ -1597,10 +1656,13 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
             }
         }
         if (!lib_mapped) {
-            error_ = "dlopen returned handle 0x" +
-                     (std::ostringstream() << std::hex << result).str() +
-                     " but library not found in /proc/maps — "
-                     "result_addr contained stale data (false positive)";
+            {
+                std::ostringstream oss;
+                oss << "dlopen returned handle 0x" << std::hex << result
+                    << " but library not found in /proc/maps — "
+                       "injection failed silently (seccomp block or dependency issue)";
+                error_ = oss.str();
+            }
             LOG_ERROR("{}", error_);
             return false;
         }
@@ -1825,7 +1887,8 @@ void Injection::stop_elevated_helper() {
             if (!r.path.empty() && r.path[0] == '/') continue;
             if (r.size() > best_size) {
                 best_size = r.size();
-                data_addr = r.end - 4096;
+                // Use middle of region, page-aligned, to avoid allocation frontier
+                data_addr = r.start + ((r.size() / 2) & ~static_cast<size_t>(0xFFF));
             }
         }
         if (data_addr != 0) {
@@ -1841,7 +1904,7 @@ void Injection::stop_elevated_helper() {
             if (r.path.find("[stack") != std::string::npos) continue;
             if (r.path.find("[vvar")  != std::string::npos) continue;
             if (r.path.find("[vdso")  != std::string::npos) continue;
-            data_addr = r.end - 4096;
+            data_addr = r.start + ((r.size() / 2) & ~static_cast<size_t>(0xFFF));
             LOG_WARN("Data region (named fallback) at 0x{:X} from '{}'",
                      data_addr, r.path.empty() ? "[anon]" : r.path);
             break;
@@ -2914,6 +2977,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
