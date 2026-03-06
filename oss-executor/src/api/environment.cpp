@@ -385,9 +385,27 @@ static int lua_debug_getinfo(lua_State* L) {
             return 1;
         }
     } else if (lua_isfunction(L, 1)) {
-        lua_pushvalue(L, 1);
-        lua_getinfo(L, -1, "slna", &ar);
-        lua_pop(L, 1);
+        lua_newtable(L);
+        const char* w = lua_iscfunction(L, 1) ? "C" : "Lua";
+        lua_pushstring(L, w);
+        lua_setfield(L, -2, "what");
+        lua_pushstring(L, lua_iscfunction(L, 1) ? "=[C]" : "=[Lua]");
+        lua_setfield(L, -2, "source");
+        lua_pushstring(L, lua_iscfunction(L, 1) ? "[C]" : "[Lua]");
+        lua_setfield(L, -2, "short_src");
+        lua_pushinteger(L, -1);
+        lua_setfield(L, -2, "currentline");
+        lua_pushinteger(L, -1);
+        lua_setfield(L, -2, "linedefined");
+        int nups = 0;
+        while (lua_getupvalue(L, 1, nups + 1)) { lua_pop(L, 1); nups++; }
+        lua_pushinteger(L, nups);
+        lua_setfield(L, -2, "nups");
+        lua_pushinteger(L, 0);
+        lua_setfield(L, -2, "numparams");
+        lua_pushboolean(L, false);
+        lua_setfield(L, -2, "is_vararg");
+        return 1;
     } else {
         luaL_error(L, "debug.getinfo: expected number or function");
         return 0;
@@ -2381,6 +2399,7 @@ void Environment::setup(lua_State* L) {
 }
 
 } // namespace oss
+
 
 
 
