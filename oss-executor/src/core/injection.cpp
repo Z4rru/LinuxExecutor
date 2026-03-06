@@ -2839,10 +2839,26 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if ((code[i]==0x48||code[i]==0x4C) && code[i+1]==0x8D && (code[i+2]&0xC7)==0x05) leas++;
                         if (code[i]==0x8D && (code[i+1]&0xC7)==0x05) leas++;
                     }
+                                        // mov dword [reg+disp8], imm32: C7 4x xx 09000000
                     if (i+7 < scan_sz && code[i]==0xC7 && (code[i+1]&0xC0)==0x40 && (code[i+1]&0x38)==0x00) {
-                        size_t disp = 1;
                         size_t sib = ((code[i+1]&7)==4) ? 1 : 0;
-                        size_t imm_off = 2 + sib + disp;
+                        size_t imm_off = 2 + sib + 1;
+                        if (i+imm_off+4 <= scan_sz) {
+                            int32_t imm; memcpy(&imm, &code[i+imm_off], 4);
+                            if (imm == 9) has_tt9 = true;
+                        }
+                    }
+                    // mov byte [reg+disp8], imm8: C6 4x xx 09
+                    if (!has_tt9 && i+4 < scan_sz && code[i]==0xC6 && (code[i+1]&0xC0)==0x40 && (code[i+1]&0x38)==0x00) {
+                        size_t sib = ((code[i+1]&7)==4) ? 1 : 0;
+                        size_t imm_off = 2 + sib + 1;
+                        if (i+imm_off+1 <= scan_sz && code[i+imm_off] == 9)
+                            has_tt9 = true;
+                    }
+                    // mov dword [reg+disp32], imm32: C7 8x ... 09000000
+                    if (!has_tt9 && i+10 < scan_sz && code[i]==0xC7 && (code[i+1]&0xC0)==0x80 && (code[i+1]&0x38)==0x00) {
+                        size_t sib = ((code[i+1]&7)==4) ? 1 : 0;
+                        size_t imm_off = 2 + sib + 4;
                         if (i+imm_off+4 <= scan_sz) {
                             int32_t imm; memcpy(&imm, &code[i+imm_off], 4);
                             if (imm == 9) has_tt9 = true;
@@ -2863,7 +2879,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     best_fsz = fsz; best_calls = calls;
                 }
             }
-            if (best_addr && best_score >= 10) {
+            if (best_addr && best_score >= 5) {
                 out.newthread = best_addr;
                 LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={})",
                          best_addr, best_fsz, best_calls, best_score);
@@ -3812,6 +3828,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
