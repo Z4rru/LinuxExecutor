@@ -1354,13 +1354,13 @@ static bool resolve_functions() {
                     if (fsz>=60&&fsz<=150) score+=2;
                     if (addr<anchor) score+=1;
                                     // Validate: one of the calls should target lua_settop (cleanup)
-                if (score >= 3 && out.settop) {
+                if (score >= 3 && G.settop) {
                     bool calls_settop = false;
                     for (size_t j = 0; j < fsz && off+j+5 < scan_sz; j++) {
                         if (code[off+j] == 0xE8) {
                             int32_t cdisp; memcpy(&cdisp, &code[off+j+1], 4);
                             uintptr_t ctarget = scan_lo + off + j + 5 + (int64_t)cdisp;
-                            if (ctarget == out.settop) { calls_settop = true; break; }
+                            if (ctarget == (uintptr_t)G.settop) { calls_settop = true; break; }
                         }
                     }
                     if (calls_settop) score += 5;
