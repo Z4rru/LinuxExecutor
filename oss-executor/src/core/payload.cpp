@@ -1282,21 +1282,77 @@ static bool resolve_functions() {
     }
 
     if (!G.newthread) {
-        static const char* nt_strings[] = {
-            "lua_newthread",
-            "too many C calls",
-            nullptr
-        };
-        for (int i = 0; nt_strings[i] && !G.newthread; i++) {
-            size_t slen = strlen(nt_strings[i]);
-            uintptr_t str_addr = scan_for_string(nt_strings[i], slen);
-            if (!str_addr) continue;
-            uintptr_t xref = find_lea_xref(str_addr);
-            if (!xref) continue;
-            uintptr_t func = walk_back_to_func(xref);
-            if (func && !is_in_payload(func)) {
-                G.newthread = (fn_newthread)func;
-                plog("[payload] string-ref: lua_newthread at %lx\n", func);
+        // lua_newthread has NO string literals in Luau. Proximity scan near lua_settop.
+        uintptr_t anchor = (uintptr_t)G.settop;
+        if (!anchor) anchor = (uintptr_t)G.load;
+        if (anchor && !is_in_payload(anchor)) {
+            plog("[payload] lua_newthread: proximity scan near %lx\n", anchor);
+            auto scan_regions = get_regions();
+            for (auto& r : scan_regions) {
+                if (!r.r || !r.x) continue;
+                if (anchor < r.base || anchor >= r.base + r.size) continue;
+
+                uintptr_t scan_lo = (anchor > r.base + 32768) ? anchor - 32768 : r.base;
+                uintptr_t scan_hi = (anchor + 16384 < r.base + r.size) ? anchor + 16384 : r.base + r.size;
+                size_t scan_sz = scan_hi - scan_lo;
+                if (scan_sz < 512) break;
+
+                std::vector<uint8_t> code(scan_sz);
+                if (!safe_read(scan_lo, code.data(), scan_sz)) break;
+
+                int best_score = -1;
+                uintptr_t best_addr = 0;
+                size_t best_fsz = 0; int best_calls = 0;
+
+                for (size_t off = 1; off + 260 < scan_sz; off++) {
+                    uintptr_t addr = scan_lo + off;
+                    if (addr == (uintptr_t)G.resume || addr == (uintptr_t)G.settop ||
+                        addr == (uintptr_t)G.load || addr == (uintptr_t)G.sandbox) continue;
+                    if (is_in_payload(addr)) continue;
+
+                    if (code[off-1]!=0xC3 && code[off-1]!=0xCC && code[off-1]!=0x90) continue;
+
+                    size_t p = off;
+                    if (p+3<scan_sz && code[p]==0xF3 && code[p+1]==0x0F && code[p+2]==0x1E && code[p+3]==0xFA) p+=4;
+                    if (p>=scan_sz) continue;
+                    if (!(code[p]==0x55||code[p]==0x53||
+                          (code[p]==0x41&&p+1<scan_sz&&code[p+1]>=0x54&&code[p+1]<=0x57)||
+                          (code[p]==0x48&&p+2<scan_sz&&code[p+1]==0x83&&code[p+2]==0xEC)))
+                        continue;
+
+                    int calls=0,leas=0; size_t fsz=0; bool has_tt9=false;
+                    for (size_t j=0; j<250 && off+j+8<scan_sz; j++) {
+                        size_t i=off+j;
+                        if (code[i]==0xE8) calls++;
+                        if (i+6<scan_sz) {
+                            if ((code[i]==0x48||code[i]==0x4C)&&code[i+1]==0x8D&&(code[i+2]&0xC7)==0x05) leas++;
+                            if (code[i]==0x8D&&(code[i+1]&0xC7)==0x05) leas++;
+                        }
+                        if (i+7<scan_sz && code[i]==0xC7 && (code[i+1]&0xC0)==0x40 && (code[i+1]&0x38)==0x00) {
+                            size_t sib=((code[i+1]&7)==4)?1:0;
+                            size_t imm_off=2+sib+1;
+                            if (i+imm_off+4<=scan_sz) {
+                                int32_t imm; memcpy(&imm,&code[i+imm_off],4);
+                                if (imm==9) has_tt9=true;
+                            }
+                        }
+                        if (code[i]==0xC3 && j>=30) { fsz=j+1; break; }
+                    }
+                    if (fsz<40||fsz>200||leas>0||calls<2||calls>6) continue;
+
+                    int score=0;
+                    if (has_tt9) score+=10;
+                    if (calls>=2&&calls<=4) score+=3;
+                    if (fsz>=60&&fsz<=150) score+=2;
+                    if (addr<anchor) score+=1;
+                    if (score>best_score) { best_score=score; best_addr=addr; best_fsz=fsz; best_calls=calls; }
+                }
+                if (best_addr) {
+                    G.newthread = (fn_newthread)best_addr;
+                    plog("[payload] proximity: lua_newthread at %lx (%zuB, %d calls, score=%d)\n",
+                         best_addr, best_fsz, best_calls, best_score);
+                }
+                break;
             }
         }
     }
