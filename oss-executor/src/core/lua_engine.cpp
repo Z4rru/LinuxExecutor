@@ -540,6 +540,8 @@ bool LuaEngine::send_to_payload(const std::string& source_code,
                 offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(kName) - 1);
 
             if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), alen) == 0) {
+                uint32_t len = static_cast<uint32_t>(data.size());
+                ::write(fd, &len, sizeof(len));
                 size_t sent = 0;
                 while (sent < data.size()) {
                     ssize_t n = ::write(fd, data.data() + sent, data.size() - sent);
@@ -570,6 +572,8 @@ bool LuaEngine::send_to_payload(const std::string& source_code,
 
             if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
                           sizeof(addr)) == 0) {
+                uint32_t len = static_cast<uint32_t>(data.size());
+                ::write(fd, &len, sizeof(len));
                 size_t sent = 0;
                 while (sent < data.size()) {
                     ssize_t n = ::write(fd, data.data() + sent, data.size() - sent);
@@ -604,6 +608,8 @@ bool LuaEngine::send_to_payload(const std::string& source_code,
 
         std::ofstream f(cmd_path, std::ios::binary | std::ios::trunc);
         if (f.is_open()) {
+            uint32_t len = static_cast<uint32_t>(data.size());
+            f.write(reinterpret_cast<const char*>(&len), sizeof(len));
             f.write(data.data(), static_cast<std::streamsize>(data.size()));
             f.close();
             if (f.good()) {
@@ -1130,7 +1136,9 @@ void LuaEngine::register_custom_libs() {
 }
 
 void LuaEngine::sandbox() {
-    execute_internal(R"(
+    if (!L_) return;
+
+    static const char* sandbox_code = R"(
         local safe_os = {
             time = os.time, clock = os.clock,
             date = os.date, difftime = os.difftime
@@ -1138,7 +1146,32 @@ void LuaEngine::sandbox() {
         os = safe_os
         loadfile = nil
         dofile = nil
-    )", "=sandbox");
+    )";
+
+    std::string bc = compile(sandbox_code);
+    if (bc.empty()) return;
+
+    LOG_DEBUG("LuaEngine: Executing '=sandbox' ({} bytes bytecode)", bc.size());
+
+    if (luau_load(L_, "=sandbox", bc.data(), bc.size(), 0) != 0) {
+        const char* err = lua_tostring(L_, -1);
+        LOG_ERROR("LuaEngine: sandbox load error: {}", err ? err : "unknown");
+        lua_pop(L_, 1);
+        return;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    int status = lua_pcall(L_, 0, 0, 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+
+    if (status != 0) {
+        const char* err = lua_tostring(L_, -1);
+        LOG_ERROR("LuaEngine: sandbox error: {}", err ? err : "unknown");
+        lua_pop(L_, 1);
+    } else {
+        LOG_INFO("LuaEngine: '=sandbox' completed in {:.1f}ms", ms);
+    }
 }
 
 int LuaEngine::lua_drawing_new(lua_State* L) {
@@ -1379,11 +1412,14 @@ int LuaEngine::lua_drawing_newindex(lua_State* L) {
             cairo_surface_destroy(surface);
             surface = nullptr;
         }
-        eng->update_drawing_object(h->id, [&path, surface](DrawingObject& o){
+        bool ok = eng->update_drawing_object(h->id, [path, surface](DrawingObject& o){
             if (o.image_surface) cairo_surface_destroy(o.image_surface);
             o.image_path    = path;
             o.image_surface = surface;
         });
+        if (!ok && surface) {
+            cairo_surface_destroy(surface);
+        }
     }
 
     return 0;
@@ -2152,3 +2188,4 @@ int LuaEngine::lua_sha256(lua_State* L) {
 }
 
 }
+
