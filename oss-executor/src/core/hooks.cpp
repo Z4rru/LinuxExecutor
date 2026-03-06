@@ -400,12 +400,13 @@ uintptr_t HookManager::find_remote_got_entry(pid_t pid, const std::string& libra
 
     uintptr_t symtab_addr = 0, strtab_addr = 0, jmprel_addr = 0;
     size_t pltrelsz = 0;
+    uintptr_t got_bias = (ehdr.e_type == ET_DYN) ? lib_base : 0;
 
     for (const auto& d : dyns) {
         switch (d.d_tag) {
-            case DT_SYMTAB:   symtab_addr = d.d_un.d_ptr; break;
-            case DT_STRTAB:   strtab_addr = d.d_un.d_ptr; break;
-            case DT_JMPREL:   jmprel_addr = d.d_un.d_ptr; break;
+            case DT_SYMTAB:   symtab_addr = d.d_un.d_ptr + got_bias; break;
+            case DT_STRTAB:   strtab_addr = d.d_un.d_ptr + got_bias; break;
+            case DT_JMPREL:   jmprel_addr = d.d_un.d_ptr + got_bias; break;
             case DT_PLTRELSZ: pltrelsz = d.d_un.d_val; break;
             default: break;
         }
@@ -442,8 +443,7 @@ uintptr_t HookManager::find_remote_symbol(pid_t pid, const std::string& library,
 
     uintptr_t lib_base = 0;
     for (const auto& r : regions) {
-        if (!library.empty() && r.path.find(library) != std::string::npos &&
-            (r.prot & PROT_EXEC)) {
+        if (!library.empty() && r.path.find(library) != std::string::npos) {
             if (!lib_base || r.start < lib_base)
                 lib_base = r.start;
         }
@@ -479,14 +479,15 @@ uintptr_t HookManager::find_remote_symbol(pid_t pid, const std::string& library,
     uintptr_t symtab_addr = 0, strtab_addr = 0;
     size_t strtab_size = 0;
     uintptr_t hash_addr = 0, gnu_hash_addr = 0;
+    uintptr_t sym_bias = (ehdr.e_type == ET_DYN) ? lib_base : 0;
 
     for (const auto& d : dyns) {
         switch (d.d_tag) {
-            case DT_SYMTAB:  symtab_addr = d.d_un.d_ptr; break;
-            case DT_STRTAB:  strtab_addr = d.d_un.d_ptr; break;
-            case DT_STRSZ:   strtab_size = d.d_un.d_val; break;
-            case DT_HASH:    hash_addr = d.d_un.d_ptr; break;
-            case DT_GNU_HASH: gnu_hash_addr = d.d_un.d_ptr; break;
+            case DT_SYMTAB:   symtab_addr = d.d_un.d_ptr + sym_bias; break;
+            case DT_STRTAB:   strtab_addr = d.d_un.d_ptr + sym_bias; break;
+            case DT_STRSZ:    strtab_size = d.d_un.d_val; break;
+            case DT_HASH:     hash_addr = d.d_un.d_ptr + sym_bias; break;
+            case DT_GNU_HASH: gnu_hash_addr = d.d_un.d_ptr + sym_bias; break;
             default: break;
         }
     }
