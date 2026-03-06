@@ -125,7 +125,7 @@ target_link_libraries(oss_payload PRIVATE
 )
 
 # Generate version script to hide ALL exported symbols from static Luau
-file(WRITE ${CMAKE_BINARY_DIR}/payload.map "{ local: *; };\n")
+file(WRITE ${CMAKE_BINARY_DIR}/payload.map "{ global: oss_payload_entry; local: *; };\n")
 
 target_link_options(oss_payload PRIVATE
     -static-libstdc++
@@ -176,6 +176,7 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
 
 
 
