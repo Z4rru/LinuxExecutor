@@ -2922,7 +2922,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
                 if (score > best_score) { best_score=score; best_addr=addr; best_fsz=fsz; best_calls=calls; }
             }
-            if (best_addr && best_score >= 6) {
+            if (best_addr && best_score >= 8) {
                 out.newthread = best_addr;
                 LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={})",
                          best_addr, best_fsz, best_calls, best_score);
@@ -2942,6 +2942,83 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             LOG_INFO("[direct-hook] libc free at 0x{:X}", out.free_fn);
     }
 
+    // Global scan: if proximity failed, scan ALL exec regions for lua_newthread
+    if (!out.newthread && out.resume) {
+        LOG_INFO("[direct-hook] proximity scan failed, trying global scan for lua_newthread");
+        for (const auto& r : regions) {
+            if (!r.readable() || !r.executable()) continue;
+            if (r.size() < 512) continue;
+            size_t scan_sz = std::min(r.size(), static_cast<size_t>(0x200000));
+            std::vector<uint8_t> code(scan_sz);
+            struct iovec li = {code.data(), scan_sz};
+            struct iovec ri = {reinterpret_cast<void*>(r.start), scan_sz};
+            if (process_vm_readv(pid, &li, 1, &ri, 1, 0) != (ssize_t)scan_sz) continue;
+
+            int best_score = -1;
+            uintptr_t best_addr = 0;
+
+            for (size_t off = 1; off + 200 < scan_sz; off++) {
+                if (code[off-1] != 0xC3 && code[off-1] != 0xCC && code[off-1] != 0x90) continue;
+                uintptr_t addr = r.start + off;
+                if (addr == out.resume || addr == out.settop || addr == out.load) continue;
+
+                size_t p = off;
+                if (p+3 < scan_sz && code[p]==0xF3 && code[p+1]==0x0F && code[p+2]==0x1E && code[p+3]==0xFA) p+=4;
+                if (p >= scan_sz) continue;
+                if (!(code[p]==0x55 || code[p]==0x53 ||
+                      (code[p]==0x41 && p+1<scan_sz && code[p+1]>=0x54 && code[p+1]<=0x57) ||
+                      (code[p]==0x48 && p+2<scan_sz && code[p+1]==0x83 && code[p+2]==0xEC)))
+                    continue;
+
+                bool uses_rsi = false, saves_rdi = false, has_tt9 = false;
+                int calls = 0, leas = 0;
+                size_t fsz = 0;
+
+                for (size_t j = 0; j < 200 && off+j+8 < scan_sz; j++) {
+                    size_t i = off + j;
+                    if (code[i] == 0xE8) calls++;
+                    if (i+6 < scan_sz && ((code[i]==0x48||code[i]==0x4C) && code[i+1]==0x8D && (code[i+2]&0xC7)==0x05)) leas++;
+
+                    // rsi check
+                    if (j < 20 && i+2 < scan_sz) {
+                        if (code[i]==0x89 && (code[i+1]&0xF8)==0xF0) uses_rsi = true;
+                        if ((code[i]==0x48||code[i]==0x49) && code[i+1]==0x89 && (code[i+2]&0xF8)==0xF0) uses_rsi = true;
+                        if ((code[i]==0x48||code[i]==0x49) && code[i+1]==0x89 && (code[i+2]&0xF8)==0xF8) saves_rdi = true;
+                        if (code[i]==0x89 && (code[i+1]&0xF8)==0xF8) saves_rdi = true;
+                    }
+
+                    // tt9 broad scan
+                    if (!has_tt9 && i+3 < scan_sz && code[i]==0x09 && code[i+1]==0x00 && code[i+2]==0x00 && code[i+3]==0x00 && j>=4) {
+                        if (i>=1 && code[i-1]>=0xB8 && code[i-1]<=0xBF) has_tt9 = true;
+                        if (i>=2 && (code[i-2]>=0x40&&code[i-2]<=0x4F) && code[i-1]>=0xB8 && code[i-1]<=0xBF) has_tt9 = true;
+                        if (i>=3 && (code[i-3]==0xC7||code[i-3]==0xC6)) has_tt9 = true;
+                        if (i>=4 && (code[i-4]>=0x40&&code[i-4]<=0x4F) && (code[i-3]==0xC7||code[i-3]==0xC6)) has_tt9 = true;
+                    }
+
+                    if (code[i]==0xC3 && j >= 30) { fsz = j + 1; break; }
+                }
+
+                if (!has_tt9 || uses_rsi || !saves_rdi) continue;
+                if (fsz < 40 || fsz > 200 || leas > 0 || calls < 2 || calls > 5) continue;
+
+                int score = 10; // tt9 guaranteed
+                if (calls >= 2 && calls <= 4) score += 3;
+                if (fsz >= 60 && fsz <= 150) score += 2;
+
+                if (score > best_score) {
+                    best_score = score;
+                    best_addr = addr;
+                }
+            }
+            if (best_addr && best_score >= 10) {
+                out.newthread = best_addr;
+                LOG_INFO("[direct-hook] global scan: lua_newthread=0x{:X} (score={})", best_addr, best_score);
+                break;
+            }
+        }
+    }
+
+    
     if (!out.resume || !out.newthread || !out.load || !out.settop) {
         LOG_ERROR("[direct-hook] missing functions: resume={:#x} newthread={:#x} load={:#x} settop={:#x}",
                   out.resume, out.newthread, out.load, out.settop);
@@ -3899,6 +3976,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
