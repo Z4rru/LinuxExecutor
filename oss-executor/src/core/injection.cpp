@@ -2865,6 +2865,33 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 }
                 if (fsz < 40 || fsz > 200 || leas > 0 || calls < 2 || calls > 6) continue;
 
+                // lua_newthread takes exactly 1 arg (rdi). Reject functions
+                // that save rsi (second arg) in the first 20 bytes.
+                bool uses_rsi = false;
+                bool saves_rdi = false;
+                for (size_t bi = 0; bi < 20 && off + bi + 3 < scan_sz; bi++) {
+                    uint8_t b0 = code[off + bi];
+                    uint8_t b1 = code[off + bi + 1];
+                    uint8_t b2 = code[off + bi + 2];
+                    // Check for mov rXX, rsi patterns:
+                    // 89 F0-F7         mov eXX, esi
+                    // 48 89 F0-F7      mov rXX, rsi  
+                    // 49 89 F0-F7      mov r8-r15, rsi
+                    if (b0 == 0x89 && (b1 & 0xF8) == 0xF0) uses_rsi = true;
+                    if ((b0 == 0x48 || b0 == 0x49) && b1 == 0x89 && (b2 & 0xF8) == 0xF0) uses_rsi = true;
+                    // Check for mov rXX, rdi patterns (saves first arg):
+                    // 48 89 F8-FF      mov rXX, rdi
+                    // 49 89 F8-FF      mov r8-r15, rdi
+                    if ((b0 == 0x48 || b0 == 0x49) && b1 == 0x89 && (b2 & 0xF8) == 0xF8) saves_rdi = true;
+                }
+                if (uses_rsi) {
+                    LOG_DEBUG("[direct-hook] rejecting 0x{:X}: uses rsi (2-arg function)", addr);
+                    continue;
+                }
+                if (!saves_rdi) {
+                    score -= 2; // Penalize: lua_newthread must save L (rdi)
+                }
+
                 int score = 0;
                 if (has_tt9) score += 10;
                 if (calls >= 2 && calls <= 4) score += 3;
@@ -3874,6 +3901,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
