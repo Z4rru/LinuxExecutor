@@ -110,11 +110,28 @@ bool Executor::send_to_payload(const std::string& source) {
     const auto& pinfo = inj.process_info();
     pid_t pid = inj.target_pid();
 
+    if (inj.is_direct_hook()) {
+        size_t bc_len = 0;
+        char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_len);
+        if (!bc || bc_len == 0 || static_cast<uint8_t>(bc[0]) == 0) {
+            std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
+            free(bc);
+            LOG_ERROR("Compile failed for direct hook: {}", ce);
+            return false;
+        }
+        bool ok = inj.send_via_mailbox(bc, bc_len, 1);
+        free(bc);
+        if (ok) {
+            LOG_INFO("Sent {} bytes bytecode via direct hook mailbox", bc_len);
+            return true;
+        }
+        LOG_WARN("Direct hook mailbox failed, trying IPC fallback");
+    }
+
     std::string prefix;
     if ((pinfo.via_flatpak || pinfo.via_sober) && pid > 0)
         prefix = "/proc/" + std::to_string(pid) + "/root";
 
-    // Helper: write all bytes to an fd
     auto write_all = [](int fd, const char* d, size_t rem) -> bool {
         while (rem > 0) {
             ssize_t n = ::write(fd, d, rem);
@@ -529,7 +546,3 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
-
-
-
-
