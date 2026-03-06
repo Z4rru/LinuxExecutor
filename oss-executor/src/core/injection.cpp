@@ -2688,7 +2688,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         {"lua_newthread",  &out.newthread, {"lua_newthread", "too many C calls", nullptr}},
         {"luau_load",      &out.load,      {"bytecode version mismatch", "truncated", nullptr}},
         {"lua_settop",     &out.settop,    {"stack overflow", nullptr}},
-        {"luau_compile",   &out.compile,   {"CompileError", "broken string", nullptr}},
+        {"luau_compile",   &out.compile,   {"CompileError", "broken string", "compile option", nullptr}},
     };
 
     auto regions = memory_.get_regions();
@@ -2840,12 +2840,30 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if (code[i]==0x8D && (code[i+1]&0xC7)==0x05) leas++;
                     }
                                         // mov dword [reg+disp8], imm32: C7 4x xx 09000000
-                    if (i+7 < scan_sz && code[i]==0xC7 && (code[i+1]&0xC0)==0x40 && (code[i+1]&0x38)==0x00) {
-                        size_t sib = ((code[i+1]&7)==4) ? 1 : 0;
-                        size_t imm_off = 2 + sib + 1;
-                        if (i+imm_off+4 <= scan_sz) {
-                            int32_t imm; memcpy(&imm, &code[i+imm_off], 4);
-                            if (imm == 9) has_tt9 = true;
+                    if (!has_tt9) {
+                        size_t ci = i;
+                        if (ci < scan_sz && (code[ci] >= 0x40 && code[ci] <= 0x4F)) ci++;
+                        if (ci + 2 < scan_sz && (code[ci] == 0xC7 || code[ci] == 0xC6)) {
+                            uint8_t modrm = code[ci + 1];
+                            uint8_t mod = (modrm >> 6) & 3;
+                            uint8_t reg_ext = (modrm >> 3) & 7;
+                            uint8_t rm = modrm & 7;
+                            if (mod != 3 && reg_ext == 0) {
+                                size_t imm_start = ci + 2;
+                                if (rm == 4 && mod != 3) {
+                                    imm_start++;
+                                    if (mod == 0 && ci + 2 < scan_sz && (code[ci+2] & 7) == 5) imm_start += 4;
+                                }
+                                if (mod == 0 && rm == 5) imm_start += 4;
+                                else if (mod == 1) imm_start += 1;
+                                else if (mod == 2) imm_start += 4;
+                                if (code[ci] == 0xC7 && imm_start + 4 <= scan_sz) {
+                                    int32_t imm; memcpy(&imm, &code[imm_start], 4);
+                                    if (imm == 9) has_tt9 = true;
+                                } else if (code[ci] == 0xC6 && imm_start + 1 <= scan_sz) {
+                                    if (code[imm_start] == 9) has_tt9 = true;
+                                }
+                            }
                         }
                     }
                     // mov byte [reg+disp8], imm8: C6 4x xx 09
@@ -2879,7 +2897,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     best_fsz = fsz; best_calls = calls;
                 }
             }
-            if (best_addr && best_score >= 5) {
+            if (best_addr && best_score >= 8) {
                 out.newthread = best_addr;
                 LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={})",
                          best_addr, best_fsz, best_calls, best_score);
@@ -3631,8 +3649,8 @@ bool Injection::execute_script(const std::string& source) {
             }
             free(bc);
         }
-        LOG_INFO("Sending raw source '{}' ({} bytes) to payload for target-side compilation",
-                 "user_script", source.size());
+        LOG_INFO("Sending raw source 'user_script' ({} bytes) to payload for target-side compilation",
+                 source.size());
         bool ok = send_via_mailbox(source.data(), source.size(), 0);
         if (ok) {
             set_state(InjectionState::Ready, "Source dispatched to Roblox payload");
@@ -3828,6 +3846,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
