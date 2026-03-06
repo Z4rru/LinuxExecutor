@@ -1354,20 +1354,29 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     proc_mem_write(pid, guard_addr, &magic, 8);
     proc_mem_write(pid, completion_addr, &zero, 8);
 
-        // Verify writes survived — detect if target threads are corrupting this region
-    usleep(20000);  // Increased to 20ms for better detection
+    // Verify writes survived — detect if target threads are corrupting this region
+    usleep(20000);
     uint64_t verify_guard = 0, verify_result = 0, verify_completion = 0;
     proc_mem_read(pid, guard_addr, &verify_guard, 8);
     proc_mem_read(pid, result_addr, &verify_result, 8);
     proc_mem_read(pid, completion_addr, &verify_completion, 8);
     if (verify_guard != GUARD_MAGIC || verify_result != 0 || verify_completion != 0) {
-        LOG_ERROR("Data region at 0x{:X} is actively written by target threads "
-                  "(guard: wrote 0x{:X}, read 0x{:X}; result: wrote 0, read 0x{:X}; "
-                  "completion: wrote 0, read 0x{:X}) — aborting inline hook",
-                  data_addr, GUARD_MAGIC, verify_guard, verify_result, verify_completion);
-        proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
-        error_ = "Data region unstable — target process is actively using this memory";
-        return false;
+        LOG_WARN("Data region at 0x{:X} corrupted within 20ms by target "
+                 "(guard: 0x{:X} vs expected 0x{:X}; result: 0x{:X}; completion: 0x{:X})",
+                 data_addr, verify_guard, GUARD_MAGIC, verify_result, verify_completion);
+        // Re-write and verify once more before giving up
+        proc_mem_write(pid, result_addr, &zero, 8);
+        proc_mem_write(pid, guard_addr, &magic, 8);
+        proc_mem_write(pid, completion_addr, &zero, 8);
+        usleep(20000);
+        proc_mem_read(pid, guard_addr, &verify_guard, 8);
+        if (verify_guard != GUARD_MAGIC) {
+            LOG_ERROR("Data region at 0x{:X} unstable after retry — aborting inline hook", data_addr);
+            proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
+            error_ = "Data region unstable — target actively writing to selected memory area";
+            return false;
+        }
+        LOG_INFO("Data region stabilized on second write — proceeding");
     }
 
     size_t sc_needed = 256;
@@ -1926,10 +1935,9 @@ void Injection::stop_elevated_helper() {
         return false;
     }
 
-    uintptr_t path_addr       = data_addr;
-    uintptr_t result_addr     = data_addr + 512;
-    uintptr_t guard_addr      = data_addr + 520;
-    uintptr_t completion_addr = data_addr + 528;
+    uintptr_t path_addr   = data_addr;
+    uintptr_t result_addr = data_addr + 512;
+    uintptr_t done_addr   = data_addr + 520;  // spin-wait sync flag for procmem path
 
     uint8_t path_buf[512] = {};
     size_t path_len = std::min(lib_path.size(), sizeof(path_buf) - 1);
@@ -2988,6 +2996,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
