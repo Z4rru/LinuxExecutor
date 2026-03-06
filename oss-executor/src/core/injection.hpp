@@ -89,7 +89,7 @@ public:
 
     Memory& memory() { return memory_; }
     bool send_via_mailbox(const void* data, size_t len, uint32_t flags);
-    bool is_direct_hook() const;
+    bool is_direct_hook() const { return dhook_.active; }
 
 private:
     Injection() = default;
@@ -207,6 +207,7 @@ private:
 };
 
 }
+
 
 
 
