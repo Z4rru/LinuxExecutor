@@ -2,6 +2,8 @@
 #include <luacode.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <thread>
+#include <chrono>
 
 
 namespace fs = std::filesystem;
@@ -3582,4 +3584,5 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
