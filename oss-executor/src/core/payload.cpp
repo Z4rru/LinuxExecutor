@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "luacode.h"
+#include <atomic> 
 
 static pthread_t g_file_t = 0, g_ipc_t = 0, g_init_t = 0;
 
@@ -29,7 +30,7 @@ static pthread_t g_file_t = 0, g_ipc_t = 0, g_init_t = 0;
 
 // ─── FIX #3: Memory-mapped mailbox for cross-namespace IPC ───────────────────
 // The executor can find this via /proc/PID/mem scanning and write scripts
-// directly into it, bypassing all filesystem namespace issues.
+static std::atomic<bool> g_initialized{false};
 static constexpr size_t   MAILBOX_DATA_CAP = 1 << 18; // 256 KB
 static constexpr char     MAILBOX_MAGIC[16] = {
     'O','S','S','_','M','A','I','L','B','O','X','_','V','2','\0','\0'
