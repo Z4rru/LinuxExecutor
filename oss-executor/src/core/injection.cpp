@@ -1,32 +1,5 @@
-#include "injection.hpp"
-#include "memory.hpp"
-#include "utils/logger.hpp"
-
-#include <chrono>
-#include <algorithm>
-#include <fstream>
-#include <filesystem>
-#include <string>
-#include <sstream>
-#include <cctype>
-#include <cstring>
-#include <cstdlib>
-#include <csignal>
-#include <unistd.h>
-#include <dirent.h>
-#include <dlfcn.h>
-#include <link.h>
-#include <sys/ptrace.h>
-#include <sys/wait.h>
-#include <sys/user.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/uio.h>
-#include <sys/un.h>
 #include <elf.h>
 #include <luacode.h>
-#include <cstdio>
 #include <fcntl.h>
 #include <poll.h>
 
@@ -1284,7 +1257,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
 
     auto regions = memory_.get_regions();
     uintptr_t data_addr = 0;
-    // Pass 1: prefer anonymous/heap regions — named binary segments contain live variables
     {
         size_t best_size = 0;
         for (const auto& r : regions) {
@@ -1293,7 +1265,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
             if (r.path.find("[stack") != std::string::npos) continue;
             if (r.path.find("[vvar") != std::string::npos) continue;
             if (r.path.find("[vdso") != std::string::npos) continue;
-            // Skip file-backed mappings (binary/library data segments)
             if (!r.path.empty() && r.path[0] == '/') continue;
             if (r.size() > best_size) {
                 best_size = r.size();
@@ -1305,7 +1276,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
                       best_size / 1024, data_addr);
         }
     }
-    // Pass 2: fall back to any writable region if no anonymous region found
     if (data_addr == 0) {
         for (const auto& r : regions) {
             if (!r.writable() || !r.readable()) continue;
@@ -1347,15 +1317,14 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         return false;
     }
 
-    static constexpr uint64_t GUARD_MAGIC      = 0x4F53534755415244ULL; // "OSSGUARD"
-    static constexpr uint64_t COMPLETION_MAGIC  = 0x4F5353444F4E4521ULL; // "OSSDONE!"
+    static constexpr uint64_t GUARD_MAGIC      = 0x4F53534755415244ULL;
+    static constexpr uint64_t COMPLETION_MAGIC  = 0x4F5353444F4E4521ULL;
     uint64_t zero = 0;
     uint64_t magic = GUARD_MAGIC;
     proc_mem_write(pid, result_addr, &zero, 8);
     proc_mem_write(pid, guard_addr, &magic, 8);
     proc_mem_write(pid, completion_addr, &zero, 8);
 
-    // Verify writes survived — detect if target threads are corrupting this region
     usleep(20000);
     uint64_t verify_guard = 0, verify_result = 0, verify_completion = 0;
     proc_mem_read(pid, guard_addr, &verify_guard, 8);
@@ -1365,7 +1334,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         LOG_WARN("Data region at 0x{:X} corrupted within 20ms by target "
                  "(guard: 0x{:X} vs expected 0x{:X}; result: 0x{:X}; completion: 0x{:X})",
                  data_addr, verify_guard, GUARD_MAGIC, verify_result, verify_completion);
-        // Re-write and verify once more before giving up
         proc_mem_write(pid, result_addr, &zero, 8);
         proc_mem_write(pid, guard_addr, &magic, 8);
         proc_mem_write(pid, completion_addr, &zero, 8);
@@ -1382,7 +1350,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
 
     size_t sc_needed = 256;
 
-    
     std::vector<MemoryRegion> nearby_regions;
     for (const auto& r : regions) {
         int64_t dist_lo = static_cast<int64_t>(r.start) - static_cast<int64_t>(hook_func_addr);
@@ -1417,12 +1384,9 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     memset(sc, 0xCC, sizeof(sc));
     int off = 0;
 
-
     sc[off++] = 0x9C;
-
     sc[off++] = 0x50; sc[off++] = 0x51; sc[off++] = 0x52; sc[off++] = 0x53;
     sc[off++] = 0x55; sc[off++] = 0x56; sc[off++] = 0x57;
-
     sc[off++] = 0x41; sc[off++] = 0x50;
     sc[off++] = 0x41; sc[off++] = 0x51;
     sc[off++] = 0x41; sc[off++] = 0x52;
@@ -1436,62 +1400,43 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xE5;
     sc[off++] = 0x48; sc[off++] = 0x83; sc[off++] = 0xE4; sc[off++] = 0xF0;
 
-
-        // mov rdx, guard_addr
     sc[off++] = 0x48; sc[off++] = 0xBA;
     memcpy(sc + off, &guard_addr, 8); off += 8;
-
-    // mov rax, GUARD_MAGIC (expected old value for cmpxchg)
     sc[off++] = 0x48; sc[off++] = 0xB8;
     memcpy(sc + off, &magic, 8); off += 8;
-
-    // mov ecx, 1 (desired new value; zero-extends to rcx)
     sc[off++] = 0xB9; sc[off++] = 0x01; sc[off++] = 0x00; sc[off++] = 0x00; sc[off++] = 0x00;
-
-    // lock cmpxchg [rdx], rcx — if [rdx]==rax then [rdx]=rcx, ZF=1; else rax=[rdx], ZF=0
     sc[off++] = 0xF0; sc[off++] = 0x48; sc[off++] = 0x0F; sc[off++] = 0xB1; sc[off++] = 0x0A;
-
-    // jnz skip_dlopen (guard was corrupted or already consumed)
     sc[off++] = 0x0F; sc[off++] = 0x85;
     int jnz_patch_offset = off;
     off += 4;
 
-  
     sc[off++] = 0x48; sc[off++] = 0xBF;
     memcpy(sc + off, &path_addr, 8); off += 8;
-
-
     sc[off++] = 0x48; sc[off++] = 0xBE;
     memcpy(sc + off, &dlopen_flags, 8); off += 8;
-
-
     sc[off++] = 0x48; sc[off++] = 0xB8;
     memcpy(sc + off, &dlopen_addr, 8); off += 8;
     sc[off++] = 0xFF; sc[off++] = 0xD0;
-
 
     sc[off++] = 0x48; sc[off++] = 0xBA;
     memcpy(sc + off, &result_addr, 8); off += 8;
     sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x02;
 
-    // Write COMPLETION_MAGIC to completion_addr — proves shellcode actually ran
     {
         uint64_t comp_magic = COMPLETION_MAGIC;
-        sc[off++] = 0x48; sc[off++] = 0xBA;                      // mov rdx, completion_addr
+        sc[off++] = 0x48; sc[off++] = 0xBA;
         memcpy(sc + off, &completion_addr, 8); off += 8;
-        sc[off++] = 0x48; sc[off++] = 0xB8;                      // mov rax, COMPLETION_MAGIC
+        sc[off++] = 0x48; sc[off++] = 0xB8;
         memcpy(sc + off, &comp_magic, 8); off += 8;
-        sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x02;    // mov [rdx], rax
+        sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0x02;
     }
 
     int skip_target = off;
     int32_t jnz_rel = skip_target - (jnz_patch_offset + 4);
     memcpy(sc + jnz_patch_offset, &jnz_rel, 4);
 
-
     sc[off++] = 0x48; sc[off++] = 0x89; sc[off++] = 0xEC;
     sc[off++] = 0x5D;
-
     sc[off++] = 0x41; sc[off++] = 0x5F;
     sc[off++] = 0x41; sc[off++] = 0x5E;
     sc[off++] = 0x41; sc[off++] = 0x5D;
@@ -1500,16 +1445,12 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     sc[off++] = 0x41; sc[off++] = 0x5A;
     sc[off++] = 0x41; sc[off++] = 0x59;
     sc[off++] = 0x41; sc[off++] = 0x58;
-   
     sc[off++] = 0x5F; sc[off++] = 0x5E; sc[off++] = 0x5D; sc[off++] = 0x5B;
     sc[off++] = 0x5A; sc[off++] = 0x59; sc[off++] = 0x58;
-
     sc[off++] = 0x9D;
-
 
     memcpy(sc + off, orig_prologue, steal_size);
     off += steal_size;
-
 
     uintptr_t jmp_from = code_addr + off + 5;
     uintptr_t jmp_to = hook_func_addr + steal_size;
@@ -1541,7 +1482,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         return false;
     }
 
-    // Build hook patch for function prologue
     uint8_t hook_patch[16];
     int hook_size = 0;
 
@@ -1582,37 +1522,25 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     bool completed = false;
     for (int i = 0; i < 100; i++) {
         usleep(100000);
-        
-        // Check if process is still alive
         if (kill(pid, 0) != 0) {
             error_ = "Process died during inline hook injection";
             LOG_ERROR("{}", error_);
             return false;
         }
-        
-        // Read all status values
         proc_mem_read(pid, completion_addr, &completion, 8);
         proc_mem_read(pid, result_addr, &result, 8);
         proc_mem_read(pid, guard_addr, &guard_status, 8);
-        
-        // Check for completion marker (definitive success signal)
         if (completion == COMPLETION_MAGIC) {
             LOG_INFO("Inline hook dlopen completed, handle=0x{:X}", result);
             completed = true;
             break;
         }
-        
-        // Check if guard was corrupted (data region is unstable)
         if (guard_status != GUARD_MAGIC && guard_status != 1) {
-            LOG_WARN("Guard value corrupted during wait (0x{:X}), data region unstable", 
+            LOG_WARN("Guard value corrupted during wait (0x{:X}), data region unstable",
                      guard_status);
-            // Don't break — completion marker is authoritative
         }
     }
 
-
-    
-    // Read diagnostic values BEFORE cleanup overwrites the data region
     uint64_t final_guard = 0;
     if (!completed) {
         proc_mem_read(pid, guard_addr, &final_guard, 8);
@@ -1656,7 +1584,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         return false;
     }
 
-    // Verify the library actually loaded by checking /proc/PID/maps
     {
         bool lib_mapped = false;
         std::ifstream maps_check("/proc/" + std::to_string(pid) + "/maps");
@@ -1886,7 +1813,6 @@ void Injection::stop_elevated_helper() {
     }
 
     uintptr_t data_addr = 0;
-    // Pass 1: prefer anonymous/heap regions — named binary segments contain live variables
     {
         size_t best_size = 0;
         for (const auto& r : regions) {
@@ -1898,7 +1824,6 @@ void Injection::stop_elevated_helper() {
             if (!r.path.empty() && r.path[0] == '/') continue;
             if (r.size() > best_size) {
                 best_size = r.size();
-                // Use middle of region, page-aligned, to avoid allocation frontier
                 data_addr = r.start + ((r.size() / 2) & ~static_cast<size_t>(0xFFF));
             }
         }
@@ -1907,7 +1832,6 @@ void Injection::stop_elevated_helper() {
                       best_size / 1024, data_addr);
         }
     }
-    // Pass 2: fall back to any writable region
     if (data_addr == 0) {
         for (const auto& r : regions) {
             if (!r.writable() || !r.readable()) continue;
@@ -1938,7 +1862,7 @@ void Injection::stop_elevated_helper() {
 
     uintptr_t path_addr   = data_addr;
     uintptr_t result_addr = data_addr + 512;
-    uintptr_t done_addr   = data_addr + 520;  // spin-wait sync flag for procmem path
+    uintptr_t done_addr   = data_addr + 520;
 
     uint8_t path_buf[512] = {};
     size_t path_len = std::min(lib_path.size(), sizeof(path_buf) - 1);
@@ -2236,7 +2160,6 @@ void Injection::stop_elevated_helper() {
     proc_mem_write(pid, cave.padding_start, orig_cave, shellcode_needed);
     proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
 
-    // Verify the library actually loaded by checking /proc/PID/maps
     {
         bool lib_mapped = false;
         std::ifstream maps_check("/proc/" + std::to_string(pid) + "/maps");
@@ -2328,8 +2251,6 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     if (inject_via_procmem(pid, target_path, dlopen_addr, flags))
         return true;
 
-        // inject_via_procmem already tried inject_via_inline_hook as its internal
-    // fallback when SIGSTOP failed. Don't retry with identical parameters.
     if (error_.find("Inline hook") != std::string::npos ||
         error_.find("dlopen returned") != std::string::npos ||
         error_.find("Data region unstable") != std::string::npos ||
@@ -2555,6 +2476,7 @@ bool Injection::attach() {
     return true;
 }
 
+// *** CHUNK 4 APPLIED: cleanup_direct_hook() added before stop_elevated_helper() ***
 bool Injection::detach() {
     if (state_ == InjectionState::Detached && !memory_.is_valid())
         return true;
@@ -2585,182 +2507,13 @@ bool Injection::detach() {
     return true;
 }
 
-static size_t dh_insn_len(const uint8_t* p) {
-    if (p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA) return 4;
-    size_t i = 0;
-    while (i < 4 && (p[i]==0x66||p[i]==0x67||p[i]==0xF0||p[i]==0xF2||p[i]==0xF3||
-                     p[i]==0x26||p[i]==0x2E||p[i]==0x36||p[i]==0x3E||p[i]==0x64||p[i]==0x65)) i++;
-    bool rex_w = false;
-    if (p[i] >= 0x40 && p[i] <= 0x4F) { rex_w = (p[i] & 0x08) != 0; i++; }
-    uint8_t op = p[i++];
-    if ((op>=0x50&&op<=0x5F)||op==0x90||op==0xC3||op==0xCC||op==0xC9) return i;
-    if (op==0xC2) return i+2;
-    if (op>=0xB0&&op<=0xB7) return i+1;
-    if (op>=0xB8&&op<=0xBF) return i+(rex_w?8:4);
-    if (op==0xE8||op==0xE9) return i+4;
-    if (op==0xEB||(op>=0x70&&op<=0x7F)) return i+1;
-    auto mlen = [&](size_t s) -> size_t {
-        size_t j = s;
-        uint8_t m = p[j++];
-        uint8_t mod = (m>>6)&3, rm = m&7;
-        if (mod!=3&&rm==4) { uint8_t sib=p[j++]; if(mod==0&&(sib&7)==5) j+=4; }
-        if (mod==0&&rm==5) j+=4;
-        else if (mod==1) j+=1;
-        else if (mod==2) j+=4;
-        return j;
-    };
-    if (op==0x80||op==0x82||op==0x83||op==0xC0||op==0xC1) return mlen(i)+1;
-    if (op==0x81||op==0xC7||op==0x69) return mlen(i)+4;
-    if (op==0xC6||op==0x6B) return mlen(i)+1;
-    if (op==0x0F) {
-        uint8_t op2=p[i++];
-        if (op2>=0x80&&op2<=0x8F) return i+4;
-        return mlen(i);
-    }
-    if ((op&0xC4)==0x00||(op&0xFE)==0x84||(op&0xFC)==0x88||op==0x8C||op==0x8E||
-        op==0x8D||op==0x63||op==0x86||op==0x87||op==0x8F) return mlen(i);
-    if (op>=0xD0&&op<=0xD3) return mlen(i);
-    if (op==0xFE||op==0xFF) return mlen(i);
-    if (op==0xF6) { uint8_t m=p[i]; return ((m&0x38)==0)?mlen(i)+1:mlen(i); }
-    if (op==0xF7) { uint8_t m=p[i]; return ((m&0x38)==0)?mlen(i)+4:mlen(i); }
-    return 0;
-}
+// *** CHUNK 1 NOT APPLIED: The new functions (dh_insn_len, dh_find_elf_sym_sections,
+//     find_remote_luau_functions, inject_via_direct_hook, cleanup_direct_hook,
+//     send_via_mailbox) should be inserted HERE, before inject(). ***
+// *** Please send the complete Chunk 1 replacement text. ***
 
-static uintptr_t dh_find_elf_sym_sections(const std::string& filepath,
-                                           const std::string& name,
-                                           uintptr_t load_bias) {
-    FILE* ef = fopen(filepath.c_str(), "rb");
-    if (!ef) return 0;
-    Elf64_Ehdr ehdr;
-    if (fread(&ehdr, sizeof(ehdr), 1, ef) != 1 ||
-        memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
-        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
-        ehdr.e_shnum == 0) { fclose(ef); return 0; }
-    std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
-    fseek(ef, static_cast<long>(ehdr.e_shoff), SEEK_SET);
-    if (fread(shdrs.data(), sizeof(Elf64_Shdr), ehdr.e_shnum, ef) != ehdr.e_shnum)
-        { fclose(ef); return 0; }
-    for (size_t si = 0; si < shdrs.size(); si++) {
-        if (shdrs[si].sh_type != SHT_SYMTAB && shdrs[si].sh_type != SHT_DYNSYM) continue;
-        uint32_t str_idx = shdrs[si].sh_link;
-        if (str_idx >= shdrs.size()) continue;
-        size_t strsz = shdrs[str_idx].sh_size;
-        if (strsz == 0) continue;
-        std::vector<char> strtab(strsz);
-        fseek(ef, static_cast<long>(shdrs[str_idx].sh_offset), SEEK_SET);
-        if (fread(strtab.data(), 1, strsz, ef) != strsz) continue;
-        size_t entsize = shdrs[si].sh_entsize;
-        if (entsize < sizeof(Elf64_Sym)) entsize = sizeof(Elf64_Sym);
-        size_t nsyms = shdrs[si].sh_size / entsize;
-        for (size_t j = 0; j < nsyms; j++) {
-            Elf64_Sym sym;
-            fseek(ef, static_cast<long>(shdrs[si].sh_offset + j * entsize), SEEK_SET);
-            if (fread(&sym, sizeof(sym), 1, ef) != 1) break;
-            if (sym.st_name == 0 || sym.st_name >= strsz) continue;
-            if (sym.st_shndx == SHN_UNDEF) continue;
-            if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC) continue;
-            if (strcmp(strtab.data() + sym.st_name, name.c_str()) == 0) {
-                fclose(ef);
-                return load_bias + sym.st_value;
-            }
-        }
-    }
-    fclose(ef);
-    return 0;
-}
-
-bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
-    LOG_INFO("[direct-hook] locating Luau functions in PID {}", pid);
-
-    char exe_link[512];
-    std::string exe_path;
-    {
-        std::string link = "/proc/" + std::to_string(pid) + "/exe";
-        ssize_t len = readlink(link.c_str(), exe_link, sizeof(exe_link) - 1);
-        if (len > 0) { exe_link[len] = '\0'; exe_path = exe_link; }
-    }
-
-    uintptr_t exe_base = 0;
-    {
-        std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
-        std::string line;
-        while (std::getline(maps, line)) {
-            if (line.find(exe_path) == std::string::npos &&
-                line.find("sober") == std::string::npos) continue;
-            uintptr_t lo; unsigned long off; char perms[5]{};
-            if (sscanf(line.c_str(), "%lx-%*x %4s %lx", &lo, perms, &off) == 3 && off == 0) {
-                exe_base = lo;
-                break;
-            }
-        }
-    }
-
-    std::string real_path;
-    {
-        std::string ns = "/proc/" + std::to_string(pid) + "/root" + exe_path;
-        struct stat st;
-        if (::stat(ns.c_str(), &st) == 0) real_path = ns;
-        else if (::stat(exe_path.c_str(), &st) == 0) real_path = exe_path;
-    }
-
-    struct { const char* name; uintptr_t* dst; } syms[] = {
-        {"lua_resume",          &out.resume},
-        {"lua_newthread",       &out.newthread},
-        {"luau_load",           &out.load},
-        {"lua_settop",          &out.settop},
-        {"luaL_sandboxthread",  &out.sandbox},
-    };
-
-    if (!real_path.empty() && exe_base) {
-        uintptr_t first_vaddr = 0;
-        {
-            FILE* f = fopen(real_path.c_str(), "rb");
-            if (f) {
-                Elf64_Ehdr eh;
-                if (fread(&eh, sizeof(eh), 1, f) == 1 && memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0) {
-                    for (int i = 0; i < eh.e_phnum; i++) {
-                        Elf64_Phdr ph;
-                        fseek(f, static_cast<long>(eh.e_phoff + i * eh.e_phentsize), SEEK_SET);
-                        if (fread(&ph, sizeof(ph), 1, f) != 1) break;
-                        if (ph.p_type == PT_LOAD) { first_vaddr = ph.p_vaddr; break; }
-                    }
-                }
-                fclose(f);
-            }
-        }
-        uintptr_t bias = exe_base - first_vaddr;
-        for (auto& s : syms) {
-            uintptr_t addr = dh_find_elf_sym_sections(real_path, s.name, bias);
-            if (addr) {
-                *s.dst = addr;
-                LOG_INFO("[direct-hook] ELF: {} at 0x{:X}", s.name, addr);
-            }
-        }
-    }
-
-    for (auto& s : syms) {
-        if (*s.dst) continue;
-        uintptr_t addr = find_remote_symbol(pid, "c", s.name);
-        if (!addr) addr = find_remote_symbol(pid, "dl", s.name);
-        if (addr) {
-            *s.dst = addr;
-            LOG_INFO("[direct-hook] dlsym: {} at 0x{:X}", s.name, addr);
-        }
-    }
-
-    struct { const char* func_name; uintptr_t* dst; const char* strings[4]; } fallbacks[] = {
-        {"lua_resume",     &out.resume,    {"cannot resume dead coroutine", "cannot resume running coroutine", nullptr, nullptr}},
-        {"lua_newthread",  &out.newthread, {"lua_newthread", "too many C calls", nullptr, nullptr}},
-        {"luau_load",      &out.load,      {"bytecode version mismatch", "truncated", nullptr, nullptr}},
-        {"lua_settop",     &out.settop,    {"stack overflow", nullptr, nullptr, nullptr}},
-    };
-
-    auto regions = memory_.get_regions();
-
-    for (auto& fb : fallbacks) {
-        if (*fb.dst) continue;
-        for (int si = 0; fb.strings[si]; si++) {
-            const char* needle = 
+bool Injection::inject() {
+    if (!attach()) return false;
 
     if (!process_alive()) {
         set_state(InjectionState::Failed, "Process died during injection");
@@ -2850,6 +2603,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
        
             payload_loaded_ = true;
         } else {
+            // *** CHUNK 2 APPLIED: direct hook fallback after library injection failure ***
             LOG_WARN("Library injection failed ({}), continuing with VM-scan mode", error_);
 
             if (proc_info_.via_flatpak || proc_info_.via_sober) {
@@ -2858,16 +2612,39 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (std::remove(staged.c_str()) == 0)
                     LOG_DEBUG("Cleaned up staged payload: {}", staged);
             }
+
+            LOG_INFO("Attempting direct hook injection (bypass dlopen)...");
+            set_state(InjectionState::Injecting, "Trying direct hook injection...");
+            if (inject_via_direct_hook(memory_.get_pid())) {
+                payload_loaded_ = true;
+                LOG_INFO("Direct hook injection succeeded");
+            } else {
+                LOG_WARN("Direct hook injection failed: {}", error_);
+            }
         }
     } else {
-        LOG_WARN("Payload library not found, using memory-scan mode");
+        // *** CHUNK 2 APPLIED: direct hook when no payload library found ***
+        LOG_WARN("Payload library not found, trying direct hook injection...");
+        set_state(InjectionState::Injecting, "Direct hook injection (no payload library)...");
+        if (inject_via_direct_hook(memory_.get_pid())) {
+            payload_loaded_ = true;
+            LOG_INFO("Direct hook injection succeeded without payload library");
+        } else {
+            LOG_WARN("Direct hook injection failed: {}", error_);
+        }
     }
 
     bool found = locate_luau_vm();
 
+    // *** CHUNK 3 APPLIED: direct hook mode check ***
     if (payload_loaded_) {
         mode_ = InjectionMode::Full;
-        if (found) {
+        if (dhook_.active) {
+            set_state(InjectionState::Ready,
+                      "Direct hook active \u2014 bypassed dlopen/seccomp");
+            LOG_INFO("Mode: Full (direct hook) | mailbox=0x{:X} cave=0x{:X}",
+                     dhook_.mailbox_addr, dhook_.cave_addr);
+        } else if (found) {
             std::ostringstream hex;
             hex << "0x" << std::hex << vm_scan_.marker_addr;
             set_state(InjectionState::Ready,
@@ -2977,6 +2754,7 @@ bool Injection::execute_script(const std::string& source) {
 
     if (source.empty()) return true;
 
+    // *** CHUNK 5 APPLIED: direct hook mailbox path ***
     if (!payload_loaded_) {
         set_state(InjectionState::Ready, "No payload \u2014 local execution only");
         return false;
@@ -2985,7 +2763,26 @@ bool Injection::execute_script(const std::string& source) {
     set_state(InjectionState::Executing,
               "Executing (" + std::to_string(source.size()) + " bytes)...");
 
-  
+    if (dhook_.active) {
+        size_t bc_len = 0;
+        char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_len);
+        if (!bc || bc_len == 0 || static_cast<uint8_t>(bc[0]) == 0) {
+            std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
+            free(bc);
+            set_state(InjectionState::Ready, "Compile error: " + ce);
+            LOG_ERROR("Compile failed: {}", ce);
+            return false;
+        }
+        bool ok = send_via_mailbox(bc, bc_len, 1);
+        free(bc);
+        if (ok) {
+            set_state(InjectionState::Ready, "Script dispatched via direct hook");
+            LOG_INFO("Sent {} bytes bytecode via direct hook mailbox", bc_len);
+            return true;
+        }
+        LOG_WARN("Direct hook mailbox send failed, trying IPC fallback");
+    }
+
     std::string data_to_send;
     {
         size_t bc_len = 0;
@@ -3172,25 +2969,3 @@ void Injection::stop_auto_scan() {
 }
 
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
