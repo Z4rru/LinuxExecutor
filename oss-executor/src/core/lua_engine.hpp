@@ -123,10 +123,6 @@ public:
         return drawing_objects_.size();
     }
 
-    std::unordered_map<std::string, Signal> signals_;
-    OutputCallback output_cb_;
-    ErrorCallback  error_cb_;
-
     friend class Executor;
 
 private:
@@ -198,6 +194,8 @@ private:
     static int lua_task_wait(lua_State* L);
     static int lua_task_cancel(lua_State* L);
 
+    lua_State* main_state() const { return L_; }
+
     static int lua_drawing_new(lua_State* L);
     static int lua_drawing_index(lua_State* L);
     static int lua_drawing_newindex(lua_State* L);
@@ -239,11 +237,15 @@ private:
     std::queue<QueuedScript> script_queue_;
     std::mutex               queue_mutex_;
 
-    ExecCallback exec_cb_;
+    std::unordered_map<std::string, Signal> signals_;
+    OutputCallback output_cb_;
+    ErrorCallback  error_cb_;
+    ExecCallback   exec_cb_;
 
     size_t total_allocated_ = 0;
     static constexpr size_t MAX_MEMORY = 256 * 1024 * 1024;
 };
 
 }
+
 
