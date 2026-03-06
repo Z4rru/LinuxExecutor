@@ -1336,13 +1336,22 @@ static bool resolve_functions() {
                             if ((code[i]==0x48||code[i]==0x4C)&&code[i+1]==0x8D&&(code[i+2]&0xC7)==0x05) leas++;
                             if (code[i]==0x8D&&(code[i+1]&0xC7)==0x05) leas++;
                         }
-                        if (i+7<scan_sz && code[i]==0xC7 && (code[i+1]&0xC0)==0x40 && (code[i+1]&0x38)==0x00) {
-                            size_t sib=((code[i+1]&7)==4)?1:0;
-                            size_t imm_off=2+sib+1;
-                            if (i+imm_off+4<=scan_sz) {
-                                int32_t imm; memcpy(&imm,&code[i+imm_off],4);
-                                if (imm==9) has_tt9=true;
-                            }
+                        if (!has_tt9 && i+3 < scan_sz &&
+                            code[i]==0x09 && code[i+1]==0x00 &&
+                            code[i+2]==0x00 && code[i+3]==0x00 && j>=4) {
+                            size_t k=i;
+                            if (k>=3&&(code[k-3]==0xC7||code[k-3]==0xC6)) has_tt9=true;
+                            if (!has_tt9&&k>=4&&(code[k-4]>=0x40&&code[k-4]<=0x4F)&&
+                                (code[k-3]==0xC7||code[k-3]==0xC6)) has_tt9=true;
+                            if (!has_tt9&&k>=1&&code[k-1]>=0xB8&&code[k-1]<=0xBF) has_tt9=true;
+                            if (!has_tt9&&k>=2&&(code[k-2]>=0x40&&code[k-2]<=0x4F)&&
+                                code[k-1]>=0xB8&&code[k-1]<=0xBF) has_tt9=true;
+                        }
+                        if (!has_tt9&&code[i]==0x09&&j>=1) {
+                            if (i>=1&&code[i-1]==0x6A) has_tt9=true;
+                            if (i>=2&&code[i-2]==0x83) has_tt9=true;
+                            if (i>=2&&code[i-2]==0xC6) has_tt9=true;
+                            if (i>=3&&(code[i-3]>=0x40&&code[i-3]<=0x4F)&&code[i-2]==0xC6) has_tt9=true;
                         }
                         if (code[i]==0xC3 && j>=30) { fsz=j+1; break; }
                     }
