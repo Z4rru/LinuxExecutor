@@ -1353,7 +1353,19 @@ static bool resolve_functions() {
                     if (calls>=2&&calls<=4) score+=3;
                     if (fsz>=60&&fsz<=150) score+=2;
                     if (addr<anchor) score+=1;
-                    if (score>best_score) { best_score=score; best_addr=addr; best_fsz=fsz; best_calls=calls; }
+                                    // Validate: one of the calls should target lua_settop (cleanup)
+                if (score >= 3 && out.settop) {
+                    bool calls_settop = false;
+                    for (size_t j = 0; j < fsz && off+j+5 < scan_sz; j++) {
+                        if (code[off+j] == 0xE8) {
+                            int32_t cdisp; memcpy(&cdisp, &code[off+j+1], 4);
+                            uintptr_t ctarget = scan_lo + off + j + 5 + (int64_t)cdisp;
+                            if (ctarget == out.settop) { calls_settop = true; break; }
+                        }
+                    }
+                    if (calls_settop) score += 5;
+                }
+                if (score > best_score) { best_score=score; best_addr=addr; best_fsz=fsz; best_calls=calls; }
                 }
                 if (best_addr) {
                     G.newthread = (fn_newthread)best_addr;
