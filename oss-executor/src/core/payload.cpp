@@ -1847,6 +1847,18 @@ static void payload_init() {
     ssize_t wr = write(STDERR_FILENO, entered, strlen(entered));
     (void)wr;
 
+    // Immediate breadcrumb — proves constructor started even if it crashes later
+    // Accessible from host via /proc/<PID>/root/tmp/oss_payload_alive
+    {
+        int bfd = open("/tmp/oss_payload_alive", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (bfd >= 0) {
+            char bmsg[64];
+            int blen = snprintf(bmsg, sizeof(bmsg), "pid=%d\n", getpid());
+            if (blen > 0) { ssize_t bw = write(bfd, bmsg, (size_t)blen); (void)bw; }
+            close(bfd);
+        }
+    }
+
     const char* home = getenv("HOME");
     if (home) {
         snprintf(g_log_path, sizeof(g_log_path), "%s/oss_payload.log", home);
@@ -1922,6 +1934,7 @@ static void payload_fini() {
     G.alive.store(false, std::memory_order_release);
     unlink(READY_PATH);
     unlink(CMD_PATH);
+    unlink("/tmp/oss_payload_alive");
 
     void* retval;
     if (g_file_t) { pthread_join(g_file_t, &retval); g_file_t = 0; }
