@@ -22,7 +22,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "luacode.h"
-#include <atomic> 
 
 static pthread_t g_file_t = 0, g_ipc_t = 0, g_init_t = 0;
 
@@ -1930,8 +1929,6 @@ extern "C" __attribute__((visibility("default")))
 void* oss_payload_get_mailbox() {
     return g_mailbox;
 }
-
-static std::atomic<bool> g_initialized{false};
 
 __attribute__((constructor))
 static void payload_init() {
