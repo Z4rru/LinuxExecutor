@@ -2888,15 +2888,13 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     LOG_DEBUG("[direct-hook] rejecting 0x{:X}: uses rsi (2-arg function)", addr);
                     continue;
                 }
-                if (!saves_rdi) {
-                    score -= 2; // Penalize: lua_newthread must save L (rdi)
-                }
 
                 int score = 0;
                 if (has_tt9) score += 10;
                 if (calls >= 2 && calls <= 4) score += 3;
                 if (fsz >= 60 && fsz <= 150) score += 2;
                 if (addr < out.settop) score += 1;
+                if (!saves_rdi) score -= 2;
 
                 // Cross-validate: check if candidate shares call targets with lua_resume
                 if (out.resume && score >= 5) {
@@ -3050,7 +3048,7 @@ static std::vector<uint8_t> gen_resume_trampoline(
         // compile_fail: add rsp, ack
         size_t compile_fail_label = c.size();
         e({0x48,0x83,0xC4,0x10});      // add rsp, 16
-        size_t jmp_ack_from_compile = c.size(); e({0xE9}); e32(0); // jmp ack (patched later)
+        jmp_ack_from_compile = c.size(); e({0xE9}); e32(0); // jmp ack (patched later)
 
         patch(jz_compile_fail + 2, compile_fail_label);
         patch(je_compile_err + 2, compile_err_label);
@@ -3901,6 +3899,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
