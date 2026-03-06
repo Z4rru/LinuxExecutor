@@ -3267,6 +3267,31 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     }
     LOG_INFO("[direct-hook] stealing {} bytes from lua_resume prologue", steal);
 
+        // Dump lua_newthread prologue for verification
+    {
+        uint8_t nt_probe[32];
+        if (proc_mem_read(pid, addrs.newthread, nt_probe, sizeof(nt_probe))) {
+            LOG_INFO("[direct-hook] lua_newthread prologue: "
+                     "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
+                     "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                     nt_probe[0], nt_probe[1], nt_probe[2], nt_probe[3],
+                     nt_probe[4], nt_probe[5], nt_probe[6], nt_probe[7],
+                     nt_probe[8], nt_probe[9], nt_probe[10], nt_probe[11],
+                     nt_probe[12], nt_probe[13], nt_probe[14], nt_probe[15]);
+        }
+        // Also dump lua_resume for comparison
+        uint8_t lr_probe[32];
+        if (proc_mem_read(pid, addrs.resume, lr_probe, sizeof(lr_probe))) {
+            LOG_INFO("[direct-hook] lua_resume prologue: "
+                     "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
+                     "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                     lr_probe[0], lr_probe[1], lr_probe[2], lr_probe[3],
+                     lr_probe[4], lr_probe[5], lr_probe[6], lr_probe[7],
+                     lr_probe[8], lr_probe[9], lr_probe[10], lr_probe[11],
+                     lr_probe[12], lr_probe[13], lr_probe[14], lr_probe[15]);
+        }
+    }
+
     std::vector<MemoryRegion> nearby;
     for (const auto& r : regions) {
         int64_t d = (int64_t)r.start - (int64_t)addrs.resume;
@@ -3636,6 +3661,7 @@ bool Injection::execute_script(const std::string& source) {
               "Executing (" + std::to_string(source.size()) + " bytes)...");
 
     if (dhook_.active) {
+        // Syntax check only — do NOT send this bytecode
         {
             size_t bc_len = 0;
             char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_len);
@@ -3649,12 +3675,13 @@ bool Injection::execute_script(const std::string& source) {
             }
             free(bc);
         }
+        // Send raw source — trampoline compiles with target's Luau
         LOG_INFO("Sending raw source 'user_script' ({} bytes) to payload for target-side compilation",
                  source.size());
         bool ok = send_via_mailbox(source.data(), source.size(), 0);
         if (ok) {
             set_state(InjectionState::Ready, "Source dispatched to Roblox payload");
-            LOG_INFO("Source for 'user_script' dispatched to Roblox payload");
+            LOG_INFO("Source for 'user_script' dispatched ({} bytes, flags=0)", source.size());
             return true;
         }
         LOG_WARN("Direct hook mailbox send failed, trying IPC fallback");
@@ -3846,6 +3873,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
