@@ -19,6 +19,11 @@ jobs:
         with:
           submodules: recursive
 
+      # ── FIX: authenticate git so FetchContent never gets 403 ──
+      - name: Configure git authentication
+        run: |
+          git config --global url."https://${{ github.token }}@github.com/".insteadOf "https://github.com/"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -51,7 +56,6 @@ jobs:
           set -e
           mkdir -p package/oss-executor
 
-          # ── FIX 1: lowercase binary name ──
           cp oss-executor/build/oss-executor package/oss-executor/
           cp oss-executor/build/liboss_payload.so package/oss-executor/ 2>/dev/null || true
           cp -r oss-executor/scripts  package/oss-executor/ 2>/dev/null || true
@@ -61,7 +65,6 @@ jobs:
           cp oss-executor/run.sh      package/oss-executor/ 2>/dev/null || true
           cp README.md               package/oss-executor/ 2>/dev/null || true
 
-          # ── FIX 2: chmod the correct name ──
           chmod +x package/oss-executor/oss-executor
           [ -f package/oss-executor/run.sh ] && chmod +x package/oss-executor/run.sh
 
@@ -74,7 +77,6 @@ jobs:
           cp -r themes/* ~/.oss-executor/themes/ 2>/dev/null || true
           cp -r resources ~/.oss-executor/ 2>/dev/null || true
           cp config.json ~/.oss-executor/ 2>/dev/null || true
-          # ── FIX 3: install the lowercase binary ──
           sudo mkdir -p /usr/local/lib/oss-executor
           sudo cp liboss_payload.so /usr/local/lib/oss-executor/ 2>/dev/null || true
           sudo cp oss-executor /usr/local/bin/oss-executor
@@ -121,6 +123,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # ── FIX: same token injection for appimage job ──
+      - name: Configure git authentication
+        run: |
+          git config --global url."https://${{ github.token }}@github.com/".insteadOf "https://github.com/"
 
       - name: Install deps
         run: |
@@ -189,7 +196,6 @@ jobs:
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/oss-executor
 
-          # ── FIX 4: lowercase binary name ──
           cp oss-executor/build/oss-executor AppDir/usr/bin/
           mkdir -p AppDir/usr/lib/oss-executor
           cp oss-executor/build/liboss_payload.so AppDir/usr/lib/oss-executor/ 2>/dev/null || true
@@ -203,7 +209,6 @@ jobs:
           Type=Application
           Name=OSS Executor
           Comment=Open Source Lua Script Executor
-          # ── FIX 5: Exec line matches binary ──
           Exec=oss-executor
           Icon=oss-executor
           Categories=Development;
@@ -224,7 +229,6 @@ jobs:
           fi
           export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
           export OSS_HOME="${HOME}/.oss-executor"
-          # ── FIX 6: exec the lowercase binary ──
           exec "${HERE}/usr/bin/oss-executor" "$@"
           APPRUN_EOF
           chmod +x AppDir/AppRun
