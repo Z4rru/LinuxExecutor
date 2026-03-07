@@ -2790,16 +2790,22 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
         // FIX: lua_newthread has NO string literals in Luau — proximity scan near lua_settop
     // Both live in lapi.cpp. Look for: no string refs, 2-5 calls, 40-200 bytes, stores LUA_TTHREAD=9
-    if (!out.newthread && out.settop) {
-        LOG_INFO("[direct-hook] lua_newthread: no strings found, proximity scan near lua_settop 0x{:X}", out.settop);
-        for (const auto& r : regions) {
-            if (!r.readable() || !r.executable()) continue;
-            if (out.settop < r.start || out.settop >= r.end) continue;
+    if (!out.newthread) {
+        std::vector<uintptr_t> anchors;
+        if (out.settop) anchors.push_back(out.settop);
+        if (out.resume) anchors.push_back(out.resume);
+        if (out.load) anchors.push_back(out.load);
+        LOG_INFO("[direct-hook] lua_newthread: proximity scan with {} anchors, +/-512KB each", anchors.size());
+        for (uintptr_t anchor : anchors) {
+            if (out.newthread) break;
+            for (const auto& r : regions) {
+                if (!r.readable() || !r.executable()) continue;
+                if (anchor < r.start || anchor >= r.end) continue;
 
-            uintptr_t scan_lo = (out.settop > r.start + 32768) ? out.settop - 32768 : r.start;
-            uintptr_t scan_hi = std::min(out.settop + 16384, r.end);
-            size_t scan_sz = scan_hi - scan_lo;
-            if (scan_sz < 512) break;
+                uintptr_t scan_lo = (anchor > r.start + 0x80000) ? anchor - 0x80000 : r.start;
+                uintptr_t scan_hi = std::min(anchor + 0x80000, r.end);
+                size_t scan_sz = scan_hi - scan_lo;
+                if (scan_sz < 512) continue;
 
             std::vector<uint8_t> code(scan_sz);
             struct iovec li = {code.data(), scan_sz};
@@ -2920,17 +2926,14 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
                 if (score > best_score) { best_score=score; best_addr=addr; best_fsz=fsz; best_calls=calls; }
             }
-            if (best_addr && best_score >= 5) {
+            if (best_addr && best_score >= 8) {
                 out.newthread = best_addr;
                 LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={})",
                          best_addr, best_fsz, best_calls, best_score);
-            } else if (best_addr) {
-                LOG_WARN("[direct-hook] proximity: best candidate score {} too low (min 5) — rejecting 0x{:X}",
-                         best_score, best_addr);
-            } else {
-                LOG_WARN("[direct-hook] proximity: 0 candidates in 48KB around lua_settop");
+                break;
             }
             break;
+        }
         }
     }
     
@@ -2946,7 +2949,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         for (const auto& r : regions) {
             if (!r.readable() || !r.executable()) continue;
             if (r.size() < 512) continue;
-            size_t scan_sz = std::min(r.size(), static_cast<size_t>(0x200000));
+            size_t scan_sz = std::min(r.size(), static_cast<size_t>(0x4000000));
             std::vector<uint8_t> code(scan_sz);
             struct iovec li = {code.data(), scan_sz};
             struct iovec ri = {reinterpret_cast<void*>(r.start), scan_sz};
@@ -4018,6 +4021,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
