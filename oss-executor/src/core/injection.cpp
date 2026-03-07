@@ -2877,12 +2877,10 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     // 89 F0-F7         mov eXX, esi
                     // 48 89 F0-F7      mov rXX, rsi  
                     // 49 89 F0-F7      mov r8-r15, rsi
-                    if (b0 == 0x89 && (b1 & 0xF8) == 0xF0) uses_rsi = true;
-                    if ((b0 == 0x48 || b0 == 0x49) && b1 == 0x89 && (b2 & 0xF8) == 0xF0) uses_rsi = true;
-                    // Check for mov rXX, rdi patterns (saves first arg):
-                    // 48 89 F8-FF      mov rXX, rdi
-                    // 49 89 F8-FF      mov r8-r15, rdi
-                    if ((b0 == 0x48 || b0 == 0x49) && b1 == 0x89 && (b2 & 0xF8) == 0xF8) saves_rdi = true;
+                    if (b0 == 0x89 && (b1 & 0x38) == 0x30) uses_rsi = true;
+                    if ((b0 == 0x48 || b0 == 0x49) && b1 == 0x89 && (b2 & 0x38) == 0x30) uses_rsi = true;
+                    // Check for any MOV with rdi as source (reg field=7, bits 5:3 of modrm)
+                    if ((b0 == 0x48 || b0 == 0x49) && b1 == 0x89 && (b2 & 0x38) == 0x38) saves_rdi = true;
                 }
                 if (uses_rsi) {
                     LOG_DEBUG("[direct-hook] rejecting 0x{:X}: uses rsi (2-arg function)", addr);
@@ -2922,12 +2920,12 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
                 if (score > best_score) { best_score=score; best_addr=addr; best_fsz=fsz; best_calls=calls; }
             }
-            if (best_addr && best_score >= 8) {
+            if (best_addr && best_score >= 5) {
                 out.newthread = best_addr;
                 LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={})",
                          best_addr, best_fsz, best_calls, best_score);
             } else if (best_addr) {
-                LOG_WARN("[direct-hook] proximity: best candidate score {} too low (need tt9, min 10) — rejecting 0x{:X}",
+                LOG_WARN("[direct-hook] proximity: best candidate score {} too low (min 5) — rejecting 0x{:X}",
                          best_score, best_addr);
             } else {
                 LOG_WARN("[direct-hook] proximity: 0 candidates in 48KB around lua_settop");
@@ -2979,12 +2977,12 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     if (code[i] == 0xE8) calls++;
                     if (i+6 < scan_sz && ((code[i]==0x48||code[i]==0x4C) && code[i+1]==0x8D && (code[i+2]&0xC7)==0x05)) leas++;
 
-                    // rsi check
+                                        // rsi check — mask 0x38 isolates reg field (bits 5:3) to catch memory-dest MOVs
                     if (j < 20 && i+2 < scan_sz) {
-                        if (code[i]==0x89 && (code[i+1]&0xF8)==0xF0) uses_rsi = true;
-                        if ((code[i]==0x48||code[i]==0x49) && code[i+1]==0x89 && (code[i+2]&0xF8)==0xF0) uses_rsi = true;
-                        if ((code[i]==0x48||code[i]==0x49) && code[i+1]==0x89 && (code[i+2]&0xF8)==0xF8) saves_rdi = true;
-                        if (code[i]==0x89 && (code[i+1]&0xF8)==0xF8) saves_rdi = true;
+                        if (code[i]==0x89 && (code[i+1]&0x38)==0x30) uses_rsi = true;
+                        if ((code[i]==0x48||code[i]==0x49) && code[i+1]==0x89 && (code[i+2]&0x38)==0x30) uses_rsi = true;
+                        if ((code[i]==0x48||code[i]==0x49) && code[i+1]==0x89 && (code[i+2]&0x38)==0x38) saves_rdi = true;
+                        if (code[i]==0x89 && (code[i+1]&0x38)==0x38) saves_rdi = true;
                     }
 
                     // tt9 broad scan
@@ -3099,7 +3097,7 @@ static std::vector<uint8_t> gen_resume_trampoline(
     size_t jmp_skip_compile = 0;
     if (compile_addr && free_addr) {
         // Compile source on target side: luau_compile(src, len, NULL, &outsize)
-        e({0x48,0x83,0xEC,0x10});      // sub rsp, 16  (outsize var + alignment)
+        e({0x48,0x83,0xEC,0x18});     // sub rsp, 24  (16-byte aligned: [0]=data_size [8]=pad [16]=from)
         e({0x48,0xC7,0x04,0x24,0x00,0x00,0x00,0x00}); // mov qword [rsp], 0
         e({0x49,0x8D,0x7F,0x30});      // lea rdi, [r15+0x30]  (source)
         e({0x8B,0x74,0x24,0x10});      // mov esi, [rsp+16]  (data_size from saved slot)
@@ -3976,6 +3974,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
