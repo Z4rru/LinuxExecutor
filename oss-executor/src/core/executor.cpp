@@ -254,46 +254,14 @@ ExecutionResult Executor::execute_internal(const std::string& script,
     bool attached = inj.is_attached() && inj.is_payload_loaded();
 
     if (attached) {
-#ifdef OSS_SEND_RAW_SOURCE
-        // ── FIX: Send raw source to payload. The payload compiles using ──
-        //    the TARGET's own luau_compile, guaranteeing bytecode-version
-        //    compatibility with Roblox's proprietary VM.
-        //    Open-source Luau 0.620 produces bytecode version 5/6 that
-        //    does NOT match what Roblox's VM expects.
-        LOG_INFO("Sending raw source '{}' ({} bytes) to payload for "
-                 "target-side compilation", name, script.size());
+        LOG_INFO("Sending '{}' ({} bytes) to payload", name, script.size());
         result.success = send_to_payload(script);
         if (!result.success) {
-            result.error = "IPC failed \u2014 could not deliver source to payload";
-            LOG_WARN("Payload IPC failed for '{}', NOT falling back to local VM", name);
+            result.error = "Failed to deliver script to payload";
+            LOG_WARN("Payload send failed for '{}'", name);
         } else {
-            LOG_INFO("Source for '{}' dispatched to Roblox payload", name);
+            LOG_INFO("Script '{}' dispatched to Roblox payload", name);
         }
-#else
-        // ── Compile locally with OUR Luau — risky if bytecode version ──
-        //    diverges from Roblox's VM. Update GIT_TAG in CMakeLists.txt
-        //    to match Roblox's internal Luau hash if using this path.
-        size_t bc_len = 0;
-        char* bc = luau_compile(script.c_str(), script.size(), nullptr, &bc_len);
-        if (!bc || bc_len == 0 || static_cast<uint8_t>(bc[0]) == 0) {
-            std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
-            free(bc);
-            result.success = false;
-            result.error = "Compile error: " + ce;
-            LOG_ERROR("Compile failed for '{}': {}", name, ce);
-        } else {
-            std::string bytecode(bc, bc_len);
-            free(bc);
-            LOG_INFO("Compiled '{}': {} -> {} bytes bytecode", name, script.size(), bytecode.size());
-            result.success = send_to_payload(bytecode);
-            if (!result.success) {
-                result.error = "IPC failed \u2014 could not deliver bytecode to payload";
-                LOG_WARN("Payload IPC failed for '{}', NOT falling back to local VM", name);
-            } else {
-                LOG_INFO("Bytecode for '{}' dispatched to Roblox payload", name);
-            }
-        }
-#endif
 
         // Read payload status/log regardless of send method
         if (result.success) {
@@ -548,6 +516,7 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
 
 
 
