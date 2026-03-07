@@ -19,10 +19,13 @@ find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
 include(FetchContent)
+
+# ── FIX: use URL tarball to avoid 403 on git clone ──
 FetchContent_Declare(Luau
-    GIT_REPOSITORY https://github.com/luau-lang/luau.git
-    GIT_TAG        0.711
-    GIT_SHALLOW    TRUE)
+    URL        https://github.com/luau-lang/luau/archive/refs/tags/0.711.tar.gz
+    URL_HASH   MD5=0    # remove or update once you know the real hash
+    DOWNLOAD_EXTRACT_TIMESTAMP ON
+)
 set(LUAU_BUILD_CLI   OFF CACHE BOOL "" FORCE)
 set(LUAU_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LUAU_BUILD_WEB   OFF CACHE BOOL "" FORCE)
@@ -31,9 +34,9 @@ FetchContent_MakeAvailable(Luau)
 find_package(spdlog 1.12 QUIET CONFIG)
 if(NOT spdlog_FOUND)
     FetchContent_Declare(spdlog
-        GIT_REPOSITORY https://github.com/gabime/spdlog.git
-        GIT_TAG        v1.13.0
-        GIT_SHALLOW    TRUE)
+        URL        https://github.com/gabime/spdlog/archive/refs/tags/v1.13.0.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP ON
+    )
     set(SPDLOG_FMT_EXTERNAL OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(spdlog)
 endif()
@@ -41,9 +44,9 @@ endif()
 find_package(nlohmann_json 3.11 QUIET CONFIG)
 if(NOT nlohmann_json_FOUND)
     FetchContent_Declare(json
-        GIT_REPOSITORY https://github.com/nlohmann/json.git
-        GIT_TAG        v3.11.3
-        GIT_SHALLOW    TRUE)
+        URL        https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP ON
+    )
     FetchContent_MakeAvailable(json)
 endif()
 
@@ -76,15 +79,14 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${Luau_SOURCE_DIR}/Compiler/include
-    ${Luau_SOURCE_DIR}/Ast/include
-    ${Luau_SOURCE_DIR}/VM/include
-    ${Luau_SOURCE_DIR}/Common/include
+    ${luau_SOURCE_DIR}/Compiler/include
+    ${luau_SOURCE_DIR}/Ast/include
+    ${luau_SOURCE_DIR}/VM/include
+    ${luau_SOURCE_DIR}/Common/include
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     APP_VERSION="${PROJECT_VERSION}"
- 
     OSS_SEND_RAW_SOURCE=1
 )
 
@@ -111,10 +113,10 @@ add_library(oss_payload SHARED src/core/payload.cpp)
 
 target_include_directories(oss_payload PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${Luau_SOURCE_DIR}/Compiler/include
-    ${Luau_SOURCE_DIR}/Ast/include
-    ${Luau_SOURCE_DIR}/VM/include
-    ${Luau_SOURCE_DIR}/Common/include
+    ${luau_SOURCE_DIR}/Compiler/include
+    ${luau_SOURCE_DIR}/Ast/include
+    ${luau_SOURCE_DIR}/VM/include
+    ${luau_SOURCE_DIR}/Common/include
 )
 
 target_link_libraries(oss_payload PRIVATE
@@ -124,7 +126,6 @@ target_link_libraries(oss_payload PRIVATE
     ${CMAKE_DL_LIBS}
 )
 
-# Generate version script to hide ALL exported symbols from static Luau
 file(WRITE ${CMAKE_BINARY_DIR}/payload.map "{ global: oss_payload_entry; local: *; };\n")
 
 target_link_options(oss_payload PRIVATE
@@ -151,7 +152,7 @@ set_target_properties(oss_payload PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     LIBRARY_OUTPUT_DIRECTORY  "${CMAKE_BINARY_DIR}"
     C_VISIBILITY_PRESET       hidden
-    CXX_VISIBILITY_PRESET     hidden 
+    CXX_VISIBILITY_PRESET     hidden
 )
 
 add_dependencies(${PROJECT_NAME} oss_payload)
@@ -168,23 +169,9 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/resources)
             $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources)
 endif()
 
-install(TARGETS ${PROJECT_NAME}
-    RUNTIME DESTINATION bin)
-install(TARGETS oss_payload
-    LIBRARY DESTINATION lib/oss-executor)
+install(TARGETS ${PROJECT_NAME}     RUNTIME DESTINATION bin)
+install(TARGETS oss_payload         LIBRARY DESTINATION lib/oss-executor)
 install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
-
-
-
-
-
-
-
-
-
-
-
-
