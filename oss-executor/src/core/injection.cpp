@@ -3188,7 +3188,7 @@ static std::vector<uint8_t> gen_resume_trampoline(
     e({0x49,0x89,0x4F,0x18});
     e({0x41,0xC7,0x47,0x2C,0x05,0x00,0x00,0x00});
 
-    if (compile_addr && free_addr) {{
+    if (compile_addr && free_addr) {
         // Patch jmp_ack_from_compile to point here
         int32_t rel = static_cast<int32_t>(ack_label - (jmp_ack_from_compile + 5));
         memcpy(&c[jmp_ack_from_compile + 1], &rel, 4);
@@ -4016,6 +4016,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
