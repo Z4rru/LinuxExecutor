@@ -3047,12 +3047,12 @@ static std::vector<uint8_t> gen_resume_trampoline(
     size_t jne_stolen = c.size(); e({0x0F,0x85}); e32(0);
 
     e({0x53}); e({0x55}); e({0x41,0x54}); e({0x41,0x55}); e({0x41,0x56}); e({0x41,0x57});
-    e({0x48,0x83,0xEC,0x10});     // sub rsp, 16  (need 8 more for from)
+    e({0x48,0x83,0xEC,0x18});     // sub rsp, 24  (16-byte aligned: data_size[0] pad[8] from[16])
 
     e({0x49,0x89,0xFC});              // mov r12, rdi  (save L)
     e({0x49,0x89,0xF5});              // mov r13, rsi  (save from — temp, zeroed later)
     e({0x41,0x89,0xD6});              // mov r14d, edx (save nargs)
-    e({0x48,0x89,0x74,0x24,0x08});    // mov [rsp+8], rsi  (save from on stack permanently)
+    e({0x48,0x89,0x74,0x24,0x10});    // mov [rsp+16], rsi  (save from on stack permanently)
 
     e({0x49,0xBF}); e64(mailbox_addr);
 
@@ -3168,11 +3168,11 @@ static std::vector<uint8_t> gen_resume_trampoline(
     if (free_addr) {
         e({0x4D,0x85,0xED});      // test r13, r13
         size_t jz_no_free = c.size(); e({0x74}); e8(0);
-        e({0x50});                // push rax  (save resume result)
+        e({0x48,0x89,0x44,0x24,0x08}); // mov [rsp+8], rax  (save resume result to pad slot)
         e({0x4C,0x89,0xEF});      // mov rdi, r13
         e({0x48,0xB8}); e64(free_addr);
         e({0xFF,0xD0});
-        e({0x58});                // pop rax
+        e({0x48,0x8B,0x44,0x24,0x08}); // mov rax, [rsp+8]  (restore resume result)
         e({0x45,0x31,0xED});      // xor r13d, r13d
         size_t no_free_label = c.size();
         c[jz_no_free + 1] = static_cast<uint8_t>(no_free_label - (jz_no_free + 2));
@@ -3198,9 +3198,9 @@ static std::vector<uint8_t> gen_resume_trampoline(
     e({0x48,0xB8}); e64(guard_addr);
     e({0xC6,0x00,0x00});
     e({0x4C,0x89,0xE7});              // mov rdi, r12  (restore L)
-    e({0x48,0x8B,0x74,0x24,0x08});    // mov rsi, [rsp+8]  (restore from from stack)
+    e({0x48,0x8B,0x74,0x24,0x10});    // mov rsi, [rsp+16]  (restore from from stack)
     e({0x44,0x89,0xF2});              // mov edx, r14d (restore nargs)
-    e({0x48,0x83,0xC4,0x10});     // add rsp, 16
+    e({0x48,0x83,0xC4,0x18});     // add rsp, 24
     e({0x41,0x5F}); e({0x41,0x5E}); e({0x41,0x5D}); e({0x41,0x5C});
     e({0x5D}); e({0x5B});
 
@@ -3976,6 +3976,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
