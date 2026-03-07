@@ -3097,7 +3097,7 @@ static std::vector<uint8_t> gen_resume_trampoline(
     size_t jmp_skip_compile = 0;
     if (compile_addr && free_addr) {
         // Compile source on target side: luau_compile(src, len, NULL, &outsize)
-        e({0x48,0x83,0xEC,0x18});     // sub rsp, 24  (16-byte aligned: [0]=data_size [8]=pad [16]=from)
+        e({0x48,0x83,0xEC,0x10});     // sub rsp, 16  ([0]=outsize [8]=pad [16]=outer data_size)
         e({0x48,0xC7,0x04,0x24,0x00,0x00,0x00,0x00}); // mov qword [rsp], 0
         e({0x49,0x8D,0x7F,0x30});      // lea rdi, [r15+0x30]  (source)
         e({0x8B,0x74,0x24,0x10});      // mov esi, [rsp+16]  (data_size from saved slot)
@@ -3456,6 +3456,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     memcpy(dhook_.orig_patch, prologue, patch_len);
     dhook_.patch_len = patch_len;
     dhook_.active = true;
+    dhook_.has_compile = (addrs.compile != 0);
 
     LOG_INFO("[direct-hook] ARMED — lua_resume hooked at 0x{:X}, trampoline at 0x{:X}, mailbox at 0x{:X}",
              addrs.resume, cave.padding_start, mb_addr);
@@ -3762,27 +3763,22 @@ bool Injection::execute_script(const std::string& source) {
               "Executing (" + std::to_string(source.size()) + " bytes)...");
 
     if (dhook_.active) {
-        // Syntax check only — do NOT send this bytecode
-        {
-            size_t bc_len = 0;
-            char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_len);
-            bool syntax_ok = bc && bc_len > 0 && static_cast<uint8_t>(bc[0]) != 0;
-            if (!syntax_ok) {
-                std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
-                free(bc);
-                set_state(InjectionState::Ready, "Compile error: " + ce);
-                LOG_ERROR("Compile failed: {}", ce);
-                return false;
-            }
+        size_t bc_len = 0;
+        char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_len);
+        if (!bc || bc_len == 0 || static_cast<uint8_t>(bc[0]) == 0) {
+            std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
             free(bc);
+            set_state(InjectionState::Ready, "Compile error: " + ce);
+            LOG_ERROR("Compile failed: {}", ce);
+            return false;
         }
-        // Send raw source — trampoline compiles with target's Luau
-        LOG_INFO("Sending raw source 'user_script' ({} bytes) to payload for target-side compilation",
-                 source.size());
-        bool ok = send_via_mailbox(source.data(), source.size(), 0);
+        LOG_INFO("Compiled {} bytes -> {} bytes bytecode (v{})",
+                 source.size(), bc_len, static_cast<int>(static_cast<uint8_t>(bc[0])));
+        bool ok = send_via_mailbox(bc, bc_len, 1);
+        free(bc);
         if (ok) {
-            set_state(InjectionState::Ready, "Source dispatched to Roblox payload");
-            LOG_INFO("Source for 'user_script' dispatched ({} bytes, flags=0)", source.size());
+            set_state(InjectionState::Ready, "Bytecode dispatched to Roblox payload");
+            LOG_INFO("Bytecode dispatched ({} bytes, flags=1)", bc_len);
             return true;
         }
         LOG_WARN("Direct hook mailbox send failed, trying IPC fallback");
@@ -3974,6 +3970,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
