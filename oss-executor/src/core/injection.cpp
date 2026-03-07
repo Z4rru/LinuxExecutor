@@ -3772,13 +3772,28 @@ bool Injection::execute_script(const std::string& source) {
             LOG_ERROR("Compile failed: {}", ce);
             return false;
         }
+        uint8_t bc_ver = static_cast<uint8_t>(bc[0]);
         LOG_INFO("Compiled {} bytes -> {} bytes bytecode (v{})",
-                 source.size(), bc_len, static_cast<int>(static_cast<uint8_t>(bc[0])));
+                 source.size(), bc_len, static_cast<int>(bc_ver));
+        if (bc_ver < 3 || bc_ver > 6) {
+            free(bc);
+            set_state(InjectionState::Ready,
+                "Bytecode version " + std::to_string(bc_ver) +
+                " may not match Roblox VM — update Luau in CMakeLists.txt");
+            LOG_WARN("Bytecode version {} outside expected range [3..6]", static_cast<int>(bc_ver));
+            return false;
+        }
+        if (bc_len > 16336) {
+            free(bc);
+            set_state(InjectionState::Ready, "Bytecode too large for mailbox");
+            LOG_ERROR("Bytecode {} bytes exceeds mailbox limit 16336", bc_len);
+            return false;
+        }
         bool ok = send_via_mailbox(bc, bc_len, 1);
         free(bc);
         if (ok) {
             set_state(InjectionState::Ready, "Bytecode dispatched to Roblox payload");
-            LOG_INFO("Bytecode dispatched ({} bytes, flags=1)", bc_len);
+            LOG_INFO("Bytecode dispatched ({} bytes, v{}, flags=1)", bc_len, static_cast<int>(bc_ver));
             return true;
         }
         LOG_WARN("Direct hook mailbox send failed, trying IPC fallback");
@@ -3970,6 +3985,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
