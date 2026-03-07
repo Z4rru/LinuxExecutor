@@ -3147,9 +3147,9 @@ static std::vector<uint8_t> gen_resume_trampoline(
     c[jmp_past_mb + 1] = static_cast<uint8_t>(past_mb_label - (jmp_past_mb + 2));
 
     e({0x8B,0x0C,0x24});          // mov ecx, [rsp]  — restored data_size
-    e({0x45,0x31,0xC0});          // xor r8d, r8d  (env=0)
-    e({0x48,0xB8}); e64(a.load);
-    e({0xFF,0xD0});
+    e({0x45,0x31,0xC0});
+    e({0x31,0xC0});
+    for(int p=0;p<10;p++) e8(0x90);
     e({0x41,0xC7,0x47,0x2C,0x03,0x00,0x00,0x00});
     e({0x85,0xC0});
     size_t jnz_settop = c.size(); e({0x90}); e({0xE9}); e32(0);
@@ -3180,8 +3180,7 @@ static std::vector<uint8_t> gen_resume_trampoline(
     // settop(parent, -2)
     e({0x48,0x89,0xEF});
     e8(0xBE); e32(0xFFFFFFFE);
-    e({0x48,0xB8}); e64(a.settop);
-    e({0xFF,0xD0});
+    for(int p=0;p<12;p++) e8(0x90);
 
     size_t ack_label = c.size();
     e({0x49,0x8B,0x4F,0x10});
@@ -4016,6 +4015,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
