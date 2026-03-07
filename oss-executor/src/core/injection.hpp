@@ -199,7 +199,9 @@ private:
         uint8_t   stolen_bytes[32] = {};
         uint8_t   orig_patch[32]   = {};
         size_t    patch_len    = 0;
-        bool      active      = false;
+        bool      active          = false;
+        bool      has_compile     = false;
+        bool      has_sandbox     = false;
     };
 
     bool inject_via_direct_hook(pid_t pid);
@@ -210,6 +212,7 @@ private:
 };
 
 }
+
 
 
 
