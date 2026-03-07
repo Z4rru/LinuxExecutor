@@ -120,12 +120,12 @@ bool Executor::send_to_payload(const std::string& source) {
             LOG_ERROR("Syntax check failed for direct hook: {}", ce);
             return false;
         }
+        LOG_INFO("Compiled {} bytes -> {} bytes bytecode (v{})",
+                 source.size(), bc_len, static_cast<int>(static_cast<uint8_t>(bc[0])));
+        bool ok = inj.send_via_mailbox(bc, bc_len, 1);
         free(bc);
-        LOG_INFO("Syntax OK, sending {} bytes raw source via direct hook mailbox",
-                 source.size());
-        bool ok = inj.send_via_mailbox(source.data(), source.size(), 0);
         if (ok) {
-            LOG_INFO("Sent {} bytes source via direct hook mailbox", source.size());
+            LOG_INFO("Sent {} bytes bytecode via direct hook mailbox", bc_len);
             return true;
         }
         LOG_WARN("Direct hook mailbox failed, trying IPC fallback");
@@ -548,6 +548,7 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
 
 
 
