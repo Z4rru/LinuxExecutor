@@ -113,18 +113,19 @@ bool Executor::send_to_payload(const std::string& source) {
     if (inj.is_direct_hook()) {
         size_t bc_len = 0;
         char* bc = luau_compile(source.c_str(), source.size(), nullptr, &bc_len);
-        if (!bc || bc_len == 0 || static_cast<uint8_t>(bc[0]) == 0) {
+        bool syntax_ok = bc && bc_len > 0 && static_cast<uint8_t>(bc[0]) != 0;
+        if (!syntax_ok) {
             std::string ce = (bc && bc_len > 1) ? std::string(bc + 1, bc_len - 1) : "unknown";
             free(bc);
-            LOG_ERROR("Compile failed for direct hook: {}", ce);
+            LOG_ERROR("Syntax check failed for direct hook: {}", ce);
             return false;
         }
-        LOG_INFO("Compiled {} bytes source → {} bytes bytecode (version byte={})",
-                 source.size(), bc_len, (int)(uint8_t)bc[0]);
-        bool ok = inj.send_via_mailbox(bc, bc_len, 1);
         free(bc);
+        LOG_INFO("Syntax OK, sending {} bytes raw source via direct hook mailbox",
+                 source.size());
+        bool ok = inj.send_via_mailbox(source.data(), source.size(), 0);
         if (ok) {
-            LOG_INFO("Sent {} bytes bytecode via direct hook mailbox", bc_len);
+            LOG_INFO("Sent {} bytes source via direct hook mailbox", source.size());
             return true;
         }
         LOG_WARN("Direct hook mailbox failed, trying IPC fallback");
@@ -547,5 +548,6 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
 
 
