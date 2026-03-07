@@ -3059,7 +3059,7 @@ static std::vector<uint8_t> gen_resume_trampoline(
     size_t jle_cleanup = c.size(); e({0x0F,0x8E}); e32(0);
 
     e({0xC6,0x00,0x01});
-
+    e({0x41,0xC7,0x47,0x2C,0x01,0x00,0x00,0x00});
     e({0x41,0x8B,0x5F,0x20});
     e({0x85,0xDB});
     size_t jz_ack1 = c.size(); e({0x0F,0x84}); e32(0);
@@ -3077,7 +3077,7 @@ static std::vector<uint8_t> gen_resume_trampoline(
     e({0x48,0x85,0xC0});
     size_t jz_ack2 = c.size(); e({0x0F,0x84}); e32(0);
     e({0x48,0x89,0xC5});
-
+    e({0x41,0xC7,0x47,0x2C,0x02,0x00,0x00,0x00});
     if (a.sandbox) {
         e({0x48,0x89,0xEF});
         e({0x48,0xB8}); e64(a.sandbox);
@@ -3150,6 +3150,7 @@ static std::vector<uint8_t> gen_resume_trampoline(
     e({0x45,0x31,0xC0});          // xor r8d, r8d  (env=0)
     e({0x48,0xB8}); e64(a.load);
     e({0xFF,0xD0});
+    e({0x41,0xC7,0x47,0x2C,0x03,0x00,0x00,0x00});
     e({0x85,0xC0});
     size_t jnz_settop = c.size(); e({0x0F,0x85}); e32(0);
 
@@ -3160,8 +3161,8 @@ static std::vector<uint8_t> gen_resume_trampoline(
     size_t stolen_call = c.size();
     e({0x48,0xB8}); e64(0);
     e({0xFF,0xD0});
+    e({0x41,0xC7,0x47,0x2C,0x04,0x00,0x00,0x00});
 
-    // Free compiled bytecode if r13 != 0
     size_t settop_label = c.size();
     if (free_addr) {
         e({0x4D,0x85,0xED});      // test r13, r13
@@ -3185,8 +3186,9 @@ static std::vector<uint8_t> gen_resume_trampoline(
     size_t ack_label = c.size();
     e({0x49,0x8B,0x4F,0x10});
     e({0x49,0x89,0x4F,0x18});
+    e({0x41,0xC7,0x47,0x2C,0x05,0x00,0x00,0x00});
 
-    if (compile_addr && free_addr) {
+    if (compile_addr && free_addr) {{
         // Patch jmp_ack_from_compile to point here
         int32_t rel = static_cast<int32_t>(ack_label - (jmp_ack_from_compile + 5));
         memcpy(&c[jmp_ack_from_compile + 1], &rel, 4);
@@ -3504,10 +3506,39 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     uint32_t sz = static_cast<uint32_t>(len);
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 32, &sz, 4)) return false;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 36, &flags, 4)) return false;
+    uint32_t zero_step = 0;
+    proc_mem_write(pid, dhook_.mailbox_addr + 44, &zero_step, 4);
     uint64_t new_seq = seq + 1;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) return false;
 
     LOG_INFO("[direct-hook] sent {} bytes via mailbox (seq={})", len, new_seq);
+
+    for (int i = 0; i < 30; i++) {
+        usleep(100000);
+        uint32_t step = 0;
+        proc_mem_read(pid, dhook_.mailbox_addr + 44, &step, 4);
+        uint64_t cur_ack = 0;
+        proc_mem_read(pid, dhook_.mailbox_addr + 24, &cur_ack, 8);
+        if (step > 0) {
+            LOG_INFO("[direct-hook] trampoline reached step {}", step);
+        }
+        if (cur_ack >= new_seq) {
+            LOG_INFO("[direct-hook] mailbox consumed (ack={} step={})", cur_ack, step);
+            break;
+        }
+        if (kill(pid, 0) != 0) {
+            const char* desc =
+                step == 0 ? "never entered processing (guard/seq check)" :
+                step == 1 ? "CRASHED before lua_newthread call" :
+                step == 2 ? "CRASHED after lua_newthread, before luau_load — lua_newthread is OK" :
+                step == 3 ? "CRASHED after luau_load, before lua_resume — bytecode loaded OK" :
+                step == 4 ? "CRASHED during/after lua_resume execution" :
+                "completed successfully then crashed";
+            LOG_ERROR("[direct-hook] TARGET DIED at step {}: {}", step, desc);
+            break;
+        }
+    }
+
     return true;
 }
 
@@ -3985,6 +4016,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
