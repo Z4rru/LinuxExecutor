@@ -22,8 +22,8 @@ include(FetchContent)
 
 # ── FIX: use URL tarball to avoid 403 on git clone ──
 FetchContent_Declare(Luau
-    URL        https://github.com/luau-lang/luau/archive/refs/tags/0.711.tar.gz
-    URL_HASH   MD5=0    # remove or update once you know the real hash
+    URL      https://github.com/luau-lang/luau/archive/refs/tags/0.711.tar.gz
+    URL_HASH MD5=326e84620a69afa3d86c6e92ef98c968
     DOWNLOAD_EXTRACT_TIMESTAMP ON
 )
 set(LUAU_BUILD_CLI   OFF CACHE BOOL "" FORCE)
@@ -175,3 +175,4 @@ install(DIRECTORY resources/ DESTINATION share/oss-executor/resources OPTIONAL)
 install(DIRECTORY themes/    DESTINATION share/oss-executor/themes    OPTIONAL)
 install(DIRECTORY scripts/   DESTINATION share/oss-executor/scripts   OPTIONAL)
 install(FILES config.json    DESTINATION share/oss-executor           OPTIONAL)
+
