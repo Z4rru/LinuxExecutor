@@ -170,17 +170,16 @@ private:
     int                 elevated_out_fd_ = -1;
 
     struct DirectMailbox {
-        char magic[16];       // +0
-        uint64_t seq;         // +16
-        uint64_t ack;         // +24
-        uint32_t data_size;   // +32
-        uint32_t flags;       // +36
-        uint8_t guard;        // +40
-        uint8_t pending;      // +41  entry sets to 1, epilogue clears
-        uint8_t pad[6];       // +42  (step diagnostic at +44)
-        uint64_t saved_L;     // +48  parent lua_State* from entry
-        uint64_t saved_ret;   // +56  original return address hijacked by entry
-        char data[16320];     // +64  bytecode payload
+        char magic[16];
+        uint64_t seq;
+        uint64_t ack;
+        uint32_t data_size;
+        uint32_t flags;
+        uint8_t guard;
+        uint8_t _pad1;
+        uint8_t pad[6];
+        uint64_t _reserved[2];
+        char data[16320];
     };
 
     struct DirectHookAddrs {
@@ -215,6 +214,7 @@ private:
 };
 
 }
+
 
 
 
