@@ -3337,6 +3337,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     dhook_.stolen_len = steal;
     dhook_.resume_addr = addrs.resume;
     dhook_.newthread_addr = addrs.newthread;
+    dhook_.load_addr = addrs.load;
     memcpy(dhook_.stolen_bytes, prologue, steal);
     memcpy(dhook_.orig_patch, prologue, patch_len);
     dhook_.patch_len = patch_len;
@@ -3396,42 +3397,49 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     uint8_t zero_guard = 0;
     proc_mem_write(pid, dhook_.mailbox_addr + 40, &zero_guard, 1);
 
-    uintptr_t lock_fn = 0, unlock_fn = 0;
-    uint8_t lock_save = 0, unlock_save = 0;
+    struct LockPatch { uintptr_t addr; uint8_t saved; };
+    std::vector<LockPatch> lock_patches;
     bool lock_bypassed = false;
-    if (dhook_.newthread_addr) {
-        uint8_t ntb[200];
-        if (proc_mem_read(pid, dhook_.newthread_addr, ntb, 200)) {
-            for (int i = 0; i < 18; i++) {
-                if (ntb[i] == 0xE8) {
-                    int32_t d; memcpy(&d, &ntb[i+1], 4);
-                    lock_fn = dhook_.newthread_addr + i + 5 + (int64_t)d;
-                    break;
-                }
-            }
-            for (int i = 195; i >= 20; i--) {
-                if (ntb[i] == 0xE8) {
-                    int32_t d; memcpy(&d, &ntb[i+1], 4);
-                    unlock_fn = dhook_.newthread_addr + i + 5 + (int64_t)d;
-                    break;
-                }
-            }
-            if (lock_fn) {
-                proc_mem_read(pid, lock_fn, &lock_save, 1);
-                uint8_t ret = 0xC3;
-                if (proc_mem_write(pid, lock_fn, &ret, 1)) {
-                    lock_bypassed = true;
-                    LOG_INFO("[direct-hook] bypassed lua_lock at 0x{:X} (saved 0x{:02X})", lock_fn, lock_save);
-                }
-            }
-            if (unlock_fn && unlock_fn != lock_fn) {
-                proc_mem_read(pid, unlock_fn, &unlock_save, 1);
-                uint8_t ret = 0xC3;
-                proc_mem_write(pid, unlock_fn, &ret, 1);
-                LOG_INFO("[direct-hook] bypassed lua_unlock at 0x{:X} (saved 0x{:02X})", unlock_fn, unlock_save);
+
+    auto bypass_locks_in = [&](uintptr_t fn_addr, int first_range, int scan_range, const char* name) {
+        if (!fn_addr) return;
+        std::vector<uint8_t> buf(scan_range);
+        if (!proc_mem_read(pid, fn_addr, buf.data(), scan_range)) return;
+        uintptr_t targets[2] = {0, 0};
+        for (int i = 0; i < std::min(first_range, scan_range - 4); i++) {
+            if (buf[i] == 0xE8) {
+                int32_t d; memcpy(&d, &buf[i+1], 4);
+                targets[0] = fn_addr + i + 5 + (int64_t)d;
+                break;
             }
         }
-    }
+        for (int i = scan_range - 5; i >= 20; i--) {
+            if (buf[i] == 0xE8) {
+                int32_t d; memcpy(&d, &buf[i+1], 4);
+                targets[1] = fn_addr + i + 5 + (int64_t)d;
+                break;
+            }
+        }
+        for (int t = 0; t < 2; t++) {
+            if (!targets[t]) continue;
+            bool dup = false;
+            for (auto& p : lock_patches) if (p.addr == targets[t]) { dup = true; break; }
+            if (dup) continue;
+            LockPatch lp{targets[t], 0};
+            proc_mem_read(pid, lp.addr, &lp.saved, 1);
+            uint8_t ret = 0xC3;
+            if (proc_mem_write(pid, lp.addr, &ret, 1)) {
+                lock_patches.push_back(lp);
+                lock_bypassed = true;
+                LOG_INFO("[direct-hook] bypassed {}:{} at 0x{:X} (saved 0x{:02X})",
+                         name, t == 0 ? "lock" : "unlock", lp.addr, lp.saved);
+            }
+        }
+    };
+
+    bypass_locks_in(dhook_.newthread_addr, 18, 200, "newthread");
+    bypass_locks_in(dhook_.load_addr, 30, 500, "luau_load");
+    bypass_locks_in(dhook_.resume_addr, 30, 500, "lua_resume");
 
     uint64_t new_seq = seq + 1;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) return false;
@@ -3486,7 +3494,8 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                 LOG_WARN("[direct-hook] TIMEOUT at step 2: lua_newthread at 0x{:X} hung (no lock bypass available)", dhook_.newthread_addr);
             }
         } else if (last_step == 3) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 3: lua_newthread OK — luau_load hung or crashed");
+            LOG_WARN("[direct-hook] TIMEOUT at step 3: lua_newthread OK — luau_load at 0x{:X} hung (lock bypass covered {} functions)",
+                     dhook_.load_addr, lock_patches.size());
         } else if (last_step == 4) {
             LOG_WARN("[direct-hook] TIMEOUT at step 4: luau_load OK — inner lua_resume hung");
         } else if (last_step == 5) {
@@ -3497,11 +3506,9 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     }
 
     if (lock_bypassed) {
-        if (lock_fn)
-            proc_mem_write(pid, lock_fn, &lock_save, 1);
-        if (unlock_fn && unlock_fn != lock_fn)
-            proc_mem_write(pid, unlock_fn, &unlock_save, 1);
-        LOG_INFO("[direct-hook] restored lua_lock/unlock originals");
+        for (auto& p : lock_patches)
+            proc_mem_write(pid, p.addr, &p.saved, 1);
+        LOG_INFO("[direct-hook] restored {} lock/unlock patches", lock_patches.size());
     }
 
     return true;
@@ -3988,6 +3995,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
