@@ -2905,15 +2905,17 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
                 // Cross-validate: check if candidate shares call targets with lua_resume
                 if (out.resume && score >= 5) {
-                    uint8_t resume_code[256];
-                    struct iovec rl = {resume_code, 256};
-                    struct iovec rr_v = {reinterpret_cast<void*>(out.resume), 256};
-                    if (process_vm_readv(pid, &rl, 1, &rr_v, 1, 0) == 256) {
+                    uint8_t resume_code[1024];
+                    struct iovec rl = {resume_code, 1024};
+                    struct iovec rr_v = {reinterpret_cast<void*>(out.resume), 1024};
+                    ssize_t rrd = process_vm_readv(pid, &rl, 1, &rr_v, 1, 0);
+                    if (rrd >= 64) {
+                        size_t resume_scan = static_cast<size_t>(rrd);
                         for (size_t cj = 0; cj < fsz && off+cj+5 < scan_sz; cj++) {
                             if (code[off+cj] != 0xE8) continue;
                             int32_t cdisp; memcpy(&cdisp, &code[off+cj+1], 4);
                             uintptr_t ctarget = scan_lo + off + cj + 5 + (int64_t)cdisp;
-                            for (size_t rj = 0; rj + 5 <= 256; rj++) {
+                            for (size_t rj = 0; rj + 5 <= resume_scan; rj++) {
                                 if (resume_code[rj] != 0xE8) continue;
                                 int32_t rdisp; memcpy(&rdisp, &resume_code[rj+1], 4);
                                 uintptr_t rtarget = out.resume + rj + 5 + (int64_t)rdisp;
@@ -2929,14 +2931,14 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
                 if (score > best_score) { best_score=score; best_addr=addr; best_fsz=fsz; best_calls=calls; }
             }
-            if (best_addr && best_score >= 8) {
+            if (best_addr && best_score >= 20) {
                 out.newthread = best_addr;
-                LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={})",
+                LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={}, CROSS-VALIDATED)",
                          best_addr, best_fsz, best_calls, best_score);
-                if (best_score <= 16) {
-                    LOG_WARN("[direct-hook] lua_newthread has NO cross-validation with lua_resume — identification confidence is LOW");
-                }
                 break;
+            } else if (best_addr && best_score >= 8) {
+                LOG_WARN("[direct-hook] proximity candidate 0x{:X} rejected (score={}, needs cross-validation >=20)",
+                         best_addr, best_score);
             }
             break;
         }
@@ -3017,22 +3019,49 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     best_addr = addr;
                 }
             }
-            if (best_addr && best_score >= 10) {
-                out.newthread = best_addr;
-                LOG_INFO("[direct-hook] global scan: lua_newthread=0x{:X} (score={})", best_addr, best_score);
-                if (best_score <= 16) {
-                    LOG_WARN("[direct-hook] lua_newthread (global) has NO cross-validation — identification confidence is LOW");
+            if (best_addr && best_score >= 10 && out.resume) {
+                uint8_t gxr[1024];
+                struct iovec gl = {gxr, 1024};
+                struct iovec gr = {reinterpret_cast<void*>(out.resume), 1024};
+                ssize_t grd = process_vm_readv(pid, &gl, 1, &gr, 1, 0);
+                bool xval = false;
+                if (grd >= 64) {
+                    size_t gscan = static_cast<size_t>(grd);
+                    for (size_t gi = 0; gi + 200 < scan_sz && !xval; gi++) {
+                        if (r.start + gi != best_addr) continue;
+                        for (size_t gj = 0; gj < 200 && gi+gj+5 < scan_sz; gj++) {
+                            if (code[gi+gj] != 0xE8) continue;
+                            int32_t gd; memcpy(&gd, &code[gi+gj+1], 4);
+                            uintptr_t gt = r.start + gi + gj + 5 + (int64_t)gd;
+                            for (size_t rk = 0; rk + 5 <= gscan; rk++) {
+                                if (gxr[rk] != 0xE8) continue;
+                                int32_t rd; memcpy(&rd, &gxr[rk+1], 4);
+                                uintptr_t rt = out.resume + rk + 5 + (int64_t)rd;
+                                if (gt == rt) { xval = true; break; }
+                            }
+                            if (xval) break;
+                        }
+                    }
                 }
-                break;
+                if (xval) {
+                    out.newthread = best_addr;
+                    LOG_INFO("[direct-hook] global scan: lua_newthread=0x{:X} (score={}, CROSS-VALIDATED)", best_addr, best_score);
+                    break;
+                } else {
+                    LOG_WARN("[direct-hook] global candidate 0x{:X} rejected (score={}, no cross-validation)", best_addr, best_score);
+                }
             }
         }
     }
 
     
-    if (!out.resume || !out.newthread || !out.load || !out.settop) {
-        LOG_ERROR("[direct-hook] missing functions: resume={:#x} newthread={:#x} load={:#x} settop={:#x}",
-                  out.resume, out.newthread, out.load, out.settop);
+    if (!out.resume || !out.load || !out.settop) {
+        LOG_ERROR("[direct-hook] missing required functions: resume={:#x} load={:#x} settop={:#x}",
+                  out.resume, out.load, out.settop);
         return false;
+    }
+    if (!out.newthread) {
+        LOG_WARN("[direct-hook] lua_newthread not found with sufficient confidence — using direct execution fallback on parent thread");
     }
     return true;
 }
@@ -3087,13 +3116,19 @@ static std::vector<uint8_t> gen_entry_trampoline(
     e({0x48,0xB8}); e64(a.settop);
     e({0xFF,0xD0});
 
-    e({0xC7,0x43,0x2C,0x02,0x00,0x00,0x00});
-    e({0x4C,0x89,0xFF});
-    e({0x48,0xB8}); e64(a.newthread);
-    e({0xFF,0xD0});
-    e({0x49,0x89,0xC6});
-    e({0x4D,0x85,0xF6});
-    size_t j_nt_fail = c.size(); e({0x0F,0x84}); e32(0);
+    size_t j_nt_fail = SIZE_MAX;
+    if (a.newthread) {
+        e({0xC7,0x43,0x2C,0x02,0x00,0x00,0x00});
+        e({0x4C,0x89,0xFF});
+        e({0x48,0xB8}); e64(a.newthread);
+        e({0xFF,0xD0});
+        e({0x49,0x89,0xC6});
+        e({0x4D,0x85,0xF6});
+        j_nt_fail = c.size(); e({0x0F,0x84}); e32(0);
+    } else {
+        e({0xC7,0x43,0x2C,0x02,0x00,0x00,0x00});
+        e({0x4D,0x89,0xFE});
+    }
 
     e({0xC7,0x43,0x2C,0x03,0x00,0x00,0x00});
     e({0x4C,0x89,0xF7});
@@ -3134,7 +3169,8 @@ static std::vector<uint8_t> gen_entry_trampoline(
     };
     patch_j(j_guard + 2, skip_label);
     patch_j(j_seq   + 2, skip_label);
-    patch_j(j_nt_fail + 2, ack_label);
+    if (j_nt_fail != SIZE_MAX)
+        patch_j(j_nt_fail + 2, ack_label);
     patch_j(j_load_fail + 2, settop_label);
 
     e({0x48,0x89,0xEC}); e8(0x5D);
@@ -3895,6 +3931,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
