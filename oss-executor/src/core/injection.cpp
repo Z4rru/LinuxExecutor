@@ -2945,6 +2945,23 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
     
+        // Extract lua_lock address from lua_newthread's first CALL instruction
+    if (out.newthread && !out.lock_fn) {
+        uint8_t ntb[20];
+        struct iovec ntl = {ntb, 20};
+        struct iovec ntr = {reinterpret_cast<void*>(out.newthread), 20};
+        if (process_vm_readv(pid, &ntl, 1, &ntr, 1, 0) == 20) {
+            for (int i = 0; i < 16; i++) {
+                if (ntb[i] == 0xE8) {
+                    int32_t d; memcpy(&d, &ntb[i+1], 4);
+                    out.lock_fn = out.newthread + i + 5 + (int64_t)d;
+                    LOG_INFO("[direct-hook] lua_lock at 0x{:X} (from newthread+{})", out.lock_fn, i);
+                    break;
+                }
+            }
+        }
+    }
+
     if (!out.free_fn) {
         out.free_fn = find_remote_symbol(pid, "c", "free");
         if (out.free_fn)
@@ -3208,10 +3225,10 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 //   HANDLER: Fires AFTER lua_resume returns (lua_lock RELEASED).
 //            Creates thread, loads bytecode, executes, cleans up.
 // ═══════════════════════════════════════════════════════════════════
-template <typename AddrsType>
+template<typename AddrsType>
 static std::vector<uint8_t> gen_entry_trampoline(
-    const AddrsType& a, uintptr_t mailbox_addr,
-    uintptr_t cave_addr, const uint8_t* stolen, size_t stolen_len)
+    const AddrsType& a, uintptr_t mailbox_addr, uintptr_t cave_addr,
+    uintptr_t hook_target, const uint8_t* stolen, size_t stolen_len)
 {
     std::vector<uint8_t> c;
     c.reserve(512);
@@ -3331,7 +3348,7 @@ static std::vector<uint8_t> gen_entry_trampoline(
     for (size_t i = 0; i < stolen_len; i++) e8(stolen[i]);
 
     // Jump back to lua_settop + stolen_len to continue original function
-    uintptr_t settop_cont = a.settop + stolen_len;
+    uintptr_t settop_cont = hook_target + stolen_len;
     int64_t jd = (int64_t)settop_cont - (int64_t)(cave_addr + c.size() + 5);
     if (jd >= INT32_MIN && jd <= INT32_MAX) {
         e8(0xE9); e32((uint32_t)(int32_t)jd);
@@ -3465,83 +3482,119 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     LOG_INFO("[direct-hook] code cave at 0x{:X} ({} bytes)",
              cave.padding_start, cave.padding_size);
 
-    auto tramp = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
-                                      prologue, steal);
-    LOG_INFO("[direct-hook] entry trampoline: {} bytes", tramp.size());
-    if (tramp.size() > 400) {
-        LOG_ERROR("[direct-hook] trampoline too large: {} bytes", tramp.size());
-        return false;
-    }
-    if (!proc_mem_write(pid, cave.padding_start, tramp.data(), tramp.size())) {
-        LOG_ERROR("[direct-hook] failed to write trampoline");
-        return false;
-    }
+    uintptr_t hook_addr = addrs.settop;
+    bool is_lock_hook = false;
 
-    uint8_t patch[16];
-    size_t patch_len;
-    int64_t hook_disp = (int64_t)cave.padding_start - (int64_t)(addrs.settop + 5);
-    if (hook_disp >= INT32_MIN && hook_disp <= INT32_MAX && steal >= 5) {
-        patch[0] = 0xE9;
-        int32_t rel = (int32_t)hook_disp;
-        memcpy(patch + 1, &rel, 4);
-        for (size_t i = 5; i < steal; i++) patch[i] = 0x90;
-        patch_len = steal;
-    } else if (steal >= 14) {
-        patch[0] = 0xFF; patch[1] = 0x25;
-        memset(patch + 2, 0, 4);
-        memcpy(patch + 6, &cave.padding_start, 8);
-        patch_len = 14;
-    } else {
-        LOG_ERROR("[direct-hook] cannot encode jump (steal={} disp={})",
-                  steal, hook_disp);
-        return false;
-    }
+    auto try_hook_target = [&](uintptr_t target, const char* name,
+                                uint8_t* pro, size_t st) -> bool {
+        auto t = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
+                                       target, pro, st);
+        LOG_INFO("[direct-hook] {} trampoline: {} bytes", name, t.size());
+        if (t.size() > 400) return false;
+        if (!proc_mem_write(pid, cave.padding_start, t.data(), t.size())) return false;
 
-    if (!proc_mem_write(pid, addrs.settop, patch, patch_len)) {
-        LOG_ERROR("[direct-hook] failed to patch lua_settop");
-        return false;
-    }
+        uint8_t p[16]; size_t pl;
+        int64_t hd = (int64_t)cave.padding_start - (int64_t)(target + 5);
+        if (hd >= INT32_MIN && hd <= INT32_MAX && st >= 5) {
+            p[0] = 0xE9;
+            int32_t r32 = (int32_t)hd;
+            memcpy(p + 1, &r32, 4);
+            for (size_t i = 5; i < st; i++) p[i] = 0x90;
+            pl = st;
+        } else if (st >= 14) {
+            p[0] = 0xFF; p[1] = 0x25;
+            memset(p + 2, 0, 4);
+            uintptr_t ca = cave.padding_start;
+            memcpy(p + 6, &ca, 8);
+            pl = 14;
+        } else { return false; }
 
-    // Verify patch actually persisted in target memory
-    {
-        uint8_t verify[16] = {};
-        if (proc_mem_read(pid, addrs.settop, verify, patch_len)) {
-            if (memcmp(verify, patch, patch_len) != 0) {
-                LOG_ERROR("[direct-hook] PATCH DID NOT PERSIST at 0x{:X} — "
-                          "wrote {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}, "
-                          "read {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                          addrs.settop,
-                          patch[0], patch[1], patch[2], patch[3],
-                          patch[4], patch_len > 5 ? patch[5] : 0,
-                          verify[0], verify[1], verify[2], verify[3],
-                          verify[4], patch_len > 5 ? verify[5] : 0);
+        if (!proc_mem_write(pid, target, p, pl)) return false;
+
+        // Verify
+        uint8_t vf[16] = {};
+        if (proc_mem_read(pid, target, vf, pl) && memcmp(vf, p, pl) != 0) {
+            LOG_ERROR("[direct-hook] {} patch did not persist", name);
+            return false;
+        }
+        LOG_INFO("[direct-hook] {} patch verified at 0x{:X}", name, target);
+
+        // Probe: wait and check hit counter
+        uint8_t zh = 0;
+        proc_mem_write(pid, mb_addr + 41, &zh, 1);
+        usleep(500000);
+        uint8_t hits = 0;
+        proc_mem_read(pid, mb_addr + 41, &hits, 1);
+
+        if (hits == 0) {
+            LOG_WARN("[direct-hook] {} at 0x{:X} is dead code (0 hits in 500ms)", name, target);
+            proc_mem_write(pid, target, pro, st);  // restore prologue
+            return false;
+        }
+        LOG_INFO("[direct-hook] {} probe: {} hits in 500ms — LIVE!", name, hits);
+
+        // Commit: store stolen bytes and patch for cleanup
+        memcpy(prologue, pro, st);
+        steal = st;
+        patch_len = pl;
+        memcpy(patch, p, pl);
+        return true;
+    };
+
+    // === Attempt 1: lua_settop ===
+    if (!try_hook_target(addrs.settop, "lua_settop", prologue, steal)) {
+        // === Attempt 2: lua_lock (guaranteed to be called) ===
+        if (!addrs.lock_fn) {
+            LOG_ERROR("[direct-hook] no lua_lock fallback available");
+            return false;
+        }
+
+        uint8_t lock_pro[32];
+        if (!proc_mem_read(pid, addrs.lock_fn, lock_pro, sizeof(lock_pro))) {
+            LOG_ERROR("[direct-hook] cannot read lua_lock prologue");
+            return false;
+        }
+        size_t lock_steal = 0;
+        while (lock_steal < 5) {
+            size_t il = dh_insn_len(lock_pro + lock_steal);
+            if (il == 0 || lock_steal + il > sizeof(lock_pro)) {
+                LOG_ERROR("[direct-hook] cannot decode lua_lock prologue");
                 return false;
             }
-            LOG_INFO("[direct-hook] patch verified at 0x{:X}: {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                     addrs.settop, verify[0], verify[1], verify[2], verify[3],
-                     verify[4], patch_len > 5 ? verify[5] : 0);
-        } else {
-            LOG_WARN("[direct-hook] could not read-back patch for verification");
+            lock_steal += il;
         }
+        LOG_INFO("[direct-hook] lua_lock prologue: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} (steal={})",
+                 lock_pro[0], lock_pro[1], lock_pro[2], lock_pro[3],
+                 lock_pro[4], lock_pro[5], lock_pro[6], lock_pro[7], lock_steal);
+
+        if (!try_hook_target(addrs.lock_fn, "lua_lock", lock_pro, lock_steal)) {
+            LOG_ERROR("[direct-hook] both lua_settop and lua_lock are dead code — giving up");
+            return false;
+        }
+
+        hook_addr = addrs.lock_fn;
+        is_lock_hook = true;
     }
 
     dhook_.cave_addr = cave.padding_start;
-    dhook_.mailbox_addr    = mb_addr;
-    dhook_.cave_size       = tramp.size();
-    dhook_.stolen_len      = steal;
-    dhook_.resume_addr     = addrs.resume;  // keep for lock bypass
-    dhook_.settop_addr     = addrs.settop;  // hooked function for cleanup
-    dhook_.newthread_addr  = addrs.newthread;
-    dhook_.load_addr       = addrs.load;
+    dhook_.mailbox_addr = mb_addr;
+    dhook_.cave_size = 400;
+    dhook_.stolen_len = steal;
+    dhook_.resume_addr = addrs.resume;
+    dhook_.newthread_addr = addrs.newthread;
+    dhook_.load_addr = addrs.load;
+    dhook_.settop_addr = hook_addr;
     memcpy(dhook_.stolen_bytes, prologue, steal);
     memcpy(dhook_.orig_patch, prologue, patch_len);
-    dhook_.patch_len       = patch_len;
-    dhook_.active          = true;
-    dhook_.has_compile     = (addrs.compile != 0);
+    dhook_.patch_len = patch_len;
+    dhook_.active = true;
+    dhook_.has_compile = (addrs.compile != 0);
+    dhook_.hook_is_lock_fn = is_lock_hook;
 
-    LOG_INFO("[direct-hook] ENTRY HOOK ARMED — lua_settop at 0x{:X}, "
-             "lua_resume at 0x{:X}, cave at 0x{:X}, mailbox at 0x{:X}",
-             addrs.settop, addrs.resume, cave.padding_start, mb_addr);
+    LOG_INFO("[direct-hook] ENTRY HOOK ARMED — {} at 0x{:X}, cave at 0x{:X}, mailbox at 0x{:X}{}",
+             is_lock_hook ? "lua_lock" : "lua_settop", hook_addr,
+             cave.padding_start, mb_addr,
+             is_lock_hook ? " (guard handles reentrancy, no lock bypass needed)" : "");
     set_state(InjectionState::Ready, "Direct hook active — ready for scripts");
     return true;
 }
@@ -3635,11 +3688,17 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         }
     };
 
-    bypass_locks_in(dhook_.newthread_addr, 18, 200, "newthread");
-    bypass_locks_in(dhook_.load_addr, 30, 500, "luau_load");
-    bypass_locks_in(dhook_.resume_addr, 30, 500, "lua_resume");
-    bypass_locks_in(dhook_.settop_addr, 30, 300, "lua_settop");
-    bypass_locks_in(dhook_.settop_addr, 30, 300, "lua_settop");
+    if (!dhook_.hook_is_lock_fn) {
+        // Standard lock bypass for lua_settop hook
+        bypass_locks_in(dhook_.newthread_addr, 18, 200, "newthread");
+        bypass_locks_in(dhook_.load_addr, 30, 500, "luau_load");
+        bypass_locks_in(dhook_.resume_addr, 30, 500, "lua_resume");
+        bypass_locks_in(dhook_.settop_addr, 30, 300, "lua_settop");
+    } else {
+        // lua_lock hook: guard byte handles all reentrancy naturally.
+        // DO NOT bypass — writing RET to lua_lock would destroy our hook!
+        LOG_INFO("[direct-hook] lock bypass skipped — lua_lock hook uses guard for reentrancy");
+    }
 
     uint64_t new_seq = seq + 1;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) return false;
@@ -4220,6 +4279,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
