@@ -3830,13 +3830,28 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                 std::vector<uint8_t> lbuf(800);
                 if (proc_mem_read(pid, dhook_.load_addr, lbuf.data(), 800)) {
                     auto is_short_func = [&](uintptr_t addr) -> bool {
-                        uint8_t fb[64] = {};
+                        uint8_t fb[200] = {};
                         if (!proc_mem_read(pid, addr, fb, sizeof(fb))) return false;
-                        // Must start with push rbp (0x55) or endbr64 (F3 0F 1E FA)
-                        if (fb[0] != 0x55 && !(fb[0] == 0xF3 && fb[1] == 0x0F &&
-                            fb[2] == 0x1E && fb[3] == 0xFA)) return false;
-                        // Must contain RET within 60 bytes
-                        for (size_t j = 4; j < sizeof(fb); j++)
+                        // Skip endbr64 prefix if present
+                        size_t start = 0;
+                        if (fb[0] == 0xF3 && fb[1] == 0x0F &&
+                            fb[2] == 0x1E && fb[3] == 0xFA) start = 4;
+                        uint8_t b0 = fb[start];
+                        // Reject obvious non-function starts
+                        if (b0 == 0x00 || b0 == 0xCC || b0 == 0x90) return false;
+                        // Accept common function prologues:
+                        //   push reg (50-57), push r8-r15 (41 50-57),
+                        //   sub rsp (48 83 EC / 48 81 EC),
+                        //   mov reg,reg (48 89), mov reg,mem (48 8B)
+                        bool valid = (b0 >= 0x50 && b0 <= 0x57) ||
+                            (b0 == 0x41 && start + 1 < sizeof(fb) &&
+                             fb[start+1] >= 0x50 && fb[start+1] <= 0x57) ||
+                            (b0 == 0x48 && start + 2 < sizeof(fb) &&
+                             (fb[start+1] == 0x83 || fb[start+1] == 0x81 ||
+                              fb[start+1] == 0x89 || fb[start+1] == 0x8B));
+                        if (!valid) return false;
+                        // Must contain RET within 200 bytes
+                        for (size_t j = start + 1; j < sizeof(fb); j++)
                             if (fb[j] == 0xC3) return true;
                         return false;
                     };
@@ -4475,6 +4490,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
