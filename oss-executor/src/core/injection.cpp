@@ -3479,7 +3479,7 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     bypass_locks_in(dhook_.load_addr, 30, 500, "luau_load");
     bypass_locks_in(dhook_.resume_addr, 30, 500, "lua_resume");
     bypass_locks_in(dhook_.settop_addr, 30, 300, "lua_settop");
-    bypass_locks_in(addrs.settop ? addrs.settop : dhook_.resume_addr, 30, 300, "lua_settop");
+    bypass_locks_in(dhook_.settop_addr, 30, 300, "lua_settop");
 
     uint64_t new_seq = seq + 1;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) return false;
@@ -4035,6 +4035,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
