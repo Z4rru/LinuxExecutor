@@ -3338,11 +3338,8 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 36, &flags, 4)) return false;
     uint32_t zero_step = 0;
     proc_mem_write(pid, dhook_.mailbox_addr + 44, &zero_step, 4);
-    uint8_t zero_byte = 0;
-    uint64_t zero_ret = 0;
-    proc_mem_write(pid, dhook_.mailbox_addr + 40, &zero_byte, 1);  // guard=0
-    proc_mem_write(pid, dhook_.mailbox_addr + 41, &zero_byte, 1);  // pending=0
-    proc_mem_write(pid, dhook_.mailbox_addr + 56, &zero_ret, 8);   // saved_ret=0
+    uint8_t zero_guard = 0;
+    proc_mem_write(pid, dhook_.mailbox_addr + 40, &zero_guard, 1);
     uint64_t new_seq = seq + 1;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) return false;
 
@@ -3354,10 +3351,8 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         proc_mem_read(pid, dhook_.mailbox_addr + 44, &step, 4);
         uint64_t cur_ack = 0;
         proc_mem_read(pid, dhook_.mailbox_addr + 24, &cur_ack, 8);
-        uint8_t pending = 0;
-        proc_mem_read(pid, dhook_.mailbox_addr + 41, &pending, 1);
-        if (step > 0 || pending) {
-            LOG_INFO("[direct-hook] step={} pending={} ack={}", step, pending, cur_ack);
+        if (step > 0) {
+            LOG_INFO("[direct-hook] step={} ack={}", step, cur_ack);
         }
         if (cur_ack >= new_seq) {
             LOG_INFO("[direct-hook] mailbox consumed (ack={} step={})", cur_ack, step);
@@ -3365,12 +3360,12 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         }
         if (kill(pid, 0) != 0) {
             const char* desc =
-                step == 0 ? "Phase1 never triggered or Phase2 not yet entered (nanosleep not called?)" :
-                step == 1 ? "Phase2 entered — CRASHED before/during lua_newthread" :
-                step == 2 ? "lua_newthread OK — CRASHED before/during luau_load" :
-                step == 3 ? "luau_load OK — CRASHED before/during lua_resume" :
-                step == 4 ? "lua_resume returned — CRASHED during settop/cleanup" :
-                step == 5 ? "ACK written — crashed after successful execution" :
+                step == 0 ? "entry hook never triggered (lua_resume not called?)" :
+                step == 1 ? "entry hook fired — crashed at/during lua_newthread" :
+                step == 2 ? "lua_newthread OK — crashed at/during luau_load" :
+                step == 3 ? "luau_load OK — crashed at/during lua_resume (inner)" :
+                step == 4 ? "inner resume returned — crashed during lua_settop cleanup" :
+                step == 5 ? "execution complete — crashed after ack" :
                 "unknown step";
             LOG_ERROR("[direct-hook] TARGET DIED at step {}: {}", step, desc);
             break;
@@ -3854,6 +3849,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
