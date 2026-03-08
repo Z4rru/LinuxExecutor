@@ -3073,6 +3073,24 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
     
         // Validate lua_settop: must be a 2-arg function (saves rdi + rsi, NOT rdx)
+        // Re-extract lua_lock if lua_newthread was found by global scan but lua_lock wasn't set
+    if (out.newthread && !out.lock_fn) {
+        uint8_t ntb2[20];
+        struct iovec ntl2 = {ntb2, 20};
+        struct iovec ntr2 = {reinterpret_cast<void*>(out.newthread), 20};
+        if (process_vm_readv(pid, &ntl2, 1, &ntr2, 1, 0) == 20) {
+            for (int i = 0; i < 16; i++) {
+                if (ntb2[i] == 0xE8) {
+                    int32_t d; memcpy(&d, &ntb2[i+1], 4);
+                    out.lock_fn = out.newthread + i + 5 + (int64_t)d;
+                    LOG_INFO("[direct-hook] lua_lock at 0x{:X} (from newthread+{}, post-global-scan)", out.lock_fn, i);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Validate lua_settop: must be a 2-arg function (saves rdi + rsi, NOT rdx)
     if (out.settop) {
         uint8_t st_buf[24];
         struct iovec st_l = {st_buf, 24};
@@ -4281,6 +4299,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
