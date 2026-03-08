@@ -2933,6 +2933,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 out.newthread = best_addr;
                 LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} ({}B, {} calls, score={})",
                          best_addr, best_fsz, best_calls, best_score);
+                if (best_score <= 16) {
+                    LOG_WARN("[direct-hook] lua_newthread has NO cross-validation with lua_resume — identification confidence is LOW");
+                }
                 break;
             }
             break;
@@ -3017,6 +3020,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             if (best_addr && best_score >= 10) {
                 out.newthread = best_addr;
                 LOG_INFO("[direct-hook] global scan: lua_newthread=0x{:X} (score={})", best_addr, best_score);
+                if (best_score <= 16) {
+                    LOG_WARN("[direct-hook] lua_newthread (global) has NO cross-validation — identification confidence is LOW");
+                }
                 break;
             }
         }
@@ -3357,17 +3363,23 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
 
     LOG_INFO("[direct-hook] sent {} bytes via mailbox (seq={})", len, new_seq);
 
+    bool consumed = false;
+    uint32_t last_step = 0;
     for (int i = 0; i < 30; i++) {
         usleep(100000);
         uint32_t step = 0;
         proc_mem_read(pid, dhook_.mailbox_addr + 44, &step, 4);
         uint64_t cur_ack = 0;
         proc_mem_read(pid, dhook_.mailbox_addr + 24, &cur_ack, 8);
-        if (step > 0) {
-            LOG_INFO("[direct-hook] step={} ack={}", step, cur_ack);
+        uint8_t guard = 0;
+        proc_mem_read(pid, dhook_.mailbox_addr + 40, &guard, 1);
+        last_step = step;
+        if (step > 0 || guard) {
+            LOG_INFO("[direct-hook] step={} guard={} ack={}", step, guard, cur_ack);
         }
         if (cur_ack >= new_seq) {
             LOG_INFO("[direct-hook] mailbox consumed (ack={} step={})", cur_ack, step);
+            consumed = true;
             break;
         }
         if (kill(pid, 0) != 0) {
@@ -3382,6 +3394,20 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                 "unknown step";
             LOG_ERROR("[direct-hook] TARGET DIED at step {}: {}", step, desc);
             break;
+        }
+    }
+
+    if (!consumed && kill(pid, 0) == 0) {
+        uint8_t final_guard = 0;
+        proc_mem_read(pid, dhook_.mailbox_addr + 40, &final_guard, 1);
+        if (last_step == 0 && final_guard == 0) {
+            LOG_WARN("[direct-hook] TIMEOUT: hook never fired (lua_resume not called during 3s window)");
+        } else if (last_step == 1) {
+            LOG_WARN("[direct-hook] TIMEOUT at step 1: lua_settop lock probe HUNG — VM lock held by scheduler, Lua API cannot be called from this context");
+        } else if (last_step == 2) {
+            LOG_WARN("[direct-hook] TIMEOUT at step 2: lua_settop OK but lua_newthread HUNG — function at 0x{:X} is NOT lua_newthread (misidentified by proximity scan)", dhook_.resume_addr);
+        } else {
+            LOG_WARN("[direct-hook] TIMEOUT at step {} guard={} — hung during execution", last_step, final_guard);
         }
     }
 
@@ -3869,6 +3895,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
