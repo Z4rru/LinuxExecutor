@@ -3805,16 +3805,94 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     if (!dhook_.hook_is_lock_fn) {
         // Bypass locks in functions the trampoline calls internally.
         // The hook target itself is skipped by the lambda (prologue is patched).
-        // Increased first_range to 80 to catch lua_lock calls beyond short prologues.
         bypass_locks_in(dhook_.newthread_addr, 18, 200, "newthread");
-        bypass_locks_in(dhook_.load_addr, 80, 500, "luau_load");
+        bypass_locks_in(dhook_.load_addr, 300, 800, "luau_load");
         bypass_locks_in(dhook_.resume_addr, 80, 500, "lua_resume");
-        // NOTE: dhook_.settop_addr is the hook target, NOT necessarily lua_settop.
-        // The lambda skips it via the hook_target_addr check. Do not add a
-        // separate settop bypass here — we don't have the real lua_settop address.
+
+        // Deep fallback for luau_load: 5-parameter functions (L, chunkname,
+        // data, size, env) can have very long prologues where the lua_lock
+        // call sits beyond the 300-byte first_range. If per-function scan
+        // failed to find the lock, scan the full body for CALL instructions
+        // targeting SHORT functions (lua_lock/unlock are typically < 60 bytes:
+        // push rbp; mutex op; pop rbp; ret).
+        if (dhook_.load_addr) {
+            bool load_lock_covered = false;
+            for (auto& p : lock_patches) {
+                int64_t dist = static_cast<int64_t>(p.addr) -
+                               static_cast<int64_t>(dhook_.load_addr);
+                if (dist > -0x100000 && dist < 0x100000) {
+                    load_lock_covered = true;
+                    break;
+                }
+            }
+            if (!load_lock_covered) {
+                LOG_INFO("[direct-hook] deep-scanning luau_load for lock/unlock...");
+                std::vector<uint8_t> lbuf(800);
+                if (proc_mem_read(pid, dhook_.load_addr, lbuf.data(), 800)) {
+                    auto is_short_func = [&](uintptr_t addr) -> bool {
+                        uint8_t fb[64] = {};
+                        if (!proc_mem_read(pid, addr, fb, sizeof(fb))) return false;
+                        // Must start with push rbp (0x55) or endbr64 (F3 0F 1E FA)
+                        if (fb[0] != 0x55 && !(fb[0] == 0xF3 && fb[1] == 0x0F &&
+                            fb[2] == 0x1E && fb[3] == 0xFA)) return false;
+                        // Must contain RET within 60 bytes
+                        for (size_t j = 4; j < sizeof(fb); j++)
+                            if (fb[j] == 0xC3) return true;
+                        return false;
+                    };
+                    // Forward: first CALL to a short function = lua_lock
+                    for (int i = 0; i < 700; i++) {
+                        if (lbuf[i] != 0xE8) continue;
+                        int32_t d; memcpy(&d, &lbuf[i+1], 4);
+                        uintptr_t t = dhook_.load_addr + i + 5 +
+                                      static_cast<int64_t>(d);
+                        if (!is_short_func(t)) continue;
+                        bool dup = false;
+                        for (auto& p : lock_patches)
+                            if (p.addr == t) { dup = true; break; }
+                        if (dup) { load_lock_covered = true; break; }
+                        LockPatch lp{t, 0};
+                        proc_mem_read(pid, lp.addr, &lp.saved, 1);
+                        uint8_t rb = 0xC3;
+                        if (proc_mem_write(pid, lp.addr, &rb, 1)) {
+                            lock_patches.push_back(lp);
+                            lock_bypassed = true;
+                            load_lock_covered = true;
+                            LOG_INFO("[direct-hook] bypassed luau_load:lock at "
+                                     "0x{:X} (deep scan, offset {})", t, i);
+                        }
+                        break;
+                    }
+                    // Backward: last CALL to a short function = lua_unlock
+                    for (int i = 798; i >= 20; i--) {
+                        if (lbuf[i] != 0xE8) continue;
+                        int32_t d; memcpy(&d, &lbuf[i+1], 4);
+                        uintptr_t t = dhook_.load_addr + i + 5 +
+                                      static_cast<int64_t>(d);
+                        if (!is_short_func(t)) continue;
+                        bool dup = false;
+                        for (auto& p : lock_patches)
+                            if (p.addr == t) { dup = true; break; }
+                        if (dup) break;
+                        LockPatch lp{t, 0};
+                        proc_mem_read(pid, lp.addr, &lp.saved, 1);
+                        uint8_t rb = 0xC3;
+                        if (proc_mem_write(pid, lp.addr, &rb, 1)) {
+                            lock_patches.push_back(lp);
+                            lock_bypassed = true;
+                            LOG_INFO("[direct-hook] bypassed luau_load:unlock at "
+                                     "0x{:X} (deep scan, offset {})", t, i);
+                        }
+                        break;
+                    }
+                }
+                if (!load_lock_covered) {
+                    LOG_WARN("[direct-hook] luau_load lock not found even with "
+                             "deep scan — may hang at step 2");
+                }
+            }
+        }
     } else {
-        // lua_lock hook: guard byte handles all reentrancy naturally.
-        // DO NOT bypass — writing RET to lua_lock would destroy our hook!
         LOG_INFO("[direct-hook] lock bypass skipped — lua_lock hook uses guard for reentrancy");
     }
 
@@ -4397,6 +4475,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
