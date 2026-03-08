@@ -3233,6 +3233,9 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // rbx = mailbox base address
     e({0x48,0xBB}); e64(mailbox_addr);
 
+    // --- Unconditional hit counter (fires every hook entry, even re-entrant) ---
+    e({0xFE,0x43,0x29});          // inc byte [rbx+0x29]  (_pad1 as hit counter)
+
     // --- Guard check: if guard != 0, skip (re-entrant call) ---
     e({0x80,0x7B,0x28,0x00});     // cmp byte [rbx+0x28], 0
     size_t j_guard = c.size();
@@ -3499,7 +3502,30 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         return false;
     }
 
-    dhook_.cave_addr       = cave.padding_start;
+    // Verify patch actually persisted in target memory
+    {
+        uint8_t verify[16] = {};
+        if (proc_mem_read(pid, addrs.settop, verify, patch_len)) {
+            if (memcmp(verify, patch, patch_len) != 0) {
+                LOG_ERROR("[direct-hook] PATCH DID NOT PERSIST at 0x{:X} — "
+                          "wrote {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}, "
+                          "read {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                          addrs.settop,
+                          patch[0], patch[1], patch[2], patch[3],
+                          patch[4], patch_len > 5 ? patch[5] : 0,
+                          verify[0], verify[1], verify[2], verify[3],
+                          verify[4], patch_len > 5 ? verify[5] : 0);
+                return false;
+            }
+            LOG_INFO("[direct-hook] patch verified at 0x{:X}: {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                     addrs.settop, verify[0], verify[1], verify[2], verify[3],
+                     verify[4], patch_len > 5 ? verify[5] : 0);
+        } else {
+            LOG_WARN("[direct-hook] could not read-back patch for verification");
+        }
+    }
+
+    dhook_.cave_addr = cave.padding_start;
     dhook_.mailbox_addr    = mb_addr;
     dhook_.cave_size       = tramp.size();
     dhook_.stolen_len      = steal;
@@ -3566,6 +3592,8 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     proc_mem_write(pid, dhook_.mailbox_addr + 44, &zero_step, 4);
     uint8_t zero_guard = 0;
     proc_mem_write(pid, dhook_.mailbox_addr + 40, &zero_guard, 1);
+    uint8_t zero_hit = 0;
+    proc_mem_write(pid, dhook_.mailbox_addr + 41, &zero_hit, 1);  // reset hit counter
 
     struct LockPatch { uintptr_t addr; uint8_t saved; };
     std::vector<LockPatch> lock_patches;
@@ -3628,9 +3656,19 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         proc_mem_read(pid, dhook_.mailbox_addr + 24, &cur_ack, 8);
         uint8_t guard = 0;
         proc_mem_read(pid, dhook_.mailbox_addr + 40, &guard, 1);
+        uint8_t hits = 0;
+        proc_mem_read(pid, dhook_.mailbox_addr + 41, &hits, 1);
         last_step = step;
-        if (step > 0 || guard) {
-            LOG_INFO("[direct-hook] step={} guard={} ack={}", step, guard, cur_ack);
+        if (step > 0 || guard || hits > 0) {
+            LOG_INFO("[direct-hook] step={} guard={} ack={} hits={}", step, guard, cur_ack, hits);
+        }
+        // Verify patch every second
+        if (i > 0 && i % 10 == 0 && dhook_.settop_addr) {
+            uint8_t pc[2] = {};
+            if (proc_mem_read(pid, dhook_.settop_addr, pc, 2) && pc[0] != 0xE9 && pc[0] != 0xFF) {
+                LOG_ERROR("[direct-hook] PATCH OVERWRITTEN at 0x{:X}: {:02X}{:02X} (expected E9 jmp)",
+                          dhook_.settop_addr, pc[0], pc[1]);
+            }
         }
         if (cur_ack >= new_seq) {
             LOG_INFO("[direct-hook] mailbox consumed (ack={} step={})", cur_ack, step);
@@ -3654,8 +3692,23 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     if (!consumed && kill(pid, 0) == 0) {
         uint8_t final_guard = 0;
         proc_mem_read(pid, dhook_.mailbox_addr + 40, &final_guard, 1);
+        uint8_t final_hits = 0;
+        proc_mem_read(pid, dhook_.mailbox_addr + 41, &final_hits, 1);
         if (last_step == 0 && final_guard == 0) {
-            LOG_WARN("[direct-hook] TIMEOUT: hook never fired (lua_settop not called during 3s window)");
+            uint8_t pc[6] = {};
+            if (dhook_.settop_addr)
+                proc_mem_read(pid, dhook_.settop_addr, pc, 6);
+            if (final_hits > 0) {
+                LOG_WARN("[direct-hook] TIMEOUT: hook FIRED {} times but never consumed mailbox "
+                         "(seq/ack/guard logic bug) — patch@0x{:X}={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                         final_hits, dhook_.settop_addr,
+                         pc[0], pc[1], pc[2], pc[3], pc[4], pc[5]);
+            } else {
+                LOG_WARN("[direct-hook] TIMEOUT: hook never fired in 3s (hits=0) — "
+                         "patch@0x{:X}={:02X}{:02X}{:02X}{:02X}{:02X}{:02X} "
+                         "(E9=patch intact, 55=patch reverted/write failed)",
+                         dhook_.settop_addr, pc[0], pc[1], pc[2], pc[3], pc[4], pc[5]);
+            }
         } else if (last_step == 1) {
             if (lock_bypassed) {
                 LOG_WARN("[direct-hook] TIMEOUT at step 1: lock bypass applied but lua_newthread at 0x{:X} STILL hung",
@@ -4167,6 +4220,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
