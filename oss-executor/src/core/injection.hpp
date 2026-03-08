@@ -190,6 +190,7 @@ private:
         uintptr_t sandbox   = 0;
         uintptr_t compile   = 0;
         uintptr_t free_fn   = 0;
+        uintptr_t lock_fn   = 0;
     };
 
     struct DirectHookState {
@@ -207,6 +208,7 @@ private:
         bool      active       = false;
         bool      has_compile  = false;
         bool      has_sandbox  = false;
+        bool      hook_is_lock_fn = false;
     };
 
     bool inject_via_direct_hook(pid_t pid);
@@ -217,6 +219,7 @@ private:
 };
 
 }
+
 
 
 
