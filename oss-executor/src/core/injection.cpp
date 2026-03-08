@@ -3564,36 +3564,109 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     // === Attempt 1: lua_settop ===
     if (!try_hook_target(addrs.settop, "lua_settop", prologue, steal)) {
         // === Attempt 2: lua_lock (guaranteed to be called) ===
-        if (!addrs.lock_fn) {
-            LOG_ERROR("[direct-hook] no lua_lock fallback available");
-            return false;
+                // === Attempt 2: lua_lock ===
+        bool lock_ok = false;
+        if (addrs.lock_fn) {
+            uint8_t lock_pro[32];
+            if (proc_mem_read(pid, addrs.lock_fn, lock_pro, sizeof(lock_pro))) {
+                size_t lock_steal = 0;
+                while (lock_steal < 5) {
+                    size_t il = dh_insn_len(lock_pro + lock_steal);
+                    if (il == 0 || lock_steal + il > sizeof(lock_pro)) break;
+                    lock_steal += il;
+                }
+                if (lock_steal >= 5) {
+                    LOG_INFO("[direct-hook] lua_lock prologue: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} (steal={})",
+                             lock_pro[0], lock_pro[1], lock_pro[2], lock_pro[3],
+                             lock_pro[4], lock_pro[5], lock_pro[6], lock_pro[7], lock_steal);
+                    if (try_hook_target(addrs.lock_fn, "lua_lock", lock_pro, lock_steal)) {
+                        hook_addr = addrs.lock_fn;
+                        is_lock_hook = true;
+                        lock_ok = true;
+                    }
+                } else {
+                    LOG_WARN("[direct-hook] lua_lock prologue too short ({} bytes)", lock_steal);
+                }
+            } else {
+                LOG_WARN("[direct-hook] cannot read lua_lock prologue at 0x{:X}", addrs.lock_fn);
+            }
+        } else {
+            LOG_WARN("[direct-hook] lua_lock address not available");
         }
 
-        uint8_t lock_pro[32];
-        if (!proc_mem_read(pid, addrs.lock_fn, lock_pro, sizeof(lock_pro))) {
-            LOG_ERROR("[direct-hook] cannot read lua_lock prologue");
-            return false;
-        }
-        size_t lock_steal = 0;
-        while (lock_steal < 5) {
-            size_t il = dh_insn_len(lock_pro + lock_steal);
-            if (il == 0 || lock_steal + il > sizeof(lock_pro)) {
-                LOG_ERROR("[direct-hook] cannot decode lua_lock prologue");
+        // === Attempt 3+: try other Lua API functions as hook targets ===
+        // All Lua C API functions take lua_State* L as first argument (rdi).
+        // The guard byte in the trampoline safely handles re-entrant calls:
+        // e.g. if we hook lua_resume, the trampoline's internal lua_resume call
+        // re-enters the hook but the guard skips straight to the stolen bytes.
+        if (!lock_ok) {
+            LOG_WARN("[direct-hook] lua_settop and lua_lock both failed — trying other Lua API functions");
+
+            struct { uintptr_t addr; const char* name; } lua_fallbacks[] = {
+                {addrs.resume,    "lua_resume"},
+                {addrs.newthread, "lua_newthread"},
+                {addrs.load,      "luau_load"},
+            };
+
+            bool fallback_ok = false;
+            for (auto& fb : lua_fallbacks) {
+                if (!fb.addr) continue;
+
+                uint8_t fb_pro[32];
+                if (!proc_mem_read(pid, fb.addr, fb_pro, sizeof(fb_pro))) {
+                    LOG_DEBUG("[direct-hook] cannot read {} prologue at 0x{:X}", fb.name, fb.addr);
+                    continue;
+                }
+
+                size_t fb_steal = 0;
+                while (fb_steal < 5) {
+                    size_t il = dh_insn_len(fb_pro + fb_steal);
+                    if (il == 0 || fb_steal + il > sizeof(fb_pro)) break;
+                    fb_steal += il;
+                }
+                if (fb_steal < 5) {
+                    LOG_DEBUG("[direct-hook] {} prologue too short ({} bytes)", fb.name, fb_steal);
+                    continue;
+                }
+
+                // Check if existing code cave is reachable via rel32 JMP from this target
+                int64_t cave_dist = (int64_t)cave.padding_start - (int64_t)(fb.addr + 5);
+                if ((cave_dist < INT32_MIN || cave_dist > INT32_MAX) && fb_steal < 14) {
+                    // Cave out of rel32 range and prologue too short for abs64 — find new cave
+                    LOG_INFO("[direct-hook] code cave too far from {} — searching nearby", fb.name);
+                    std::vector<MemoryRegion> fb_nearby;
+                    for (const auto& r : regions) {
+                        int64_t d = (int64_t)r.start - (int64_t)fb.addr;
+                        if (d > INT32_MIN && d < INT32_MAX) { fb_nearby.push_back(r); continue; }
+                        d = (int64_t)r.end - (int64_t)fb.addr;
+                        if (d > INT32_MIN && d < INT32_MAX) fb_nearby.push_back(r);
+                    }
+                    ExeRegionInfo fb_cave;
+                    if (!find_code_cave(pid, fb_nearby, 400, fb_cave)) {
+                        LOG_WARN("[direct-hook] no reachable code cave for {} — skipping", fb.name);
+                        continue;
+                    }
+                    cave = fb_cave;
+                    LOG_INFO("[direct-hook] new code cave at 0x{:X} ({} bytes) for {}",
+                             cave.padding_start, cave.padding_size, fb.name);
+                }
+
+                LOG_INFO("[direct-hook] trying {} at 0x{:X} (steal={}) as fallback hook target",
+                         fb.name, fb.addr, fb_steal);
+
+                if (try_hook_target(fb.addr, fb.name, fb_pro, fb_steal)) {
+                    hook_addr = fb.addr;
+                    is_lock_hook = false;
+                    fallback_ok = true;
+                    break;
+                }
+            }
+
+            if (!fallback_ok) {
+                LOG_ERROR("[direct-hook] all hook targets failed (settop, lock, resume, newthread, load) — giving up");
                 return false;
             }
-            lock_steal += il;
         }
-        LOG_INFO("[direct-hook] lua_lock prologue: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} (steal={})",
-                 lock_pro[0], lock_pro[1], lock_pro[2], lock_pro[3],
-                 lock_pro[4], lock_pro[5], lock_pro[6], lock_pro[7], lock_steal);
-
-        if (!try_hook_target(addrs.lock_fn, "lua_lock", lock_pro, lock_steal)) {
-            LOG_ERROR("[direct-hook] both lua_settop and lua_lock are dead code — giving up");
-            return false;
-        }
-
-        hook_addr = addrs.lock_fn;
-        is_lock_hook = true;
     }
 
     dhook_.cave_addr = cave.padding_start;
@@ -4299,6 +4372,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
