@@ -3055,6 +3055,138 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     }
 
     
+        // Validate lua_settop: must be a 2-arg function (saves rdi + rsi, NOT rdx)
+    if (out.settop) {
+        uint8_t st_buf[24];
+        struct iovec st_l = {st_buf, 24};
+        struct iovec st_r = {reinterpret_cast<void*>(out.settop), 24};
+        if (process_vm_readv(pid, &st_l, 1, &st_r, 1, 0) == 24) {
+            bool saves_rsi = false, saves_rdx = false;
+            for (int i = 0; i + 2 < 22; i++) {
+                // mov r/m, esi/rsi: 89 with reg=110 (0x30 mask on bits 5-3)
+                if (st_buf[i] == 0x89 && (st_buf[i+1] & 0x38) == 0x30) saves_rsi = true;
+                if ((st_buf[i]==0x48||st_buf[i]==0x49) && st_buf[i+1]==0x89 && (st_buf[i+2]&0x38)==0x30) saves_rsi = true;
+                // movsxd r64, esi: 48 63 + r/m=110
+                if (st_buf[i]==0x48 && st_buf[i+1]==0x63 && (st_buf[i+2]&0xC7)==0xC6) saves_rsi = true;
+                // mov r/m, edx/rdx: 89 with reg=010 (0x10 mask on bits 5-3)
+                if (st_buf[i] == 0x89 && (st_buf[i+1] & 0x38) == 0x10) saves_rdx = true;
+                if ((st_buf[i]==0x48||st_buf[i]==0x49) && st_buf[i+1]==0x89 && (st_buf[i+2]&0x38)==0x10) saves_rdx = true;
+            }
+            if (saves_rdx && !saves_rsi) {
+                LOG_WARN("[direct-hook] lua_settop at 0x{:X} saves rdx (3-arg function) — wrong function, clearing", out.settop);
+                out.settop = 0;
+            } else if (!saves_rsi) {
+                LOG_WARN("[direct-hook] lua_settop at 0x{:X} doesn't save rsi — may be wrong function, clearing", out.settop);
+                out.settop = 0;
+            }
+        }
+    }
+
+    // Proximity scan for lua_settop near lua_resume if not found or invalidated
+    if (!out.settop && out.resume) {
+        LOG_INFO("[direct-hook] lua_settop: proximity scan near lua_resume (±2MB)");
+        for (const auto& r : regions) {
+            if (!r.readable() || !r.executable()) continue;
+            if (out.resume < r.start || out.resume >= r.end) continue;
+
+            uintptr_t scan_lo = (out.resume > r.start + 0x200000) ? out.resume - 0x200000 : r.start;
+            uintptr_t scan_hi = std::min(out.resume + 0x200000, r.end);
+            size_t scan_sz = scan_hi - scan_lo;
+            if (scan_sz < 512) continue;
+
+            std::vector<uint8_t> code(scan_sz);
+            struct iovec st_li = {code.data(), scan_sz};
+            struct iovec st_ri = {reinterpret_cast<void*>(scan_lo), scan_sz};
+            if (process_vm_readv(pid, &st_li, 1, &st_ri, 1, 0) != (ssize_t)scan_sz) break;
+
+            int best_score = -1;
+            uintptr_t best_addr = 0;
+            size_t best_fsz = 0;
+
+            for (size_t off = 1; off + 260 < scan_sz; off++) {
+                if (code[off-1] != 0xC3 && code[off-1] != 0xCC && code[off-1] != 0x90) continue;
+                uintptr_t addr = scan_lo + off;
+                if (addr == out.resume || addr == out.newthread || addr == out.load) continue;
+
+                size_t p = off;
+                if (p+3 < scan_sz && code[p]==0xF3 && code[p+1]==0x0F && code[p+2]==0x1E && code[p+3]==0xFA) p += 4;
+                if (p >= scan_sz) continue;
+                if (!(code[p]==0x55 || code[p]==0x53 ||
+                      (code[p]==0x41 && p+1<scan_sz && code[p+1]>=0x54 && code[p+1]<=0x57)))
+                    continue;
+
+                bool saves_rdi = false, saves_rsi = false, saves_rdx = false;
+                int calls = 0, leas = 0;
+                size_t fsz = 0;
+
+                for (size_t j = 0; j < 250 && off+j+8 < scan_sz; j++) {
+                    size_t i = off + j;
+                    if (code[i] == 0xE8) calls++;
+                    if (i+6 < scan_sz && ((code[i]==0x48||code[i]==0x4C) &&
+                        code[i+1]==0x8D && (code[i+2]&0xC7)==0x05)) leas++;
+
+                    if (j < 20 && i+2 < scan_sz) {
+                        // rsi/esi saves (reg field = 110)
+                        if (code[i]==0x89 && (code[i+1]&0x38)==0x30) saves_rsi = true;
+                        if ((code[i]==0x48||code[i]==0x49) && code[i+1]==0x89 && (code[i+2]&0x38)==0x30) saves_rsi = true;
+                        if (code[i]==0x48 && code[i+1]==0x63 && (code[i+2]&0xC7)==0xC6) saves_rsi = true;
+                        // rdi saves (reg field = 111)
+                        if ((code[i]==0x48||code[i]==0x49) && code[i+1]==0x89 && (code[i+2]&0x38)==0x38) saves_rdi = true;
+                        if (code[i]==0x89 && (code[i+1]&0x38)==0x38) saves_rdi = true;
+                        // rdx saves → 3-arg, reject
+                        if (code[i]==0x89 && (code[i+1]&0x38)==0x10) saves_rdx = true;
+                        if ((code[i]==0x48||code[i]==0x49) && code[i+1]==0x89 && (code[i+2]&0x38)==0x10) saves_rdx = true;
+                    }
+
+                    if (code[i]==0xC3 && j >= 20) { fsz = j + 1; break; }
+                }
+
+                if (!saves_rdi || !saves_rsi) continue;  // must be 2-arg saving both
+                if (saves_rdx) continue;                   // reject 3-arg functions
+                if (fsz < 30 || fsz > 250 || calls < 1 || calls > 8) continue;
+
+                int score = 5;  // saves both rdi and rsi
+                if (calls >= 1 && calls <= 4) score += 2;
+                if (fsz >= 40 && fsz <= 150) score += 2;
+                if (leas == 0) score += 1;  // lua_settop has no string refs typically
+
+                // Cross-validate: shared call targets with lua_resume
+                if (out.resume && score >= 5) {
+                    uint8_t rc[1024];
+                    struct iovec rc_l = {rc, 1024};
+                    struct iovec rc_r = {reinterpret_cast<void*>(out.resume), 1024};
+                    ssize_t rrd = process_vm_readv(pid, &rc_l, 1, &rc_r, 1, 0);
+                    if (rrd >= 64) {
+                        for (size_t cj = 0; cj < fsz && off+cj+5 < scan_sz; cj++) {
+                            if (code[off+cj] != 0xE8) continue;
+                            int32_t cd; memcpy(&cd, &code[off+cj+1], 4);
+                            uintptr_t ct = scan_lo + off + cj + 5 + (int64_t)cd;
+                            for (size_t rj = 0; rj + 5 <= (size_t)rrd; rj++) {
+                                if (rc[rj] != 0xE8) continue;
+                                int32_t rd; memcpy(&rd, &rc[rj+1], 4);
+                                uintptr_t rt = out.resume + rj + 5 + (int64_t)rd;
+                                if (ct == rt) { score += 10; goto settop_xv_done; }
+                            }
+                        }
+                        settop_xv_done:;
+                    }
+                }
+
+                if (score > best_score) { best_score = score; best_addr = addr; best_fsz = fsz; }
+            }
+
+            if (best_addr && best_score >= 15) {
+                out.settop = best_addr;
+                LOG_INFO("[direct-hook] proximity: lua_settop=0x{:X} ({}B, score={}, CROSS-VALIDATED)",
+                         best_addr, best_fsz, best_score);
+            } else if (best_addr) {
+                LOG_WARN("[direct-hook] proximity lua_settop candidate 0x{:X} rejected (score={})",
+                         best_addr, best_score);
+            }
+            break;
+        }
+    }
+
     if (!out.resume || !out.load || !out.settop) {
         LOG_ERROR("[direct-hook] missing required functions: resume={:#x} load={:#x} settop={:#x}",
                   out.resume, out.load, out.settop);
@@ -4035,6 +4167,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
