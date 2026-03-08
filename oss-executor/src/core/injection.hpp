@@ -196,6 +196,7 @@ private:
         uintptr_t cave_addr    = 0;
         uintptr_t mailbox_addr = 0;
         uintptr_t resume_addr  = 0;
+        uintptr_t newthread_addr = 0;
         size_t    cave_size    = 0;
         size_t    stolen_len   = 0;
         uint8_t   stolen_bytes[32] = {};
@@ -214,6 +215,7 @@ private:
 };
 
 }
+
 
 
 
