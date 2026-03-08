@@ -3076,94 +3076,106 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 //   HANDLER: Fires AFTER lua_resume returns (lua_lock RELEASED).
 //            Creates thread, loads bytecode, executes, cleans up.
 // ═══════════════════════════════════════════════════════════════════
-template<typename AddrsType>
+template <typename AddrsType>
 static std::vector<uint8_t> gen_entry_trampoline(
-    const AddrsType& a, uintptr_t mailbox_addr, uintptr_t cave_addr,
-    const uint8_t* stolen, size_t stolen_len)
+    const AddrsType& a, uintptr_t mailbox_addr,
+    uintptr_t cave_addr, const uint8_t* stolen, size_t stolen_len)
 {
     std::vector<uint8_t> c;
     c.reserve(512);
-    auto e  = [&](std::initializer_list<uint8_t> b){ c.insert(c.end(), b); };
+    auto e = [&](std::initializer_list<uint8_t> b){ c.insert(c.end(), b); };
     auto e8 = [&](uint8_t v){ c.push_back(v); };
     auto e32= [&](uint32_t v){ for(int i=0;i<4;i++) c.push_back((v>>(i*8))&0xFF); };
     auto e64= [&](uint64_t v){ for(int i=0;i<8;i++) c.push_back((v>>(i*8))&0xFF); };
 
-    e8(0x9C);
-    e8(0x50); e8(0x51); e8(0x52); e8(0x56); e8(0x57);
-    e({0x41,0x50}); e({0x41,0x51}); e({0x41,0x52}); e({0x41,0x53});
-    e8(0x53); e({0x41,0x56}); e({0x41,0x57});
-    e8(0x55); e({0x48,0x89,0xE5}); e({0x48,0x83,0xE4,0xF0});
+    // === SAVE ALL REGISTERS (including rdi=L and esi=idx for lua_settop) ===
+    e8(0x9C); // pushfq
+    e8(0x50); e8(0x51); e8(0x52); e8(0x56); e8(0x57); // push rax,rcx,rdx,rsi,rdi
+    e({0x41,0x50}); e({0x41,0x51}); e({0x41,0x52}); e({0x41,0x53}); // push r8-r11
+    e8(0x53); // push rbx
+    e({0x41,0x56}); e({0x41,0x57}); // push r14, r15
+    e8(0x55); // push rbp
+    e({0x48,0x89,0xE5});           // mov rbp, rsp
+    e({0x48,0x83,0xE4,0xF0});     // and rsp, -16 (align)
 
+    // rbx = mailbox base address
     e({0x48,0xBB}); e64(mailbox_addr);
 
-    e({0x80,0x7B,0x28,0x00});
-    size_t j_guard = c.size(); e({0x0F,0x85}); e32(0);
+    // --- Guard check: if guard != 0, skip (re-entrant call) ---
+    e({0x80,0x7B,0x28,0x00});     // cmp byte [rbx+0x28], 0
+    size_t j_guard = c.size();
+    e({0x0F,0x85}); e32(0);       // jnz -> skip_label
 
-    e({0x48,0x8B,0x43,0x10});
-    e({0x48,0x3B,0x43,0x18});
-    size_t j_seq = c.size(); e({0x0F,0x86}); e32(0);
+    // --- Sequence check: if seq <= ack, skip (no new data) ---
+    e({0x48,0x8B,0x43,0x10});     // mov rax, [rbx+0x10] (seq)
+    e({0x48,0x3B,0x43,0x18});     // cmp rax, [rbx+0x18] (ack)
+    size_t j_seq = c.size();
+    e({0x0F,0x86}); e32(0);       // jbe -> skip_label
 
-    e({0xC6,0x43,0x28,0x01});
+    // --- Set guard to prevent re-entry ---
+    e({0xC6,0x43,0x28,0x01});     // mov byte [rbx+0x28], 1
 
-    e({0x49,0x89,0xFF});
-    e({0x48,0x85,0xF6});
-    e({0x74,0x03});
-    e({0x49,0x89,0xF7});
+    // --- Save lua_State* from rdi (lua_settop's first arg) into r15 ---
+    e({0x49,0x89,0xFF});           // mov r15, rdi
 
-    e({0xC7,0x43,0x2C,0x01,0x00,0x00,0x00});
-    e({0x4C,0x89,0xFF});
-    e({0xBE,0xFF,0xFF,0xFF,0xFF});
-    e({0x48,0xB8}); e64(a.settop);
-    e({0xFF,0xD0});
-
+    // === STEP 1: lua_newthread(L) — create new thread ===
     size_t j_nt_fail = SIZE_MAX;
     if (a.newthread) {
-        e({0xC7,0x43,0x2C,0x02,0x00,0x00,0x00});
-        e({0x4C,0x89,0xFF});
+        e({0xC7,0x43,0x2C,0x01,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 1
+        e({0x4C,0x89,0xFF});       // mov rdi, r15  (L)
         e({0x48,0xB8}); e64(a.newthread);
-        e({0xFF,0xD0});
-        e({0x49,0x89,0xC6});
-        e({0x4D,0x85,0xF6});
-        j_nt_fail = c.size(); e({0x0F,0x84}); e32(0);
+        e({0xFF,0xD0});            // call lua_newthread
+        e({0x49,0x89,0xC6});       // mov r14, rax  (new thread)
+        e({0x4D,0x85,0xF6});       // test r14, r14
+        j_nt_fail = c.size();
+        e({0x0F,0x84}); e32(0);   // jz -> ack_label (newthread failed)
     } else {
-        e({0xC7,0x43,0x2C,0x02,0x00,0x00,0x00});
-        e({0x4D,0x89,0xFE});
+        e({0xC7,0x43,0x2C,0x01,0x00,0x00,0x00}); // step=1
+        e({0x4D,0x89,0xFE});       // mov r14, r15 (use parent thread)
     }
 
-    e({0xC7,0x43,0x2C,0x03,0x00,0x00,0x00});
-    e({0x4C,0x89,0xF7});
+    // === STEP 2: luau_load(thread, chunkname, data, size, env=0) ===
+    e({0xC7,0x43,0x2C,0x02,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 2
+    e({0x4C,0x89,0xF7});           // mov rdi, r14 (thread)
     size_t chunk_movabs = c.size();
-    e({0x48,0xBE}); e64(0);
-    e({0x48,0x8D,0x53,0x40});
-    e({0x8B,0x4B,0x20});
-    e({0x45,0x31,0xC0});
+    e({0x48,0xBE}); e64(0);        // mov rsi, <chunk_name_addr> (patched below)
+    e({0x48,0x8D,0x53,0x40});     // lea rdx, [rbx+0x40] (data)
+    e({0x8B,0x4B,0x20});          // mov ecx, [rbx+0x20] (data_size)
+    e({0x45,0x31,0xC0});          // xor r8d, r8d (env=0)
     e({0x48,0xB8}); e64(a.load);
-    e({0xFF,0xD0});
-    e({0x85,0xC0});
-    size_t j_load_fail = c.size(); e({0x0F,0x85}); e32(0);
+    e({0xFF,0xD0});                // call luau_load
+    e({0x85,0xC0});                // test eax, eax
+    size_t j_load_fail = c.size();
+    e({0x0F,0x85}); e32(0);       // jnz -> settop_label (load failed)
 
-    e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00});
-    e({0x4C,0x89,0xF7});
-    e({0x31,0xF6});
-    e({0x31,0xD2});
-    e({0x48,0xB8}); e64(a.resume);
-    e({0xFF,0xD0});
+    // === STEP 3: lua_resume(thread, NULL, 0) ===
+    e({0xC7,0x43,0x2C,0x03,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 3
+    e({0x4C,0x89,0xF7});           // mov rdi, r14 (thread)
+    e({0x31,0xF6});                // xor esi, esi (from=NULL)
+    e({0x31,0xD2});                // xor edx, edx (nresults=0)
+    e({0x48,0xB8}); e64(a.resume); // lua_resume is NOT hooked, call directly
+    e({0xFF,0xD0});                // call lua_resume
 
+    // === STEP 4: cleanup — lua_settop(L, -2) to pop the new thread ===
     size_t settop_label = c.size();
-    e({0xC7,0x43,0x2C,0x05,0x00,0x00,0x00});
-    e({0x4C,0x89,0xFF});
-    e({0xBE,0xFE,0xFF,0xFF,0xFF});
+    e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 4
+    e({0x4C,0x89,0xFF});           // mov rdi, r15 (original L)
+    e({0xBE,0xFE,0xFF,0xFF,0xFF}); // mov esi, -2
+    // Call lua_settop via its ORIGINAL address (will re-enter hook,
+    // but guard byte is set so it skips straight to stolen bytes)
     e({0x48,0xB8}); e64(a.settop);
-    e({0xFF,0xD0});
+    e({0xFF,0xD0});                // call lua_settop
 
+    // === STEP 5: acknowledge — set ack = seq, clear guard ===
     size_t ack_label = c.size();
-    e({0x48,0x8B,0x43,0x10});
-    e({0x48,0x89,0x43,0x18});
-    e({0xC7,0x43,0x2C,0x06,0x00,0x00,0x00});
-    e({0xC6,0x43,0x28,0x00});
-    size_t skip_label = c.size();
+    e({0x48,0x8B,0x43,0x10});     // mov rax, [rbx+0x10] (seq)
+    e({0x48,0x89,0x43,0x18});     // mov [rbx+0x18], rax (ack = seq)
+    e({0xC7,0x43,0x2C,0x05,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 5
+    e({0xC6,0x43,0x28,0x00});     // mov byte [rbx+0x28], 0 (clear guard)
 
-    auto patch_j = [&](size_t off, size_t target){
+    // === Skip label — restore registers and execute stolen bytes ===
+    size_t skip_label = c.size();
+    auto patch_j = [&](size_t off, size_t target) {
         int32_t r = static_cast<int32_t>(target - (off + 4));
         memcpy(&c[off], &r, 4);
     };
@@ -3173,24 +3185,31 @@ static std::vector<uint8_t> gen_entry_trampoline(
         patch_j(j_nt_fail + 2, ack_label);
     patch_j(j_load_fail + 2, settop_label);
 
-    e({0x48,0x89,0xEC}); e8(0x5D);
-    e({0x41,0x5F}); e({0x41,0x5E}); e8(0x5B);
-    e({0x41,0x5B}); e({0x41,0x5A}); e({0x41,0x59}); e({0x41,0x58});
-    e8(0x5F); e8(0x5E); e8(0x5A); e8(0x59); e8(0x58); e8(0x9D);
+    // Restore stack and all registers
+    e({0x48,0x89,0xEC}); e8(0x5D); // mov rsp, rbp; pop rbp
+    e({0x41,0x5F}); e({0x41,0x5E}); e8(0x5B);       // pop r15, r14, rbx
+    e({0x41,0x5B}); e({0x41,0x5A}); e({0x41,0x59}); e({0x41,0x58}); // pop r11-r8
+    e8(0x5F); e8(0x5E); e8(0x5A); e8(0x59); e8(0x58); // pop rdi,rsi,rdx,rcx,rax
+    e8(0x9D); // popfq
 
+        // Execute the stolen prologue bytes from lua_settop
     for (size_t i = 0; i < stolen_len; i++) e8(stolen[i]);
 
-    uintptr_t resume_cont = a.resume + stolen_len;
-    int64_t jd = (int64_t)resume_cont - (int64_t)(cave_addr + c.size() + 5);
+    // Jump back to lua_settop + stolen_len to continue original function
+    uintptr_t settop_cont = a.settop + stolen_len;
+    int64_t jd = (int64_t)settop_cont - (int64_t)(cave_addr + c.size() + 5);
     if (jd >= INT32_MIN && jd <= INT32_MAX) {
         e8(0xE9); e32((uint32_t)(int32_t)jd);
     } else {
-        e({0xFF,0x25,0x00,0x00,0x00,0x00}); e64(resume_cont);
+        e({0xFF,0x25,0x00,0x00,0x00,0x00});
+        e64(settop_cont);
     }
 
+    // Chunk name string "=oss" embedded in cave
     size_t chunk_name_label = c.size();
-    e({0x3D,0x6F,0x73,0x73,0x00});
+    e({0x3D,0x6F,0x73,0x73,0x00}); // "=oss\0"
 
+    // Patch the chunk name movabs to point here
     uintptr_t chunk_abs = cave_addr + chunk_name_label;
     memcpy(&c[chunk_movabs + 2], &chunk_abs, 8);
 
@@ -3251,21 +3270,29 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         }
     }
 
-    uint8_t prologue[32];
-    if (!proc_mem_read(pid, addrs.resume, prologue, sizeof(prologue))) {
-        LOG_ERROR("[direct-hook] cannot read lua_resume prologue");
+       // Hook lua_settop instead of lua_resume — settop is called constantly
+    // by every Lua operation, unlike lua_resume which Roblox may never call
+    if (!addrs.settop) {
+        LOG_ERROR("[direct-hook] lua_settop not found — cannot hook");
         return false;
     }
+
+    uint8_t prologue[32];
+    if (!proc_mem_read(pid, addrs.settop, prologue, sizeof(prologue))) {
+        LOG_ERROR("[direct-hook] cannot read lua_settop prologue");
+        return false;
+    }
+
     size_t steal = 0;
     while (steal < 5) {
         size_t il = dh_insn_len(prologue + steal);
         if (il == 0 || steal + il > sizeof(prologue)) {
-            LOG_ERROR("[direct-hook] cannot decode lua_resume prologue at offset {}", steal);
+            LOG_ERROR("[direct-hook] cannot decode lua_settop prologue at offset {}", steal);
             return false;
         }
         steal += il;
     }
-    LOG_INFO("[direct-hook] stealing {} bytes from lua_resume prologue", steal);
+    LOG_INFO("[direct-hook] stealing {} bytes from lua_settop prologue", steal);
 
     {
         auto dump = [&](const char* name, uintptr_t addr) {
@@ -3274,42 +3301,50 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             LOG_INFO("[direct-hook] {} prologue: "
                      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
                      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-                     name, p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+                     name,
+                     p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
                      p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
         };
+        dump("lua_settop", addrs.settop);
         dump("lua_resume", addrs.resume);
         dump("lua_newthread", addrs.newthread);
     }
 
     std::vector<MemoryRegion> nearby;
     for (const auto& r : regions) {
-        int64_t d = (int64_t)r.start - (int64_t)addrs.resume;
-        if (d > INT32_MIN && d < INT32_MAX) { nearby.push_back(r); continue; }
-        d = (int64_t)r.end - (int64_t)addrs.resume;
-        if (d > INT32_MIN && d < INT32_MAX) nearby.push_back(r);
+        int64_t d = (int64_t)r.start - (int64_t)addrs.settop;
+        if (d > INT32_MIN && d < INT32_MAX) {
+            nearby.push_back(r);
+            continue;
+        }
+        d = (int64_t)r.end - (int64_t)addrs.settop;
+        if (d > INT32_MIN && d < INT32_MAX)
+            nearby.push_back(r);
     }
 
     ExeRegionInfo cave;
     if (!find_code_cave(pid, nearby, 400, cave)) {
-        LOG_ERROR("[direct-hook] no code cave within +/-2GB of lua_resume");
+        LOG_ERROR("[direct-hook] no code cave within +/-2GB of lua_settop");
         return false;
     }
-    LOG_INFO("[direct-hook] code cave at 0x{:X} ({} bytes)", cave.padding_start, cave.padding_size);
+    LOG_INFO("[direct-hook] code cave at 0x{:X} ({} bytes)",
+             cave.padding_start, cave.padding_size);
 
-    auto tramp = gen_entry_trampoline(addrs, mb_addr, cave.padding_start, prologue, steal);
+    auto tramp = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
+                                      prologue, steal);
     LOG_INFO("[direct-hook] entry trampoline: {} bytes", tramp.size());
     if (tramp.size() > 400) {
         LOG_ERROR("[direct-hook] trampoline too large: {} bytes", tramp.size());
         return false;
     }
-
     if (!proc_mem_write(pid, cave.padding_start, tramp.data(), tramp.size())) {
         LOG_ERROR("[direct-hook] failed to write trampoline");
         return false;
     }
 
-    uint8_t patch[16]; size_t patch_len;
-    int64_t hook_disp = (int64_t)cave.padding_start - (int64_t)(addrs.resume + 5);
+    uint8_t patch[16];
+    size_t patch_len;
+    int64_t hook_disp = (int64_t)cave.padding_start - (int64_t)(addrs.settop + 5);
     if (hook_disp >= INT32_MIN && hook_disp <= INT32_MAX && steal >= 5) {
         patch[0] = 0xE9;
         int32_t rel = (int32_t)hook_disp;
@@ -3322,34 +3357,34 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         memcpy(patch + 6, &cave.padding_start, 8);
         patch_len = 14;
     } else {
-        LOG_ERROR("[direct-hook] cannot encode jump (steal={} disp={})", steal, hook_disp);
+        LOG_ERROR("[direct-hook] cannot encode jump (steal={} disp={})",
+                  steal, hook_disp);
         return false;
     }
 
-    if (!proc_mem_write(pid, addrs.resume, patch, patch_len)) {
-        LOG_ERROR("[direct-hook] failed to patch lua_resume");
+    if (!proc_mem_write(pid, addrs.settop, patch, patch_len)) {
+        LOG_ERROR("[direct-hook] failed to patch lua_settop");
         return false;
     }
 
-    dhook_.cave_addr = cave.padding_start;
-    dhook_.mailbox_addr = mb_addr;
-    dhook_.cave_size = tramp.size();
-    dhook_.stolen_len = steal;
-    dhook_.resume_addr = addrs.resume;
-    dhook_.newthread_addr = addrs.newthread;
-    dhook_.load_addr = addrs.load;
+    dhook_.cave_addr       = cave.padding_start;
+    dhook_.mailbox_addr    = mb_addr;
+    dhook_.cave_size       = tramp.size();
+    dhook_.stolen_len      = steal;
+    dhook_.resume_addr     = addrs.settop;  // store hooked addr for cleanup
+    dhook_.newthread_addr  = addrs.newthread;
+    dhook_.load_addr       = addrs.load;
     memcpy(dhook_.stolen_bytes, prologue, steal);
     memcpy(dhook_.orig_patch, prologue, patch_len);
-    dhook_.patch_len = patch_len;
-    dhook_.active = true;
-    dhook_.has_compile = (addrs.compile != 0);
+    dhook_.patch_len       = patch_len;
+    dhook_.active          = true;
+    dhook_.has_compile     = (addrs.compile != 0);
 
-    LOG_INFO("[direct-hook] ENTRY HOOK ARMED — lua_resume at 0x{:X}, "
-             "cave at 0x{:X}, mailbox at 0x{:X}",
-             addrs.resume, cave.padding_start, mb_addr);
+    LOG_INFO("[direct-hook] ENTRY HOOK ARMED — lua_settop at 0x{:X}, "
+             "lua_resume at 0x{:X}, cave at 0x{:X}, mailbox at 0x{:X}",
+             addrs.settop, addrs.resume, cave.padding_start, mb_addr);
     set_state(InjectionState::Ready, "Direct hook active — ready for scripts");
     return true;
-}
 
 void Injection::cleanup_direct_hook() {
     if (!dhook_.active) return;
@@ -3440,6 +3475,7 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     bypass_locks_in(dhook_.newthread_addr, 18, 200, "newthread");
     bypass_locks_in(dhook_.load_addr, 30, 500, "luau_load");
     bypass_locks_in(dhook_.resume_addr, 30, 500, "lua_resume");
+    bypass_locks_in(addrs.settop ? addrs.settop : dhook_.resume_addr, 30, 300, "lua_settop");
 
     uint64_t new_seq = seq + 1;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) return false;
@@ -3467,13 +3503,12 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         }
         if (kill(pid, 0) != 0) {
             const char* desc =
-                step == 0 ? "entry hook never triggered (lua_resume not called?)" :
-                step == 1 ? "lua_settop probe hung — VM lock held by scheduler" :
-                step == 2 ? "lock OK — lua_newthread hung (WRONG FUNCTION identified)" :
-                step == 3 ? "lua_newthread OK — crashed at/during luau_load" :
-                step == 4 ? "luau_load OK — crashed at/during lua_resume (inner)" :
-                step == 5 ? "inner resume OK — crashed during lua_settop cleanup" :
-                step == 6 ? "execution complete — crashed after ack" :
+                step == 0 ? "entry hook never triggered (lua_settop not called?)" :
+                step == 1 ? "lua_newthread hung (lock contention or wrong function)" :
+                step == 2 ? "luau_load hung or crashed" :
+                step == 3 ? "lua_resume (inner) hung or crashed" :
+                step == 4 ? "lua_settop cleanup hung" :
+                step == 5 ? "execution complete — crashed after ack" :
                 "unknown step";
             LOG_ERROR("[direct-hook] TARGET DIED at step {}: {}", step, desc);
             break;
@@ -3484,24 +3519,25 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         uint8_t final_guard = 0;
         proc_mem_read(pid, dhook_.mailbox_addr + 40, &final_guard, 1);
         if (last_step == 0 && final_guard == 0) {
-            LOG_WARN("[direct-hook] TIMEOUT: hook never fired (lua_resume not called during 3s window)");
+            LOG_WARN("[direct-hook] TIMEOUT: hook never fired (lua_settop not called during 3s window)");
         } else if (last_step == 1) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 1: lua_settop lock probe HUNG — VM lock held by scheduler");
-        } else if (last_step == 2) {
             if (lock_bypassed) {
-                LOG_WARN("[direct-hook] TIMEOUT at step 2: lock bypass applied but lua_newthread at 0x{:X} STILL hung — function may not be lua_newthread, or internal alloc/GC blocked", dhook_.newthread_addr);
+                LOG_WARN("[direct-hook] TIMEOUT at step 1: lock bypass applied but lua_newthread at 0x{:X} STILL hung",
+                         dhook_.newthread_addr);
             } else {
-                LOG_WARN("[direct-hook] TIMEOUT at step 2: lua_newthread at 0x{:X} hung (no lock bypass available)", dhook_.newthread_addr);
+                LOG_WARN("[direct-hook] TIMEOUT at step 1: lua_newthread at 0x{:X} hung (no lock bypass available)",
+                         dhook_.newthread_addr);
             }
-        } else if (last_step == 3) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 3: lua_newthread OK — luau_load at 0x{:X} hung (lock bypass covered {} functions)",
+        } else if (last_step == 2) {
+            LOG_WARN("[direct-hook] TIMEOUT at step 2: lua_newthread OK — luau_load at 0x{:X} hung (lock bypass covered {} functions)",
                      dhook_.load_addr, lock_patches.size());
+        } else if (last_step == 3) {
+            LOG_WARN("[direct-hook] TIMEOUT at step 3: luau_load OK — inner lua_resume hung");
         } else if (last_step == 4) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 4: luau_load OK — inner lua_resume hung");
-        } else if (last_step == 5) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 5: inner resume OK — lua_settop cleanup hung");
+            LOG_WARN("[direct-hook] TIMEOUT at step 4: lua_resume OK — lua_settop cleanup hung");
         } else {
-            LOG_WARN("[direct-hook] TIMEOUT at step {} guard={} — hung during execution", last_step, final_guard);
+            LOG_WARN("[direct-hook] TIMEOUT at step {} guard={} — hung during execution",
+                     last_step, final_guard);
         }
     }
 
@@ -3995,6 +4031,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
