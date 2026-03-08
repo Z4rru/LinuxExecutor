@@ -3386,6 +3386,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
              addrs.settop, addrs.resume, cave.padding_start, mb_addr);
     set_state(InjectionState::Ready, "Direct hook active — ready for scripts");
     return true;
+}
 
 void Injection::cleanup_direct_hook() {
     if (!dhook_.active) return;
@@ -4034,6 +4035,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
