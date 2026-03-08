@@ -3371,7 +3371,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     dhook_.mailbox_addr    = mb_addr;
     dhook_.cave_size       = tramp.size();
     dhook_.stolen_len      = steal;
-    dhook_.resume_addr     = addrs.settop;  // store hooked addr for cleanup
+    dhook_.resume_addr     = addrs.resume;  // keep for lock bypass
+    dhook_.settop_addr     = addrs.settop;  // hooked function for cleanup
     dhook_.newthread_addr  = addrs.newthread;
     dhook_.load_addr       = addrs.load;
     memcpy(dhook_.stolen_bytes, prologue, steal);
@@ -3390,8 +3391,9 @@ void Injection::cleanup_direct_hook() {
     if (!dhook_.active) return;
     pid_t pid = memory_.get_pid();
     if (pid > 0 && kill(pid, 0) == 0) {
-        if (dhook_.resume_addr && dhook_.stolen_len > 0) {
-            proc_mem_write(pid, dhook_.resume_addr,
+        uintptr_t hook_addr = dhook_.settop_addr ? dhook_.settop_addr : dhook_.resume_addr;
+        if (hook_addr && dhook_.stolen_len > 0) {
+            proc_mem_write(pid, hook_addr,
                            dhook_.stolen_bytes, dhook_.stolen_len);
         }
         DirectMailbox mb{};
@@ -3475,6 +3477,7 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     bypass_locks_in(dhook_.newthread_addr, 18, 200, "newthread");
     bypass_locks_in(dhook_.load_addr, 30, 500, "luau_load");
     bypass_locks_in(dhook_.resume_addr, 30, 500, "lua_resume");
+    bypass_locks_in(dhook_.settop_addr, 30, 300, "lua_settop");
     bypass_locks_in(addrs.settop ? addrs.settop : dhook_.resume_addr, 30, 300, "lua_settop");
 
     uint64_t new_seq = seq + 1;
@@ -4031,6 +4034,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
