@@ -412,6 +412,9 @@ void Injection::adopt_target(pid_t pid, const std::string& via) {
         return;
     }
 
+    if (dhook_.active && memory_.get_pid() > 0 && memory_.get_pid() != pid)
+        cleanup_direct_hook();
+
     memory_.set_pid(pid);
     proc_info_ = gather_info(pid);
     set_state(InjectionState::Found,
@@ -3148,6 +3151,10 @@ static std::vector<uint8_t> gen_entry_trampoline(
 }
 
 bool Injection::inject_via_direct_hook(pid_t pid) {
+    if (dhook_.active) {
+        LOG_INFO("[direct-hook] already active, skipping re-hook for PID {}", pid);
+        return true;
+    }
     LOG_INFO("[direct-hook] starting for PID {}", pid);
 
     DirectHookAddrs addrs;
@@ -3378,7 +3385,13 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
 bool Injection::inject() {
     if (!attach()) return false;
 
+    if (dhook_.active && payload_loaded_ && process_alive()) {
+        LOG_INFO("[inject] direct hook already active for PID {}", memory_.get_pid());
+        return true;
+    }
+
     if (!process_alive()) {
+        cleanup_direct_hook();
         set_state(InjectionState::Failed, "Process died during injection");
         memory_.set_pid(0);
         return false;
@@ -3825,6 +3838,7 @@ void Injection::start_auto_scan() {
         while (scanning_.load()) {
             if (memory_.is_valid() && !process_alive()) {
                 LOG_WARN("Target process exited, resetting");
+                cleanup_direct_hook();
                 mode_            = InjectionMode::None;
                 vm_marker_addr_  = 0;
                 vm_scan_         = {};
@@ -3849,6 +3863,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
