@@ -198,7 +198,8 @@ private:
         uintptr_t resume_addr  = 0;
         uintptr_t newthread_addr = 0;
         uintptr_t load_addr = 0;
-        size_t    cave_size    = 0;
+        uintptr_t settop_addr = 0;
+        size_t cave_size = 0;
         size_t    stolen_len   = 0;
         uint8_t   stolen_bytes[32] = {};
         uint8_t   orig_patch[32]   = {};
@@ -216,6 +217,7 @@ private:
 };
 
 }
+
 
 
 
