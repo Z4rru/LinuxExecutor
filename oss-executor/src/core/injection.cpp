@@ -3336,6 +3336,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     dhook_.cave_size = tramp.size();
     dhook_.stolen_len = steal;
     dhook_.resume_addr = addrs.resume;
+    dhook_.newthread_addr = addrs.newthread;
     memcpy(dhook_.stolen_bytes, prologue, steal);
     memcpy(dhook_.orig_patch, prologue, patch_len);
     dhook_.patch_len = patch_len;
@@ -3394,10 +3395,48 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     proc_mem_write(pid, dhook_.mailbox_addr + 44, &zero_step, 4);
     uint8_t zero_guard = 0;
     proc_mem_write(pid, dhook_.mailbox_addr + 40, &zero_guard, 1);
+
+    uintptr_t lock_fn = 0, unlock_fn = 0;
+    uint8_t lock_save = 0, unlock_save = 0;
+    bool lock_bypassed = false;
+    if (dhook_.newthread_addr) {
+        uint8_t ntb[200];
+        if (proc_mem_read(pid, dhook_.newthread_addr, ntb, 200)) {
+            for (int i = 0; i < 18; i++) {
+                if (ntb[i] == 0xE8) {
+                    int32_t d; memcpy(&d, &ntb[i+1], 4);
+                    lock_fn = dhook_.newthread_addr + i + 5 + (int64_t)d;
+                    break;
+                }
+            }
+            for (int i = 195; i >= 20; i--) {
+                if (ntb[i] == 0xE8) {
+                    int32_t d; memcpy(&d, &ntb[i+1], 4);
+                    unlock_fn = dhook_.newthread_addr + i + 5 + (int64_t)d;
+                    break;
+                }
+            }
+            if (lock_fn) {
+                proc_mem_read(pid, lock_fn, &lock_save, 1);
+                uint8_t ret = 0xC3;
+                if (proc_mem_write(pid, lock_fn, &ret, 1)) {
+                    lock_bypassed = true;
+                    LOG_INFO("[direct-hook] bypassed lua_lock at 0x{:X} (saved 0x{:02X})", lock_fn, lock_save);
+                }
+            }
+            if (unlock_fn && unlock_fn != lock_fn) {
+                proc_mem_read(pid, unlock_fn, &unlock_save, 1);
+                uint8_t ret = 0xC3;
+                proc_mem_write(pid, unlock_fn, &ret, 1);
+                LOG_INFO("[direct-hook] bypassed lua_unlock at 0x{:X} (saved 0x{:02X})", unlock_fn, unlock_save);
+            }
+        }
+    }
+
     uint64_t new_seq = seq + 1;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) return false;
 
-    LOG_INFO("[direct-hook] sent {} bytes via mailbox (seq={})", len, new_seq);
+    LOG_INFO("[direct-hook] sent {} bytes via mailbox (seq={} lock_bypass={})", len, new_seq, lock_bypassed);
 
     bool consumed = false;
     uint32_t last_step = 0;
@@ -3439,12 +3478,30 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         if (last_step == 0 && final_guard == 0) {
             LOG_WARN("[direct-hook] TIMEOUT: hook never fired (lua_resume not called during 3s window)");
         } else if (last_step == 1) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 1: lua_settop lock probe HUNG — VM lock held by scheduler, Lua API cannot be called from this context");
+            LOG_WARN("[direct-hook] TIMEOUT at step 1: lua_settop lock probe HUNG — VM lock held by scheduler");
         } else if (last_step == 2) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 2: lua_settop OK but lua_newthread HUNG — function at 0x{:X} is NOT lua_newthread (misidentified by proximity scan)", dhook_.resume_addr);
+            if (lock_bypassed) {
+                LOG_WARN("[direct-hook] TIMEOUT at step 2: lock bypass applied but lua_newthread at 0x{:X} STILL hung — function may not be lua_newthread, or internal alloc/GC blocked", dhook_.newthread_addr);
+            } else {
+                LOG_WARN("[direct-hook] TIMEOUT at step 2: lua_newthread at 0x{:X} hung (no lock bypass available)", dhook_.newthread_addr);
+            }
+        } else if (last_step == 3) {
+            LOG_WARN("[direct-hook] TIMEOUT at step 3: lua_newthread OK — luau_load hung or crashed");
+        } else if (last_step == 4) {
+            LOG_WARN("[direct-hook] TIMEOUT at step 4: luau_load OK — inner lua_resume hung");
+        } else if (last_step == 5) {
+            LOG_WARN("[direct-hook] TIMEOUT at step 5: inner resume OK — lua_settop cleanup hung");
         } else {
             LOG_WARN("[direct-hook] TIMEOUT at step {} guard={} — hung during execution", last_step, final_guard);
         }
+    }
+
+    if (lock_bypassed) {
+        if (lock_fn)
+            proc_mem_write(pid, lock_fn, &lock_save, 1);
+        if (unlock_fn && unlock_fn != lock_fn)
+            proc_mem_write(pid, unlock_fn, &unlock_save, 1);
+        LOG_INFO("[direct-hook] restored lua_lock/unlock originals");
     }
 
     return true;
@@ -3931,6 +3988,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
