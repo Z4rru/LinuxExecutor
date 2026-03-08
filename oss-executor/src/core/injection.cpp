@@ -3484,6 +3484,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
     uintptr_t hook_addr = addrs.settop;
     bool is_lock_hook = false;
+    size_t patch_len = 0;
+    uint8_t patch[16] = {};
 
     auto try_hook_target = [&](uintptr_t target, const char* name,
                                 uint8_t* pro, size_t st) -> bool {
@@ -4279,6 +4281,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
