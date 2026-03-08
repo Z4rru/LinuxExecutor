@@ -3745,8 +3745,19 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     std::vector<LockPatch> lock_patches;
     bool lock_bypassed = false;
 
+    // dhook_.settop_addr stores the actual hook target (may be lua_resume,
+    // lua_settop, or lua_lock depending on which succeeded). Its prologue
+    // is patched with a JMP — scanning it for CALL instructions finds garbage.
+    uintptr_t hook_target_addr = dhook_.settop_addr;
+
     auto bypass_locks_in = [&](uintptr_t fn_addr, int first_range, int scan_range, const char* name) {
         if (!fn_addr) return;
+        // Skip the hooked function — its prologue is overwritten with JMP,
+        // so CALL scanning would find false positives or miss the real lock
+        if (fn_addr == hook_target_addr) {
+            LOG_DEBUG("[direct-hook] skipping lock bypass for {} at 0x{:X} (hook target)", name, fn_addr);
+            return;
+        }
         std::vector<uint8_t> buf(scan_range);
         if (!proc_mem_read(pid, fn_addr, buf.data(), scan_range)) return;
         uintptr_t targets[2] = {0, 0};
@@ -3764,8 +3775,18 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                 break;
             }
         }
+        // Require BOTH lock and unlock found — partial bypass causes deadlock
+        // (lock acquired but never released → all threads freeze)
+        if (!targets[0] || !targets[1]) {
+            LOG_WARN("[direct-hook] {}: only found {} — skipping bypass to avoid deadlock",
+                     name, targets[0] ? "lock only" : (targets[1] ? "unlock only" : "neither"));
+            return;
+        }
+        if (targets[0] == targets[1]) {
+            LOG_WARN("[direct-hook] {} lock==unlock at 0x{:X} — false positive, skipping", name, targets[0]);
+            return;
+        }
         for (int t = 0; t < 2; t++) {
-            if (!targets[t]) continue;
             bool dup = false;
             for (auto& p : lock_patches) if (p.addr == targets[t]) { dup = true; break; }
             if (dup) continue;
@@ -3782,11 +3803,15 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     };
 
     if (!dhook_.hook_is_lock_fn) {
-        // Standard lock bypass for lua_settop hook
+        // Bypass locks in functions the trampoline calls internally.
+        // The hook target itself is skipped by the lambda (prologue is patched).
+        // Increased first_range to 80 to catch lua_lock calls beyond short prologues.
         bypass_locks_in(dhook_.newthread_addr, 18, 200, "newthread");
-        bypass_locks_in(dhook_.load_addr, 30, 500, "luau_load");
-        bypass_locks_in(dhook_.resume_addr, 30, 500, "lua_resume");
-        bypass_locks_in(dhook_.settop_addr, 30, 300, "lua_settop");
+        bypass_locks_in(dhook_.load_addr, 80, 500, "luau_load");
+        bypass_locks_in(dhook_.resume_addr, 80, 500, "lua_resume");
+        // NOTE: dhook_.settop_addr is the hook target, NOT necessarily lua_settop.
+        // The lambda skips it via the hook_target_addr check. Do not add a
+        // separate settop bypass here — we don't have the real lua_settop address.
     } else {
         // lua_lock hook: guard byte handles all reentrancy naturally.
         // DO NOT bypass — writing RET to lua_lock would destroy our hook!
@@ -4372,6 +4397,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
