@@ -176,10 +176,11 @@ private:
         uint32_t data_size;   // +32
         uint32_t flags;       // +36
         uint8_t guard;        // +40
-        uint8_t pending;      // +41  Phase1 sets to 1, Phase2 clears
-        uint8_t pad[6];       // +42  (step diagnostic lives at +44)
-        uint64_t saved_L;     // +48  parent lua_State* captured by Phase1
-        char data[16328];     // +56  bytecode payload
+        uint8_t pending;      // +41  entry sets to 1, epilogue clears
+        uint8_t pad[6];       // +42  (step diagnostic at +44)
+        uint64_t saved_L;     // +48  parent lua_State* from entry
+        uint64_t saved_ret;   // +56  original return address hijacked by entry
+        char data[16320];     // +64  bytecode payload
     };
 
     struct DirectHookAddrs {
@@ -193,24 +194,17 @@ private:
     };
 
     struct DirectHookState {
-        uintptr_t cave_addr        = 0;  // Phase1 trampoline
-        uintptr_t cave2_addr       = 0;  // Phase2 trampoline
-        uintptr_t mailbox_addr     = 0;
-        uintptr_t resume_addr      = 0;
-        uintptr_t sleep_addr       = 0;  // nanosleep hook point
-        size_t    cave_size        = 0;
-        size_t    cave2_size       = 0;
-        size_t    stolen_len       = 0;
-        size_t    sleep_stolen_len = 0;
-        uint8_t   stolen_bytes[32]      = {};
-        uint8_t   sleep_stolen_bytes[32]= {};
-        uint8_t   orig_patch[32]        = {};
-        uint8_t   sleep_orig_patch[32]  = {};
-        size_t    patch_len        = 0;
-        size_t    sleep_patch_len  = 0;
-        bool      active          = false;
-        bool      has_compile     = false;
-        bool      has_sandbox     = false;
+        uintptr_t cave_addr    = 0;
+        uintptr_t mailbox_addr = 0;
+        uintptr_t resume_addr  = 0;
+        size_t    cave_size    = 0;
+        size_t    stolen_len   = 0;
+        uint8_t   stolen_bytes[32] = {};
+        uint8_t   orig_patch[32]   = {};
+        size_t    patch_len    = 0;
+        bool      active       = false;
+        bool      has_compile  = false;
+        bool      has_sandbox  = false;
     };
 
     bool inject_via_direct_hook(pid_t pid);
@@ -221,6 +215,7 @@ private:
 };
 
 }
+
 
 
 
