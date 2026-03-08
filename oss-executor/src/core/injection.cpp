@@ -3077,13 +3077,19 @@ static std::vector<uint8_t> gen_entry_trampoline(
 
     e({0xC7,0x43,0x2C,0x01,0x00,0x00,0x00});
     e({0x4C,0x89,0xFF});
+    e({0xBE,0xFF,0xFF,0xFF,0xFF});
+    e({0x48,0xB8}); e64(a.settop);
+    e({0xFF,0xD0});
+
+    e({0xC7,0x43,0x2C,0x02,0x00,0x00,0x00});
+    e({0x4C,0x89,0xFF});
     e({0x48,0xB8}); e64(a.newthread);
     e({0xFF,0xD0});
     e({0x49,0x89,0xC6});
     e({0x4D,0x85,0xF6});
     size_t j_nt_fail = c.size(); e({0x0F,0x84}); e32(0);
 
-    e({0xC7,0x43,0x2C,0x02,0x00,0x00,0x00});
+    e({0xC7,0x43,0x2C,0x03,0x00,0x00,0x00});
     e({0x4C,0x89,0xF7});
     size_t chunk_movabs = c.size();
     e({0x48,0xBE}); e64(0);
@@ -3095,7 +3101,7 @@ static std::vector<uint8_t> gen_entry_trampoline(
     e({0x85,0xC0});
     size_t j_load_fail = c.size(); e({0x0F,0x85}); e32(0);
 
-    e({0xC7,0x43,0x2C,0x03,0x00,0x00,0x00});
+    e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00});
     e({0x4C,0x89,0xF7});
     e({0x31,0xF6});
     e({0x31,0xD2});
@@ -3103,7 +3109,7 @@ static std::vector<uint8_t> gen_entry_trampoline(
     e({0xFF,0xD0});
 
     size_t settop_label = c.size();
-    e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00});
+    e({0xC7,0x43,0x2C,0x05,0x00,0x00,0x00});
     e({0x4C,0x89,0xFF});
     e({0xBE,0xFE,0xFF,0xFF,0xFF});
     e({0x48,0xB8}); e64(a.settop);
@@ -3112,9 +3118,8 @@ static std::vector<uint8_t> gen_entry_trampoline(
     size_t ack_label = c.size();
     e({0x48,0x8B,0x43,0x10});
     e({0x48,0x89,0x43,0x18});
-    e({0xC7,0x43,0x2C,0x05,0x00,0x00,0x00});
+    e({0xC7,0x43,0x2C,0x06,0x00,0x00,0x00});
     e({0xC6,0x43,0x28,0x00});
-
     size_t skip_label = c.size();
 
     auto patch_j = [&](size_t off, size_t target){
@@ -3368,11 +3373,12 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         if (kill(pid, 0) != 0) {
             const char* desc =
                 step == 0 ? "entry hook never triggered (lua_resume not called?)" :
-                step == 1 ? "entry hook fired — crashed at/during lua_newthread" :
-                step == 2 ? "lua_newthread OK — crashed at/during luau_load" :
-                step == 3 ? "luau_load OK — crashed at/during lua_resume (inner)" :
-                step == 4 ? "inner resume returned — crashed during lua_settop cleanup" :
-                step == 5 ? "execution complete — crashed after ack" :
+                step == 1 ? "lua_settop probe hung — VM lock held by scheduler" :
+                step == 2 ? "lock OK — lua_newthread hung (WRONG FUNCTION identified)" :
+                step == 3 ? "lua_newthread OK — crashed at/during luau_load" :
+                step == 4 ? "luau_load OK — crashed at/during lua_resume (inner)" :
+                step == 5 ? "inner resume OK — crashed during lua_settop cleanup" :
+                step == 6 ? "execution complete — crashed after ack" :
                 "unknown step";
             LOG_ERROR("[direct-hook] TARGET DIED at step {}: {}", step, desc);
             break;
@@ -3863,6 +3869,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
