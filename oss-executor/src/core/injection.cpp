@@ -3608,32 +3608,127 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     // lua_newthread from the wrong Luau copy has a different lua_lock —
     // calling it deadlocks at step 1 because it waits on a mutex owned by
     // threads from that dead copy, not the active one.
+        // Validate lua_newthread: its FIRST CALL must target active_lock.
+    // lua_lock is always the first function called in Lua C API functions
+    // (before any work is done). If the first CALL targets a different
+    // address, this lua_newthread is from a dead/wrong Luau copy whose
+    // internal lua_lock hangs on an uninitialized or incompatible mutex.
     if (out.newthread && active_lock) {
-        bool calls_active_lock = false;
-        uint8_t ntb[100];
-        struct iovec ntl = {ntb, sizeof(ntb)};
-        struct iovec ntr_v = {reinterpret_cast<void*>(out.newthread), sizeof(ntb)};
-        if (process_vm_readv(pid, &ntl, 1, &ntr_v, 1, 0) == static_cast<ssize_t>(sizeof(ntb))) {
-            for (int i = 0; i < 95; i++) {
-                if (ntb[i] == 0xE8) {
-                    int32_t d; memcpy(&d, &ntb[i+1], 4);
-                    uintptr_t target = out.newthread + i + 5 + static_cast<int64_t>(d);
-                    if (target == active_lock) {
-                        calls_active_lock = true;
-                        LOG_INFO("[direct-hook] lua_newthread confirmed — calls active lua_lock at +{}", i);
-                        out.lock_fn = active_lock;
-                        break;
+        uint8_t ntb3[30];
+        struct iovec ntl3 = {ntb3, 30};
+        struct iovec ntr3 = {reinterpret_cast<void*>(out.newthread), 30};
+        if (process_vm_readv(pid, &ntl3, 1, &ntr3, 1, 0) == 30) {
+            bool confirmed = false;
+            for (int i = 0; i < 25; i++) {
+                if (ntb3[i] == 0xE8) {
+                    int32_t d; memcpy(&d, &ntb3[i+1], 4);
+                    uintptr_t nt_lock = out.newthread + i + 5 + (int64_t)d;
+                    if (nt_lock == active_lock) {
+                        LOG_INFO("[direct-hook] lua_newthread confirmed — first CALL targets active lua_lock at +{}", i);
+                        confirmed = true;
+                    } else {
+                        LOG_WARN("[direct-hook] lua_newthread FIRST CALL at +{} targets 0x{:X}, "
+                                 "expected active_lock 0x{:X} — wrong Luau copy",
+                                 i, nt_lock, active_lock);
                     }
-                    i += 4; // skip CALL displacement bytes
+                    break;  // MUST stop at first CALL — lua_lock is always first
                 }
             }
-        }
-        if (!calls_active_lock) {
-            LOG_WARN("[direct-hook] lua_newthread at 0x{:X} does not call active lua_lock "
-                     "0x{:X} — wrong Luau copy, clearing for re-scan",
-                     out.newthread, active_lock);
-            out.newthread = 0;
-            out.lock_fn = active_lock;
+            if (!confirmed) {
+                LOG_WARN("[direct-hook] lua_newthread at 0x{:X} rejected — clearing for "
+                         "lock-anchored re-scan", out.newthread);
+                out.newthread = 0;
+                out.lock_fn = active_lock;
+
+                // Lock-anchored re-scan: find lua_newthread from the ACTIVE
+                // Luau copy by requiring its first CALL to target active_lock.
+                // Scans ±80MB from lua_resume (where the active copy lives).
+                LOG_INFO("[direct-hook] lua_newthread: lock-anchored re-scan "
+                         "(first CALL must target active_lock 0x{:X})", active_lock);
+                int la_best_score = -1;
+                uintptr_t la_best_addr = 0;
+                size_t la_best_fsz = 0;
+                for (const auto& r : regions) {
+                    if (!r.readable() || !r.executable() || r.size() < 512) continue;
+                    int64_t rd = static_cast<int64_t>(r.start) -
+                                 static_cast<int64_t>(out.resume);
+                    if (rd < -0x5000000LL || rd > 0x5000000LL) continue;
+                    size_t scan_sz = std::min(r.size(),
+                                              static_cast<size_t>(0x4000000));
+                    std::vector<uint8_t> code(scan_sz);
+                    struct iovec la_li = {code.data(), scan_sz};
+                    struct iovec la_ri = {reinterpret_cast<void*>(r.start), scan_sz};
+                    if (process_vm_readv(pid, &la_li, 1, &la_ri, 1, 0) !=
+                        static_cast<ssize_t>(scan_sz)) continue;
+                    for (size_t off = 1; off + 200 < scan_sz; off++) {
+                        if (code[off-1] != 0xC3 && code[off-1] != 0xCC &&
+                            code[off-1] != 0x90) continue;
+                        uintptr_t addr = r.start + off;
+                        if (addr == out.resume || addr == out.settop ||
+                            addr == out.load) continue;
+                        size_t p = off;
+                        if (p+3<scan_sz && code[p]==0xF3 && code[p+1]==0x0F &&
+                            code[p+2]==0x1E && code[p+3]==0xFA) p+=4;
+                        if (p >= scan_sz) continue;
+                        if (!(code[p]==0x55 || code[p]==0x53 ||
+                              (code[p]==0x41 && p+1<scan_sz &&
+                               code[p+1]>=0x54 && code[p+1]<=0x57)))
+                            continue;
+                        // First CALL must target active_lock
+                        bool first_call_ok = false;
+                        for (size_t fi = 0; fi < 25 && off+fi+5 < scan_sz; fi++) {
+                            if (code[off+fi] != 0xE8) continue;
+                            int32_t fd; memcpy(&fd, &code[off+fi+1], 4);
+                            uintptr_t ft = r.start+off+fi+5+static_cast<int64_t>(fd);
+                            first_call_ok = (ft == active_lock);
+                            break;
+                        }
+                        if (!first_call_ok) continue;
+                        // Standard lua_newthread heuristics
+                        bool uses_rsi = false, saves_rdi = false, has_tt9 = false;
+                        int calls = 0;
+                        size_t fsz = 0;
+                        for (size_t j = 0; j < 200 && off+j+8 < scan_sz; j++) {
+                            size_t i2 = off + j;
+                            if (code[i2] == 0xE8) calls++;
+                            if (j < 20 && i2+2 < scan_sz) {
+                                if (code[i2]==0x89 && (code[i2+1]&0x38)==0x30) uses_rsi=true;
+                                if ((code[i2]==0x48||code[i2]==0x49) &&
+                                    code[i2+1]==0x89 && (code[i2+2]&0x38)==0x30) uses_rsi=true;
+                                if ((code[i2]==0x48||code[i2]==0x49) &&
+                                    code[i2+1]==0x89 && (code[i2+2]&0x38)==0x38) saves_rdi=true;
+                                if (code[i2]==0x89 && (code[i2+1]&0x38)==0x38) saves_rdi=true;
+                            }
+                            if (!has_tt9 && i2+3<scan_sz &&
+                                code[i2]==0x09 && code[i2+1]==0x00 &&
+                                code[i2+2]==0x00 && code[i2+3]==0x00 && j>=4) {
+                                if (i2>=1 && code[i2-1]>=0xB8 && code[i2-1]<=0xBF) has_tt9=true;
+                                if (i2>=3 && (code[i2-3]==0xC7||code[i2-3]==0xC6)) has_tt9=true;
+                            }
+                            if (code[i2]==0xC3 && j >= 30) { fsz=j+1; break; }
+                        }
+                        if (uses_rsi || !saves_rdi || !has_tt9) continue;
+                        if (fsz < 40 || fsz > 200 || calls < 2 || calls > 6) continue;
+                        int score = 10 + (calls>=2&&calls<=4?3:0) + (fsz>=60&&fsz<=150?2:0);
+                        if (score > la_best_score) {
+                            la_best_score = score;
+                            la_best_addr = addr;
+                            la_best_fsz = fsz;
+                        }
+                    }
+                }
+                if (la_best_addr && la_best_score >= 10) {
+                    out.newthread = la_best_addr;
+                    out.lock_fn = active_lock;
+                    LOG_INFO("[direct-hook] lock-anchored: lua_newthread=0x{:X} "
+                             "({}B, score={}, first CALL=active_lock VERIFIED)",
+                             la_best_addr, la_best_fsz, la_best_score);
+                } else {
+                    LOG_WARN("[direct-hook] lock-anchored re-scan found no "
+                             "lua_newthread calling active_lock 0x{:X}",
+                             active_lock);
+                }
+            }
         }
     }
 
@@ -5105,6 +5200,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
