@@ -2616,6 +2616,84 @@ static size_t dh_insn_len(const uint8_t* p) {
     bool rex_w = false;
     if (p[i] >= 0x40 && p[i] <= 0x4F) { rex_w = (p[i] & 0x08) != 0; i++; }
     uint8_t op = p[i++];
+
+    // ═══════════════════════════════════════════════════════════
+    // VEX 2-byte prefix (C5 xx opcode modrm ...)
+    // Format: C5 [RvvvvLpp] [opcode] [modrm] [SIB] [disp] [imm]
+    // Common in AVX-compiled Sober/Roblox binaries.
+    // ═══════════════════════════════════════════════════════════
+    if (op == 0xC5) {
+        if (i >= 14) return 0;
+        i++;                      // skip VEX byte 2
+        uint8_t vop = p[i++];    // opcode (implied 0F map)
+        if (vop == 0x77) return i; // VZEROUPPER / VZEROALL — no modrm
+        if (i >= 15) return 0;
+        // Parse modrm like any 0F-prefixed instruction
+        uint8_t m = p[i++];
+        uint8_t mod = (m >> 6) & 3, rm = m & 7;
+        if (mod != 3 && rm == 4) { uint8_t sib = p[i++]; if (mod == 0 && (sib & 7) == 5) i += 4; }
+        if (mod == 0 && rm == 5) i += 4;
+        else if (mod == 1) i += 1;
+        else if (mod == 2) i += 4;
+        // Check if this opcode takes an imm8 (comparison predicates, shuffles)
+        // 0F3A-map opcodes always take imm8, but C5 implies 0F map.
+        // Common 0F-map opcodes with imm8: C6 (VSHUFPS), C2 (VCMPPS)
+        if (vop == 0xC6 || vop == 0xC2 || vop == 0xC4 || vop == 0xC5 ||
+            vop == 0x70 || vop == 0x71 || vop == 0x72 || vop == 0x73 ||
+            vop == 0xA4 || vop == 0xAC) i += 1;
+        return i;
+    }
+    // ═══════════════════════════════════════════════════════════
+    // VEX 3-byte prefix (C4 xx xx opcode modrm ...)
+    // Format: C4 [RXBmmmmm] [WvvvvLpp] [opcode] [modrm] ...
+    // mmmmm: 1=0F, 2=0F38, 3=0F3A opcode map
+    // ═══════════════════════════════════════════════════════════
+    if (op == 0xC4) {
+        if (i + 1 >= 14) return 0;
+        uint8_t vb1 = p[i++];    // VEX byte 2
+        i++;                      // VEX byte 3
+        uint8_t mmmmm = vb1 & 0x1F;
+        if (i >= 15) return 0;
+        uint8_t vop = p[i++];    // opcode
+        if (i >= 15) return 0;
+        // Parse modrm
+        uint8_t m = p[i++];
+        uint8_t mod = (m >> 6) & 3, rm = m & 7;
+        if (mod != 3 && rm == 4) { uint8_t sib = p[i++]; if (mod == 0 && (sib & 7) == 5) i += 4; }
+        if (mod == 0 && rm == 5) i += 4;
+        else if (mod == 1) i += 1;
+        else if (mod == 2) i += 4;
+        // 0F3A map always has imm8; some 0F map opcodes have imm8 too
+        if (mmmmm == 3) i += 1;
+        else if (mmmmm == 1 && (vop == 0xC6 || vop == 0xC2 || vop == 0xC4 ||
+                                vop == 0xC5 || vop == 0x70 || vop == 0x71 ||
+                                vop == 0x72 || vop == 0x73)) i += 1;
+        return i;
+    }
+    // ═══════════════════════════════════════════════════════════
+    // EVEX 4-byte prefix (62 xx xx xx opcode modrm ...)
+    // In 64-bit mode, 0x62 is always EVEX (BOUND doesn't exist).
+    // ═══════════════════════════════════════════════════════════
+    if (op == 0x62) {
+        if (i + 2 >= 14) return 0;
+        uint8_t eb1 = p[i++];    // EVEX byte 2
+        i++;                      // EVEX byte 3
+        i++;                      // EVEX byte 4
+        uint8_t mmmmm = eb1 & 0x07;
+        if (i >= 15) return 0;
+        uint8_t eop = p[i++];    // opcode
+        if (i >= 15) return 0;
+        // Parse modrm
+        uint8_t m = p[i++];
+        uint8_t mod = (m >> 6) & 3, rm = m & 7;
+        if (mod != 3 && rm == 4) { uint8_t sib = p[i++]; if (mod == 0 && (sib & 7) == 5) i += 4; }
+        if (mod == 0 && rm == 5) i += 4;
+        else if (mod == 1) i += 1;  // EVEX disp8*N compressed
+        else if (mod == 2) i += 4;
+        if (mmmmm == 3) i += 1;    // 0F3A map → imm8
+        return i;
+    }
+
     if ((op>=0x50&&op<=0x5F)||op==0x90||op==0xC3||op==0xCC||op==0xC9) return i;
     if (op==0xC2) return i+2;
     if (op>=0xB0&&op<=0xB7) return i+1;
@@ -2624,9 +2702,10 @@ static size_t dh_insn_len(const uint8_t* p) {
     if (op==0xEB||(op>=0x70&&op<=0x7F)) return i+1;
     auto mlen = [&](size_t s) -> size_t {
         size_t j = s;
+        if (j >= 15) return 0;
         uint8_t m = p[j++];
         uint8_t mod = (m>>6)&3, rm = m&7;
-        if (mod!=3&&rm==4) { uint8_t sib=p[j++]; if(mod==0&&(sib&7)==5) j+=4; }
+        if (mod!=3&&rm==4) { if (j>=15) return 0; uint8_t sib=p[j++]; if(mod==0&&(sib&7)==5) j+=4; }
         if (mod==0&&rm==5) j+=4;
         else if (mod==1) j+=1;
         else if (mod==2) j+=4;
@@ -2638,7 +2717,26 @@ static size_t dh_insn_len(const uint8_t* p) {
     if (op==0x0F) {
         uint8_t op2=p[i++];
         if (op2>=0x80&&op2<=0x8F) return i+4;
+        if (op2>=0x40&&op2<=0x4F) return mlen(i); // CMOVcc
+        if (op2>=0x90&&op2<=0x9F) return mlen(i); // SETcc
+        if (op2==0xB6||op2==0xB7||op2==0xBE||op2==0xBF) return mlen(i); // MOVZX/MOVSX
+        if (op2==0xAF) return mlen(i); // IMUL r, r/m
+        if (op2==0xA3||op2==0xAB||op2==0xB3||op2==0xBB) return mlen(i); // BT/BTS/BTR/BTC
+        if (op2==0xBC||op2==0xBD) return mlen(i); // BSF/BSR/TZCNT/LZCNT
+        if (op2==0xA4||op2==0xAC) return mlen(i)+1; // SHLD/SHRD imm8
+        if (op2==0xA5||op2==0xAD) return mlen(i); // SHLD/SHRD cl
+        if (op2==0xBA) return mlen(i)+1; // BT/BTS/BTR/BTC imm8
         if (op2==0x1F||op2==0x44||(op2>=0x10&&op2<=0x17)||(op2>=0x28&&op2<=0x2F)) return mlen(i);
+        if (op2==0x38) { // 0F 38 xx — 3-byte opcode map
+            if (i >= 15) return 0;
+            i++; // third opcode byte
+            return mlen(i);
+        }
+        if (op2==0x3A) { // 0F 3A xx — 3-byte opcode map with imm8
+            if (i >= 15) return 0;
+            i++; // third opcode byte
+            return mlen(i)+1;
+        }
         return mlen(i);
     }
     if ((op&0xC4)==0x00||(op&0xFE)==0x84||(op&0xFC)==0x88||op==0x8C||op==0x8E||
@@ -2662,9 +2760,10 @@ static size_t dh_insn_len(const uint8_t* p) {
         op==0xAC||op==0xAD||op==0xAE||op==0xAF) return i;
     if (op==0xCD) return i+1;
     if (op==0xE4||op==0xE5||op==0xE6||op==0xE7) return i+1;
+    // LOOP/LOOPcc/JCXZ — 2-byte with rel8
+    if (op==0xE0||op==0xE1||op==0xE2||op==0xE3) return i+1;
     return 0;
 }
-
 static bool extract_lock_internals(pid_t pid, uintptr_t lock_fn_addr,
                                     int32_t& global_offset_out,
                                     int32_t& mutex_offset_out,
@@ -3088,6 +3187,42 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // FAST PRE-VALIDATION: If we have lua_resume from string-ref, extract
+    // a preliminary active_lock from lua_settop (if also found) to test
+    // whether lua_resume is from the live Luau copy. This avoids the
+    // expensive full string-ref scan + cascade that occurs when the first
+    // hits are from dead copies (observed: 242MB away, 8+ re-scans).
+    //
+    // Strategy: If lua_resume is found but lua_settop is also found,
+    // check if they share CALL targets. If not, clear lua_resume early
+    // so the string-ref fallback scan finds it in a better region.
+    // ═══════════════════════════════════════════════════════════════
+    if (out.resume && out.settop) {
+        int64_t rs_dist = static_cast<int64_t>(out.resume) -
+                          static_cast<int64_t>(out.settop);
+        if (rs_dist < 0) rs_dist = -rs_dist;
+        if (static_cast<uint64_t>(rs_dist) > 0x2800000ULL) {
+            LOG_WARN("[direct-hook] pre-validation: lua_resume 0x{:X} is {:.0f}MB "
+                     "from lua_settop 0x{:X} — likely different copies, clearing "
+                     "both for string-ref re-scan with distance filter",
+                     out.resume, rs_dist / (1024.0 * 1024.0), out.settop);
+            out.resume = 0;
+            out.settop = 0;
+        }
+    }
+    if (out.resume && out.load) {
+        int64_t rl_dist = static_cast<int64_t>(out.resume) -
+                          static_cast<int64_t>(out.load);
+        if (rl_dist < 0) rl_dist = -rl_dist;
+        if (static_cast<uint64_t>(rl_dist) > 0x2800000ULL) {
+            LOG_WARN("[direct-hook] pre-validation: luau_load 0x{:X} is {:.0f}MB "
+                     "from lua_resume 0x{:X} — clearing luau_load for re-scan",
+                     out.load, rl_dist / (1024.0 * 1024.0), out.resume);
+            out.load = 0;
+        }
+    }
+    
     struct { const char* func_name; uintptr_t* dst; const char* strings[4]; } fallbacks[] = {
         {"lua_resume",     &out.resume,    {"cannot resume dead coroutine", "cannot resume running coroutine", nullptr}},
         {"lua_newthread",  &out.newthread, {"lua_newthread", "too many C calls", nullptr}},
@@ -3113,6 +3248,19 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 uintptr_t str_addr = *hit;
                 for (const auto& xr : regions) {
                     if (!xr.readable() || !xr.executable() || xr.size() < 7) continue;
+                    // When we have an anchor function, skip xref regions that are
+                    // too far away — they belong to stale Luau copies.
+                    uintptr_t anchor = out.resume ? out.resume :
+                                       (out.settop ? out.settop : 0);
+                    if (anchor != 0) {
+                        int64_t xr_dist_lo = static_cast<int64_t>(xr.start) -
+                                             static_cast<int64_t>(anchor);
+                        int64_t xr_dist_hi = static_cast<int64_t>(xr.end) -
+                                             static_cast<int64_t>(anchor);
+                        bool xr_near = (xr_dist_lo > -0x2800000LL && xr_dist_lo < 0x2800000LL) ||
+                                       (xr_dist_hi > -0x2800000LL && xr_dist_hi < 0x2800000LL);
+                        if (!xr_near) continue;
+                    }
                     size_t xscan = std::min(xr.size(), static_cast<size_t>(0x4000000));
                     constexpr size_t CHUNK = 4096;
                     std::vector<uint8_t> buf(CHUNK + 16);
@@ -3548,20 +3696,23 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
 
-    // Validate lua_settop: must be a 2-arg function (saves rdi + rsi, NOT rdx)
+   // Validate lua_settop: must be a 2-arg function (saves rdi + rsi, NOT rdx)
+    // Also reject 1-CALL settops: they have inlined lua_unlock with struct
+    // offsets from a potentially stale Luau build. The inlined unlock fails
+    // to release the mutex, causing deadlock when called from the trampoline.
+    // A live lua_settop has ≥2 CALLs (lua_lock + lua_unlock, possibly helpers).
     if (out.settop) {
-        uint8_t st_buf[24];
-        struct iovec st_l = {st_buf, 24};
-        struct iovec st_r = {reinterpret_cast<void*>(out.settop), 24};
-        if (process_vm_readv(pid, &st_l, 1, &st_r, 1, 0) == 24) {
+        uint8_t st_buf[128];
+        struct iovec st_l = {st_buf, sizeof(st_buf)};
+        struct iovec st_r = {reinterpret_cast<void*>(out.settop), sizeof(st_buf)};
+        ssize_t st_rd = process_vm_readv(pid, &st_l, 1, &st_r, 1, 0);
+        if (st_rd >= 24) {
+            size_t st_read = static_cast<size_t>(st_rd);
             bool saves_rsi = false, saves_rdx = false;
             for (int i = 0; i + 2 < 22; i++) {
-                // mov r/m, esi/rsi: 89 with reg=110 (0x30 mask on bits 5-3)
                 if (st_buf[i] == 0x89 && (st_buf[i+1] & 0x38) == 0x30) saves_rsi = true;
                 if ((st_buf[i]==0x48||st_buf[i]==0x49) && st_buf[i+1]==0x89 && (st_buf[i+2]&0x38)==0x30) saves_rsi = true;
-                // movsxd r64, esi: 48 63 + r/m=110
                 if (st_buf[i]==0x48 && st_buf[i+1]==0x63 && (st_buf[i+2]&0xC7)==0xC6) saves_rsi = true;
-                // mov r/m, edx/rdx: 89 with reg=010 (0x10 mask on bits 5-3)
                 if (st_buf[i] == 0x89 && (st_buf[i+1] & 0x38) == 0x10) saves_rdx = true;
                 if ((st_buf[i]==0x48||st_buf[i]==0x49) && st_buf[i+1]==0x89 && (st_buf[i+2]&0x38)==0x10) saves_rdx = true;
             }
@@ -3571,6 +3722,33 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             } else if (!saves_rsi) {
                 LOG_WARN("[direct-hook] lua_settop at 0x{:X} doesn't save rsi — may be wrong function, clearing", out.settop);
                 out.settop = 0;
+            }
+
+            // Count CALL instructions to detect stale inlined-unlock settops
+            if (out.settop && st_rd >= 40) {
+                size_t st_fend = 0;
+                {
+                    size_t pos = 0;
+                    while (pos + 15 < st_read && pos < 250) {
+                        size_t il = dh_insn_len(st_buf + pos);
+                        if (il == 0) break;
+                        if (st_buf[pos] == 0xC3) { st_fend = pos + 1; break; }
+                        pos += il;
+                    }
+                }
+                if (st_fend > 10) {
+                    int call_count = 0;
+                    for (size_t ci = 0; ci + 5 <= st_fend; ci++) {
+                        if (st_buf[ci] == 0xE8) call_count++;
+                    }
+                    if (call_count < 2) {
+                        LOG_WARN("[direct-hook] lua_settop at 0x{:X} has only {} CALL(s) "
+                                 "in {} bytes — inlined lua_unlock from stale build, "
+                                 "clearing (need ≥2 for lock+unlock pair)",
+                                 out.settop, call_count, st_fend);
+                        out.settop = 0;
+                    }
+                }
             }
         }
     }
@@ -5444,7 +5622,8 @@ static std::vector<uint8_t> gen_entry_trampoline(
     const AddrsType& a, uintptr_t mailbox_addr, uintptr_t cave_addr,
     uintptr_t hook_target, const uint8_t* stolen, size_t stolen_len,
     bool capture_rdi_to_mailbox = false,
-    bool hook_held_lock = false)
+    bool hook_held_lock = false,
+    bool hook_target_is_settop = false)
 {
     std::vector<uint8_t> c;
     c.reserve(640);
@@ -5596,14 +5775,39 @@ static std::vector<uint8_t> gen_entry_trampoline(
     e({0x48,0xB8}); e64(a.resume); // lua_resume is NOT hooked, call directly
     e({0xFF,0xD0});                // call lua_resume
 
-       // === STEP 4: cleanup — lua_settop(L, -2) to pop the new thread ===
+             // === STEP 4: cleanup — lua_settop(L, -2) to pop the new thread ===
+    //
+    // CRITICAL: Do NOT call addrs.settop (the dead, lock-validated settop).
+    // Even though it calls the correct lua_lock, its INLINED lua_unlock uses
+    // struct offsets from a stale Luau compilation — acquiring the mutex but
+    // never releasing it, causing every subsequent lua_lock to deadlock.
+    //
+    // When hook_target IS a settop function, we embed a callable thunk that
+    // executes the stolen prologue bytes and jumps into the live settop body
+    // (past the hook JMP patch). The live settop's body has correct struct
+    // offsets and properly unlocks the mutex.
+    //
+    // When hook_target is NOT settop (e.g., lua_resume fallback), we skip
+    // step 4 entirely. The pushed thread is garbage-collected by Luau's GC.
+    // Stack growth is bounded: Roblox creates fresh lua_States regularly,
+    // and one extra slot per script execution is negligible vs LUAI_MAXSTACK.
     size_t settop_label = c.size();
-    if (a.settop != 0) {
+    size_t step4_settop_movabs = 0;
+    if (hook_target_is_settop && hook_target != 0) {
+        // Step 4 will CALL a cleanup thunk embedded at the end of this
+        // trampoline. The thunk address is not yet known — use a placeholder
+        // and patch it after the thunk is emitted.
         e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 4
         e({0x4C,0x89,0xFF});           // mov rdi, r15 (original L)
         e({0xBE,0xFE,0xFF,0xFF,0xFF}); // mov esi, -2
-        e({0x48,0xB8}); e64(a.settop);
-        e({0xFF,0xD0});                // call lua_settop
+        step4_settop_movabs = c.size();
+        e({0x48,0xB8}); e64(0);       // mov rax, <thunk_addr> — PATCHED BELOW
+        e({0xFF,0xD0});                // call rax
+    } else if (a.settop != 0 && !hook_target_is_settop) {
+        // hook_target is NOT settop (e.g., lua_resume fallback).
+        // Skip step 4: the dead settop has broken inlined unlock.
+        // The new thread stays on L's stack and will be GC'd.
+        e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00}); // step 4 skipped (0x44 = indicator)
     } else {
         e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00}); // step 4 skipped
     }
@@ -5719,10 +5923,47 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // No unlock bypass is needed AT ALL.
     patch_j(j_guard + 2, skip_label);
 
-    // NOP stub — single RET used as CALL redirect target by
+       // NOP stub — single RET used as CALL redirect target by
     // send_via_mailbox to no-op lua_unlock during payload execution.
-    // Always the LAST byte of the trampoline: cave_addr + c.size() - 1
     e8(0xC3);
+
+    // ═══════════════════════════════════════════════════════════════
+    // CLEANUP SETTOP THUNK — callable wrapper for the live hooked settop.
+    //
+    // This is a standalone function that can be CALL'd from step 4.
+    // It reconstructs the original settop entry point by:
+    //   1. Executing the stolen prologue bytes (push rbp; mov rbp,rsp; etc.)
+    //   2. Jumping to hook_target + stolen_len (past the JMP patch)
+    //
+    // The live settop body runs normally: lua_lock → adjust stack →
+    // lua_unlock (inlined with CORRECT struct offsets) → RET.
+    // The RET returns to step 5 in the trampoline (after the CALL).
+    //
+    // This avoids calling the dead settop whose inlined lua_unlock has
+    // stale struct offsets that fail to release the mutex.
+    // ═══════════════════════════════════════════════════════════════
+    size_t cleanup_thunk_label = 0;
+    if (hook_target_is_settop && hook_target != 0 && stolen_len > 0) {
+        cleanup_thunk_label = c.size();
+        // Emit the stolen prologue bytes
+        for (size_t i = 0; i < stolen_len; i++) e8(stolen[i]);
+        // Jump to the original function body (past the hook JMP patch)
+        uintptr_t thunk_cont = hook_target + stolen_len;
+        int64_t thunk_jd = static_cast<int64_t>(thunk_cont) -
+                           static_cast<int64_t>(cave_addr + c.size() + 5);
+        if (thunk_jd >= INT32_MIN && thunk_jd <= INT32_MAX) {
+            e8(0xE9);
+            e32(static_cast<uint32_t>(static_cast<int32_t>(thunk_jd)));
+        } else {
+            e({0xFF,0x25,0x00,0x00,0x00,0x00});
+            e64(thunk_cont);
+        }
+        // Patch step 4's movabs to point to this thunk
+        if (step4_settop_movabs != 0) {
+            uintptr_t thunk_addr = cave_addr + cleanup_thunk_label;
+            memcpy(&c[step4_settop_movabs + 2], &thunk_addr, 8);
+        }
+    }
 
     return c;
 }
@@ -5834,8 +6075,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             nearby.push_back(r);
     }
 
+    constexpr size_t CAVE_SIZE = 640; // 512 base + cleanup thunk + margin
     ExeRegionInfo cave;
-    if (!find_code_cave(pid, nearby, 512, cave)) {
+    if (!find_code_cave(pid, nearby, CAVE_SIZE, cave)) {
         LOG_ERROR("[direct-hook] no code cave within +/-2GB of lua_settop");
         return false;
     }
@@ -5849,12 +6091,13 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     uint8_t patch[16] = {};
 
     auto try_hook_target = [&](uintptr_t target, const char* name,
-                                uint8_t* pro, size_t st) -> bool {
+                                uint8_t* pro, size_t st,
+                                bool target_is_settop = true) -> bool {
         auto t = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
                                        target, pro, st,
-                                       false, false);
+                                       false, false, target_is_settop);
         LOG_INFO("[direct-hook] {} trampoline: {} bytes", name, t.size());
-        if (t.size() > 512) return false;
+        if (t.size() > CAVE_SIZE) return false;
         if (!proc_mem_write(pid, cave.padding_start, t.data(), t.size())) return false;
 
         uint8_t p[16]; size_t pl;
@@ -6081,8 +6324,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 auto probe_tramp = gen_entry_trampoline(
                     addrs, mb_addr, cave.padding_start, cand,
                     cand_pro, cand_steal,
-                    true, false);
-                if (probe_tramp.size() > 512) continue;
+                    true, false, true);
+                if (probe_tramp.size() > CAVE_SIZE) continue;
                 if (!proc_mem_write(pid, cave.padding_start,
                                     probe_tramp.data(),
                                     probe_tramp.size())) continue;
@@ -6418,8 +6661,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                         addrs, mb_addr, cave.padding_start,
                         best_live_settop, prologue, steal,
                         false,
-                        false);
-                    if (held_tramp.size() <= 512 &&
+                        false, true);
+                    if (held_tramp.size() <= CAVE_SIZE &&
                         proc_mem_write(pid, cave.padding_start,
                                        held_tramp.data(),
                                        held_tramp.size())) {
@@ -6490,13 +6733,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                          resume_cave_dist <= INT32_MAX) ||
                         resume_steal >= 14) {
                         if (try_hook_target(addrs.resume, "lua_resume",
-                                            resume_pro, resume_steal)) {
+                                            resume_pro, resume_steal, false)) {
                             hook_addr = addrs.resume;
                             is_lock_hook = false;
                             settop_probe_live = true;
                             LOG_INFO("[direct-hook] lua_resume hook "
                                      "succeeded as fallback (no "
-                                     "unlock/lock bracket needed)");
+                                     "unlock/lock bracket needed, "
+                                     "step 4 cleanup skipped)");
                         }
                     }
                 }
@@ -6521,10 +6765,12 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
              effective_held_lock,
              addrs.lock_internals_valid);
 
+    bool hook_is_settop = (hook_addr != addrs.resume);
     {
         auto t_final = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
                                              hook_addr, prologue, steal,
-                                             false, effective_held_lock);
+                                             false, effective_held_lock,
+                                             hook_is_settop);
         if (!proc_mem_write(pid, cave.padding_start, t_final.data(), t_final.size())) {
             LOG_ERROR("[direct-hook] failed to write final trampoline");
             proc_mem_write(pid, hook_addr, prologue, steal);
@@ -6536,7 +6782,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
     dhook_.cave_addr = cave.padding_start;
     dhook_.mailbox_addr = mb_addr;
-    dhook_.cave_size = 512;
+    dhook_.cave_size = CAVE_SIZE;
     dhook_.nop_stub_addr = 0;
     dhook_.stolen_len = steal;
     dhook_.resume_addr = addrs.resume;
@@ -6549,8 +6795,28 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     {
         auto t_measure = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
                                                hook_addr, prologue, steal,
-                                               false, effective_held_lock);
-        dhook_.nop_stub_addr = cave.padding_start + t_measure.size() - 1;
+                                               false, effective_held_lock,
+                                               hook_is_settop);
+        // NOP stub is the last 0xC3 before the cleanup thunk.
+        // The cleanup thunk (if present) extends past the nop stub.
+        // Walk backward from end to find the 0xC3 that ISN'T part of the thunk.
+        size_t nop_pos = t_measure.size() - 1;
+        if (hook_is_settop && steal > 0) {
+            // Thunk is at the very end: stolen_len + jmp_size bytes.
+            // NOP stub is right before the thunk.
+            // Scan backward for the RET before the thunk.
+            for (size_t si = t_measure.size() - 1; si > 0; si--) {
+                if (t_measure[si] == 0xC3) {
+                    // Check if this is the NOP stub (preceded by the re-entrant jnz patch area)
+                    // vs the thunk's JMP target. The NOP stub is followed by the stolen bytes.
+                    if (si + 1 < t_measure.size() && t_measure[si + 1] == stolen[0]) {
+                        nop_pos = si;
+                        break;
+                    }
+                }
+            }
+        }
+        dhook_.nop_stub_addr = cave.padding_start + nop_pos;
     }
     dhook_.active = true;
     dhook_.has_compile = (addrs.compile != 0);
@@ -6752,9 +7018,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                         auto rt = gen_entry_trampoline(
                             addrs, mb_addr, cave.padding_start,
                             addrs.resume, resume_pro, resume_steal,
-                            false, false);
+                            false, false, false);
 
-                        if (rt.size() <= 512 &&
+                        if (rt.size() <= CAVE_SIZE &&
                             proc_mem_write(pid, cave.padding_start,
                                            rt.data(), rt.size())) {
 
@@ -6828,7 +7094,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                                 addrs.resume,
                                                 resume_pro,
                                                 resume_steal,
-                                                false, false);
+                                                false, false, false);
                                         proc_mem_write(pid,
                                             cave.padding_start,
                                             rt_final.data(),
@@ -6945,7 +7211,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                                 cave.padding_start;
                                             dhook_.mailbox_addr =
                                                 mb_addr;
-                                            dhook_.cave_size = 512;
+                                            dhook_.cave_size = CAVE_SIZE;
                                             dhook_.nop_stub_addr = 0;
                                             dhook_.stolen_len =
                                                 resume_steal;
@@ -6974,7 +7240,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                                         addrs.resume,
                                                         resume_pro,
                                                         resume_steal,
-                                                        false, false);
+                                                        false, false,
+                                                        false);
                                                 dhook_.nop_stub_addr =
                                                     cave.padding_start +
                                                     tm.size() - 1;
@@ -7807,6 +8074,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
