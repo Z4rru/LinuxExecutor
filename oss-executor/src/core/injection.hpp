@@ -160,6 +160,7 @@ private:
     VMScanResult        vm_scan_{};
     uintptr_t           vm_marker_addr_ = 0;
     bool                payload_loaded_ = false;
+    std::string         payload_mapped_name_;
 
     StatusCallback      status_cb_;
     mutable std::mutex  mtx_;
@@ -226,23 +227,3 @@ private:
 };
 
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
