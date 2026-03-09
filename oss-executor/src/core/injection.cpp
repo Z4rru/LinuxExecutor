@@ -2966,7 +2966,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             size_t nt_read = static_cast<size_t>(ntrd);
             // Detect function boundary — expanded marker set
             size_t nt_fend = nt_read;
-            bool nt_boundary_found = false;
+            bool nt_boundary_found [[maybe_unused]] = false;
             for (size_t ni = 25; ni + 1 < nt_read; ni++) {
                 if (ntb[ni] != 0xC3) continue;
                 uint8_t nx = ntb[ni + 1];
@@ -3115,7 +3115,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if (nt2rd >= 20) {
             size_t nt2_read = static_cast<size_t>(nt2rd);
             size_t nt2_fend = nt2_read;
-            bool nt2_boundary = false;
+            bool nt2_boundary [[maybe_unused]] = false;
             for (size_t ni = 25; ni + 1 < nt2_read; ni++) {
                 if (ntb2[ni] != 0xC3) continue;
                 uint8_t nx = ntb2[ni + 1];
@@ -4837,10 +4837,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         proc_mem_write(pid, mb_addr + 41, &zh, 1);
         usleep(1000000);
         uint8_t hits = 0;
-        proc_mem_read(mpid, dhook_.mailbox_addr + 41, &hits, 1);
-        // ...
-        // after loop failure:
-    proc_mem_read(mpid, dhook_.mailbox_addr + 24, &post_ack, 8); // fresh read
+        proc_mem_read(pid, mb_addr + 41, &hits, 1);
         if (hits < 10) {
             LOG_WARN("[direct-hook] {} at 0x{:X} has only {} hits in 1000ms "
                      "(need ≥10) — likely dead/stale code", name, target, hits);
@@ -5404,6 +5401,8 @@ bool Injection::execute_script(const std::string& source) {
                 proc_mem_read(mpid, dhook_.mailbox_addr + 44, &step, 4);
                 uint8_t guard = 0;
                 proc_mem_read(mpid, dhook_.mailbox_addr + 40, &guard, 1);
+                uint8_t hits = 0;
+                proc_mem_read(mpid, dhook_.mailbox_addr + 41, &hits, 1);
 
                 if (post_ack >= post_seq) {
                     LOG_INFO("[direct-hook] execution confirmed: ack={} step={} "
@@ -5420,38 +5419,39 @@ bool Injection::execute_script(const std::string& source) {
 
             if (executed) {
                 set_state(InjectionState::Ready, "Script executed in Roblox");
-                return true;   // ← EXPLICIT early return
+                return true;
             }
-                uint32_t final_step = 0;
-                uint8_t final_guard = 0;
-                uint8_t final_hits = 0;
-                proc_mem_read(mpid, dhook_.mailbox_addr + 44, &final_step, 4);
-                proc_mem_read(mpid, dhook_.mailbox_addr + 40, &final_guard, 1);
-                proc_mem_read(mpid, dhook_.mailbox_addr + 41, &final_hits, 1);
 
-                if (final_step == 0 && final_guard == 0) {
-                    LOG_ERROR("[direct-hook] trampoline never entered payload path "
-                              "(step=0, guard=0, hits={}) — hook may be dead or "
-                              "seq not visible to target", final_hits);
-                } else if (final_step > 0 && final_step < 5) {
-                    const char* step_names[] = {
-                        "?", "lua_newthread", "luau_load", "lua_resume",
-                        "lua_settop(-2)", "ack"
-                    };
-                    const char* sn = (final_step <= 5) ? step_names[final_step] : "?";
-                    LOG_ERROR("[direct-hook] execution stalled at step {} ({}) — "
-                              "likely deadlock or crash inside Luau call",
-                              final_step, sn);
-                } else {
-                    LOG_ERROR("[direct-hook] execution timeout: step={} guard={} "
-                              "ack={} seq={}", final_step, final_guard,
-                              post_ack, post_seq);
-                }
-                set_state(InjectionState::Ready,
-                          "Script dispatch timeout — step " +
-                          std::to_string(final_step));
+            uint32_t final_step = 0;
+            uint8_t final_guard = 0;
+            uint8_t final_hits = 0;
+            proc_mem_read(mpid, dhook_.mailbox_addr + 44, &final_step, 4);
+            proc_mem_read(mpid, dhook_.mailbox_addr + 40, &final_guard, 1);
+            proc_mem_read(mpid, dhook_.mailbox_addr + 41, &final_hits, 1);
+            proc_mem_read(mpid, dhook_.mailbox_addr + 24, &post_ack, 8);
+
+            if (final_step == 0 && final_guard == 0) {
+                LOG_ERROR("[direct-hook] trampoline never entered payload path "
+                          "(step=0, guard=0, hits={}) — hook may be dead or "
+                          "seq not visible to target", final_hits);
+            } else if (final_step > 0 && final_step < 5) {
+                const char* step_names[] = {
+                    "?", "lua_newthread", "luau_load", "lua_resume",
+                    "lua_settop(-2)", "ack"
+                };
+                const char* sn = (final_step <= 5) ? step_names[final_step] : "?";
+                LOG_ERROR("[direct-hook] execution stalled at step {} ({}) — "
+                          "likely deadlock or crash inside Luau call",
+                          final_step, sn);
+            } else {
+                LOG_ERROR("[direct-hook] execution timeout: step={} guard={} "
+                          "ack={} seq={}", final_step, final_guard,
+                          post_ack, post_seq);
             }
-            return executed;
+            set_state(InjectionState::Ready,
+                      "Script dispatch timeout — step " +
+                      std::to_string(final_step));
+            return false;
         }
         LOG_WARN("Direct hook mailbox send failed, trying IPC fallback");
     }
@@ -5643,6 +5643,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
