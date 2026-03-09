@@ -3354,6 +3354,123 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                      "near lua_resume");
     }
 
+    // Fallback: proximity signature scan for luau_load near lua_resume.
+    // Finds large 3+ arg functions that share CALL targets with lua_resume.
+    // Works when string-ref fails (GOT refs, different .rodata layout, etc.)
+    if (!out.load && out.resume) {
+        LOG_INFO("[direct-hook] luau_load: proximity signature scan "
+                 "(cross-validated with lua_resume)");
+        std::vector<uintptr_t> resume_calls;
+        {
+            uint8_t rc[1024];
+            struct iovec rl = {rc, 1024};
+            struct iovec rr_v = {reinterpret_cast<void*>(out.resume), 1024};
+            ssize_t rrd = process_vm_readv(pid, &rl, 1, &rr_v, 1, 0);
+            if (rrd >= 64) {
+                for (size_t j = 0; j + 5 <= static_cast<size_t>(rrd); j++) {
+                    if (rc[j] != 0xE8) continue;
+                    int32_t rd; memcpy(&rd, &rc[j+1], 4);
+                    uintptr_t t = out.resume + j + 5 + static_cast<int64_t>(rd);
+                    bool dup = false;
+                    for (auto& ex : resume_calls)
+                        if (ex == t) { dup = true; break; }
+                    if (!dup) resume_calls.push_back(t);
+                }
+            }
+        }
+        LOG_DEBUG("[direct-hook] lua_resume has {} unique CALL targets for "
+                  "cross-validation", resume_calls.size());
+        if (!resume_calls.empty()) {
+            int best_score = -1;
+            uintptr_t best_addr = 0;
+            size_t best_fsz = 0;
+            int best_shared = 0;
+            for (const auto& r : regions) {
+                if (out.load) break;
+                if (!r.readable() || !r.executable()) continue;
+                int64_t rd0 = static_cast<int64_t>(r.start) -
+                              static_cast<int64_t>(out.resume);
+                int64_t rd1 = static_cast<int64_t>(r.end) -
+                              static_cast<int64_t>(out.resume);
+                if (!((rd0 > -0x5000000LL && rd0 < 0x5000000LL) ||
+                      (rd1 > -0x5000000LL && rd1 < 0x5000000LL))) continue;
+                size_t scan_sz = std::min(r.size(),
+                                          static_cast<size_t>(0x4000000));
+                std::vector<uint8_t> code(scan_sz);
+                struct iovec sli = {code.data(), scan_sz};
+                struct iovec sri = {reinterpret_cast<void*>(r.start), scan_sz};
+                if (process_vm_readv(pid, &sli, 1, &sri, 1, 0) !=
+                    static_cast<ssize_t>(scan_sz)) continue;
+                for (size_t off = 1; off + 500 < scan_sz; off++) {
+                    if (code[off-1]!=0xC3 && code[off-1]!=0xCC &&
+                        code[off-1]!=0x90) continue;
+                    uintptr_t addr = r.start + off;
+                    if (addr==out.resume || addr==out.settop ||
+                        addr==out.newthread || addr==out.sandbox) continue;
+                    size_t p = off;
+                    if (p+3<scan_sz && code[p]==0xF3 && code[p+1]==0x0F &&
+                        code[p+2]==0x1E && code[p+3]==0xFA) p += 4;
+                    if (p >= scan_sz) continue;
+                    if (!(code[p]==0x55 || code[p]==0x53 ||
+                          (code[p]==0x41 && p+1<scan_sz &&
+                           code[p+1]>=0x54 && code[p+1]<=0x57) ||
+                          (code[p]==0x48 && p+2<scan_sz &&
+                           code[p+1]==0x83 && code[p+2]==0xEC)))
+                        continue;
+                    bool sr_di=false, sr_si=false, sr_dx=false;
+                    for (size_t j=0; j<30 && off+j+2<scan_sz; j++) {
+                        size_t i = off+j;
+                        if (code[i]==0x89 && (code[i+1]&0x38)==0x38) sr_di=true;
+                        if ((code[i]==0x48||code[i]==0x49) &&
+                            code[i+1]==0x89 && (code[i+2]&0x38)==0x38) sr_di=true;
+                        if (code[i]==0x89 && (code[i+1]&0x38)==0x30) sr_si=true;
+                        if ((code[i]==0x48||code[i]==0x49) &&
+                            code[i+1]==0x89 && (code[i+2]&0x38)==0x30) sr_si=true;
+                        if (code[i]==0x89 && (code[i+1]&0x38)==0x10) sr_dx=true;
+                        if ((code[i]==0x48||code[i]==0x49) &&
+                            code[i+1]==0x89 && (code[i+2]&0x38)==0x10) sr_dx=true;
+                    }
+                    if (!sr_di || !sr_si || !sr_dx) continue;
+                    int calls = 0;
+                    size_t fsz = 0;
+                    for (size_t j=0; j<2000 && off+j+5<scan_sz; j++) {
+                        if (code[off+j]==0xE8) calls++;
+                        if (code[off+j]==0xC3 && j>=200) { fsz=j+1; break; }
+                    }
+                    if (fsz < 200 || calls < 5) continue;
+                    int shared = 0;
+                    for (size_t j=0; j<fsz && off+j+5<scan_sz; j++) {
+                        if (code[off+j]!=0xE8) continue;
+                        int32_t cd; memcpy(&cd, &code[off+j+1], 4);
+                        uintptr_t ct = r.start+off+j+5+static_cast<int64_t>(cd);
+                        for (auto& rt : resume_calls)
+                            if (ct == rt) { shared++; break; }
+                    }
+                    if (shared < 2) continue;
+                    int score = shared*5 + (fsz>=500?3:0) + (calls>=8?2:0);
+                    if (score > best_score) {
+                        best_score=score; best_addr=addr;
+                        best_fsz=fsz; best_shared=shared;
+                    }
+                }
+            }
+            if (best_addr && best_score >= 12) {
+                out.load = best_addr;
+                int64_t fd = static_cast<int64_t>(best_addr) -
+                             static_cast<int64_t>(out.resume);
+                if (fd < 0) fd = -fd;
+                LOG_INFO("[direct-hook] proximity signature: luau_load=0x{:X} "
+                         "({}B, {} shared targets, score={}, {:.1f}MB from "
+                         "lua_resume, CROSS-VALIDATED)",
+                         best_addr, best_fsz, best_shared, best_score,
+                         fd / (1024.0 * 1024.0));
+            } else if (best_addr) {
+                LOG_WARN("[direct-hook] proximity signature: candidate 0x{:X} "
+                         "rejected (score={}, need >=12)", best_addr, best_score);
+            }
+        }
+    }
+
     if (!out.resume || !out.load || !out.settop) {
         LOG_ERROR("[direct-hook] missing required functions: resume={:#x} load={:#x} settop={:#x}",
                   out.resume, out.load, out.settop);
@@ -4645,6 +4762,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
