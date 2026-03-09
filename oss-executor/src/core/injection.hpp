@@ -68,6 +68,7 @@ public:
     bool execute_script(const std::string& source);
 
     bool is_attached() const;
+    bool is_direct_hook_active() const { return dhook_.active; }
     bool is_payload_loaded() const { return payload_loaded_; }
     bool process_alive() const;
     bool verify_payload_alive();
@@ -225,6 +226,7 @@ private:
 };
 
 }
+
 
 
 
