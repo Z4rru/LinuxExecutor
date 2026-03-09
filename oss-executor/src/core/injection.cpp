@@ -4128,7 +4128,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 template<typename AddrsType>
 static std::vector<uint8_t> gen_entry_trampoline(
     const AddrsType& a, uintptr_t mailbox_addr, uintptr_t cave_addr,
-    uintptr_t hook_target, const uint8_t* stolen, size_t stolen_len)
+    uintptr_t hook_target, const uint8_t* stolen, size_t stolen_len,
+    bool is_lock_hook = false)
 {
     std::vector<uint8_t> c;
     c.reserve(512);
@@ -4231,11 +4232,12 @@ static std::vector<uint8_t> gen_entry_trampoline(
         int32_t r = static_cast<int32_t>(target - (off + 4));
         memcpy(&c[off], &r, 4);
     };
-    patch_j(j_guard + 2, skip_label);
+    // j_guard patched later (needs reentrant_label for lock hooks)
     patch_j(j_seq   + 2, skip_label);
     if (j_nt_fail != SIZE_MAX)
         patch_j(j_nt_fail + 2, ack_label);
     patch_j(j_load_fail + 2, settop_label);
+
 
     // Restore stack and all registers
     e({0x48,0x89,0xEC}); e8(0x5D); // mov rsp, rbp; pop rbp
@@ -4264,6 +4266,36 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // Patch the chunk name movabs to point here
     uintptr_t chunk_abs = cave_addr + chunk_name_label;
     memcpy(&c[chunk_movabs + 2], &chunk_abs, 8);
+
+    // === Reentrant-RET path for lua_lock hooks ===
+    // When hooked on lua_lock and guard != 0 (re-entrant call from
+    // inside the payload), we must NOT execute the real lua_lock —
+    // the mutex is non-recursive and would deadlock.  Just restore
+    // registers and RET, making the re-entrant lua_lock a no-op.
+    // The paired lua_unlock calls are redirected to a NOP stub by
+    // send_via_mailbox, so lock/unlock are both no-ops during payload.
+    if (is_lock_hook) {
+        size_t reentrant_label = c.size();
+        // Restore stack and all registers (same sequence as skip_label)
+        e({0x48,0x89,0xEC}); e8(0x5D); // mov rsp, rbp; pop rbp
+        e({0x41,0x5F}); e({0x41,0x5E}); e8(0x5B);       // pop r15, r14, rbx
+        e({0x41,0x5B}); e({0x41,0x5A}); e({0x41,0x59}); e({0x41,0x58}); // pop r11-r8
+        e8(0x5F); e8(0x5E); e8(0x5A); e8(0x59); e8(0x58); // pop rdi,rsi,rdx,rcx,rax
+        e8(0x9D); // popfq
+        e8(0xC3); // RET — skip lua_lock entirely, return to caller
+
+        patch_j(j_guard + 2, reentrant_label);
+    } else {
+        patch_j(j_guard + 2, skip_label);
+    }
+
+    // NOP stub — single RET used as CALL redirect target by
+    // send_via_mailbox to no-op lua_unlock during payload execution.
+    // Always the LAST byte of the trampoline: cave_addr + c.size() - 1
+    e8(0xC3);
+
+    return c;
+}
 
     return c;
 }
@@ -4388,9 +4420,10 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     uint8_t patch[16] = {};
 
     auto try_hook_target = [&](uintptr_t target, const char* name,
-                                uint8_t* pro, size_t st) -> bool {
+                                uint8_t* pro, size_t st,
+                                bool lock_hook = false) -> bool {
         auto t = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
-                                       target, pro, st);
+                                       target, pro, st, lock_hook);
         LOG_INFO("[direct-hook] {} trampoline: {} bytes", name, t.size());
         if (t.size() > 400) return false;
         if (!proc_mem_write(pid, cave.padding_start, t.data(), t.size())) return false;
@@ -4465,7 +4498,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                     LOG_INFO("[direct-hook] lua_lock prologue: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} (steal={})",
                              lock_pro[0], lock_pro[1], lock_pro[2], lock_pro[3],
                              lock_pro[4], lock_pro[5], lock_pro[6], lock_pro[7], lock_steal);
-                    if (try_hook_target(addrs.lock_fn, "lua_lock", lock_pro, lock_steal)) {
+                    if (try_hook_target(addrs.lock_fn, "lua_lock", lock_pro, lock_steal, true)) {
+
                         hook_addr = addrs.lock_fn;
                         is_lock_hook = true;
                         lock_ok = true;
@@ -4558,6 +4592,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     dhook_.cave_addr = cave.padding_start;
     dhook_.mailbox_addr = mb_addr;
     dhook_.cave_size = 400;
+    dhook_.nop_stub_addr = 0;
     dhook_.stolen_len = steal;
     dhook_.resume_addr = addrs.resume;
     dhook_.newthread_addr = addrs.newthread;
@@ -4566,6 +4601,12 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     memcpy(dhook_.stolen_bytes, prologue, steal);
     memcpy(dhook_.orig_patch, prologue, patch_len);
     dhook_.patch_len = patch_len;
+     // Compute NOP stub address: always the last byte of the trampoline
+    {
+        auto t_measure = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
+                                               hook_addr, prologue, steal, is_lock_hook);
+        dhook_.nop_stub_addr = cave.padding_start + t_measure.size() - 1;
+    }
     dhook_.active = true;
     dhook_.has_compile = (addrs.compile != 0);
     dhook_.hook_is_lock_fn = is_lock_hook;
@@ -4871,176 +4912,122 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
             }
         }
     } else if (dhook_.hook_is_lock_fn) {
-        // When hooked on lua_lock, guard-based re-entrancy only works if
-        // called functions use the SAME lua_lock.  Functions from wrong
-        // Luau copies call dead lua_lock → hang on stale mutex.
-        // Fix: redirect their internal lock/unlock CALLs to active ones.
-        uintptr_t al  = dhook_.active_lock_addr;
+        // ═══════════════════════════════════════════════════════════
+        // lua_lock hook: the trampoline's guard-skip path now RETs
+        // immediately for re-entrant lua_lock calls (Cluster 2 fix),
+        // making every re-entrant lua_lock a no-op.  We must ALSO
+        // no-op the paired lua_unlock calls — otherwise lua_unlock
+        // tries to release a mutex never acquired, corrupting state.
+        //
+        // Strategy: redirect E8/E9 CALL instructions targeting
+        // active_unlock inside called functions to a NOP stub (C3)
+        // in the code cave.  lua_lock is handled by the guard;
+        // only lua_unlock needs CALL displacement patching.
+        // ═══════════════════════════════════════════════════════════
         uintptr_t aul = dhook_.active_unlock_addr;
+        uintptr_t nop = dhook_.nop_stub_addr;
 
-        if (al && aul) {
-            LOG_INFO("[direct-hook] lua_lock hook: redirecting internal "
-                     "lock/unlock calls (active_lock=0x{:X} active_unlock=0x{:X})",
-                     al, aul);
+        if (aul && nop) {
+            LOG_INFO("[direct-hook] lua_lock hook: redirecting lua_unlock "
+                     "calls to NOP stub 0x{:X} (active_unlock=0x{:X})",
+                     nop, aul);
 
-                        // Use saved stolen bytes for lock prologue — the live bytes
-            // at active_lock are overwritten with our JMP hook patch.
-            uint8_t lock_prologue[8] = {};
-            uint8_t unlock_prologue[8] = {};
-            if (dhook_.hook_is_lock_fn && dhook_.stolen_len >= 6) {
-                memcpy(lock_prologue, dhook_.stolen_bytes,
-                       std::min(dhook_.stolen_len, static_cast<size_t>(8)));
-                LOG_DEBUG("[direct-hook] using saved stolen bytes as lock "
-                          "prologue (hook is on lua_lock)");
-            } else {
-                proc_mem_read(pid, al, lock_prologue, 8);
-            }
-            proc_mem_read(pid, aul, unlock_prologue, 8);
-            LOG_DEBUG("[direct-hook] lock prologue: {:02X}{:02X}{:02X}{:02X}"
-                      "{:02X}{:02X}{:02X}{:02X}",
-                      lock_prologue[0], lock_prologue[1], lock_prologue[2],
-                      lock_prologue[3], lock_prologue[4], lock_prologue[5],
-                      lock_prologue[6], lock_prologue[7]);
-            LOG_DEBUG("[direct-hook] unlock prologue: {:02X}{:02X}{:02X}{:02X}"
-                      "{:02X}{:02X}{:02X}{:02X}",
-                      unlock_prologue[0], unlock_prologue[1], unlock_prologue[2],
-                      unlock_prologue[3], unlock_prologue[4], unlock_prologue[5],
-                      unlock_prologue[6], unlock_prologue[7]);
-
-            auto redirect_fn_locks = [&](uintptr_t fn_addr, size_t scan_size,
-                                         const char* name) {
+            auto redirect_unlock_calls = [&](uintptr_t fn_addr,
+                                              size_t scan_size,
+                                              const char* name) {
                 if (!fn_addr || fn_addr == dhook_.settop_addr) return;
                 std::vector<uint8_t> buf(scan_size);
                 if (!proc_mem_read(pid, fn_addr, buf.data(), scan_size))
                     return;
 
-                // Function boundary
+                // Detect function boundary to avoid scanning into
+                // adjacent functions (RET + boundary marker pattern)
                 size_t fend = scan_size;
                 for (size_t i = 25; i + 1 < scan_size; i++) {
                     if (buf[i] != 0xC3) continue;
                     uint8_t nx = buf[i + 1];
-                    if (nx==0xCC||nx==0x90||nx==0x55||nx==0x53||
-                        nx==0xF3||nx==0x00||
-                        (nx==0x41 && i+2<scan_size &&
-                         buf[i+2]>=0x54 && buf[i+2]<=0x57)) {
+                    if (nx == 0xCC || nx == 0x90 || nx == 0x55 ||
+                        nx == 0x53 || nx == 0xF3 || nx == 0x00 ||
+                        (nx == 0x41 && i + 2 < scan_size &&
+                         buf[i + 2] >= 0x54 && buf[i + 2] <= 0x57)) {
                         fend = i + 1;
                         break;
                     }
                 }
 
-                // Prologue-matching redirect: scan ALL E8/E9 in the
-                // function body. For each, read target's first 8 bytes.
-                // If prologue matches active_lock → redirect to al.
-                // If prologue matches active_unlock → redirect to aul.
-                // This avoids the "first CALL = lock" assumption.
-                int lock_count = 0, unlock_count = 0;
+                int redirected = 0, lock_seen = 0;
                 for (size_t i = 0; i + 5 <= fend; i++) {
                     uint8_t op = buf[i];
                     if (op != 0xE8 && op != 0xE9) continue;
-                    // Skip E9 in first 8 bytes (prologue setup, not a call)
+                    // Skip E9 in first 8 bytes (prologue JMP, not a call)
                     if (op == 0xE9 && i < 8) continue;
 
-                    int32_t d; memcpy(&d, &buf[i + 1], 4);
+                    int32_t d;
+                    memcpy(&d, &buf[i + 1], 4);
                     uintptr_t tgt = fn_addr + i + 5 +
                                     static_cast<int64_t>(d);
 
-                    // Skip if already points to active lock/unlock
-                    if (tgt == al) { lock_count++; continue; }
-                    if (tgt == aul) { unlock_count++; continue; }
-                    // Skip self-calls
-                    if (tgt == fn_addr) continue;
+                    // Count lua_lock calls (handled by guard-RET, no
+                    // patching needed) for diagnostics
+                    if (tgt == dhook_.active_lock_addr) {
+                        lock_seen++;
+                        continue;
+                    }
 
-                    // Read target prologue
-                    uint8_t tgt_pro[8] = {};
-                    if (!proc_mem_read(pid, tgt, tgt_pro, 8)) continue;
+                    // Only redirect calls that target active_unlock
+                    if (tgt != aul) continue;
 
-                    // Check if target matches lock prologue
-                    bool is_lock = (memcmp(tgt_pro, lock_prologue, 8) == 0);
-                    // Check if target matches unlock prologue
-                    bool is_unlock = (!is_lock &&
-                        memcmp(tgt_pro, unlock_prologue, 8) == 0);
-
-                    if (!is_lock && !is_unlock) continue;
-
-                    uintptr_t redirect_to = is_lock ? al : aul;
-                    const char* which = is_lock ? "lock" : "unlock";
-
-                    int64_t nd = static_cast<int64_t>(redirect_to) -
+                    // Compute new rel32 displacement to NOP stub
+                    int64_t nd = static_cast<int64_t>(nop) -
                                  static_cast<int64_t>(fn_addr + i + 5);
                     if (nd < INT32_MIN || nd > INT32_MAX) {
-                        LOG_WARN("[direct-hook]   {} {} redirect out of "
-                                 "rel32 range (at +{}, {:02X})",
-                                 name, which, i, op);
+                        LOG_WARN("[direct-hook]   {} unlock redirect out "
+                                 "of rel32 range (at +{}, {:02X})",
+                                 name, i, op);
                         continue;
                     }
                     int32_t nd32 = static_cast<int32_t>(nd);
-                    uintptr_t pa = fn_addr + i + 1;
-                    if (proc_mem_write(pid, pa, &nd32, 4)) {
-                        call_redirects.push_back({pa, d});
+                    uintptr_t patch_addr = fn_addr + i + 1;
+                    if (proc_mem_write(pid, patch_addr, &nd32, 4)) {
+                        call_redirects.push_back({patch_addr, d});
                         lock_bypassed = true;
-                        LOG_INFO("[direct-hook]   {} {}: 0x{:X}→0x{:X} "
-                                 "(at +{}, {:02X})",
-                                 name, which, tgt, redirect_to, i, op);
-                        if (is_lock) lock_count++;
-                        else unlock_count++;
+                        redirected++;
+                        LOG_INFO("[direct-hook]   {} unlock: 0x{:X}→NOP "
+                                 "0x{:X} (at +{}, {:02X})",
+                                 name, tgt, nop, i, op);
                     }
                 }
 
-                // Derive active_unlock if this function already uses
-                // active_lock but we haven't found unlock yet
-                if (lock_count > 0 && unlock_count == 0) {
-                    for (int ui = static_cast<int>(fend) - 1;
-                         ui >= 20; ui--) {
-                        if (buf[ui] != 0xE8 && buf[ui] != 0xE9)
-                            continue;
-                        if (ui + 5 > static_cast<int>(scan_size))
-                            continue;
-                        int32_t ud;
-                        memcpy(&ud, &buf[ui + 1], 4);
-                        uintptr_t ut = fn_addr + ui + 5 +
-                            static_cast<int64_t>(ud);
-                        if (ut == al || ut == fn_addr) continue;
-                        if (aul != ut) {
-                            LOG_INFO("[direct-hook]   derived "
-                                "active_unlock=0x{:X} from {} "
-                                "(at +{}, {:02X})", ut, name,
-                                ui, buf[ui]);
-                            aul = ut;
-                            // Re-read unlock prologue for future matches
-                            proc_mem_read(pid, aul, unlock_prologue, 8);
-                            LOG_DEBUG("[direct-hook]   updated unlock "
-                                "prologue: {:02X}{:02X}{:02X}{:02X}"
-                                "{:02X}{:02X}{:02X}{:02X}",
-                                unlock_prologue[0], unlock_prologue[1],
-                                unlock_prologue[2], unlock_prologue[3],
-                                unlock_prologue[4], unlock_prologue[5],
-                                unlock_prologue[6], unlock_prologue[7]);
-                        }
-                        break;
-                    }
-                }
-
-                if (lock_count == 0 && unlock_count == 0)
-                    LOG_DEBUG("[direct-hook]   {} no lock/unlock calls "
-                              "found by prologue match (scanned {} bytes)",
+                if (redirected == 0 && lock_seen == 0)
+                    LOG_DEBUG("[direct-hook]   {} no lock/unlock calls to "
+                              "active_lock/unlock (scanned {} bytes)",
                               name, fend);
                 else
-                    LOG_INFO("[direct-hook]   {} total: {} lock, {} unlock",
-                             name, lock_count, unlock_count);
+                    LOG_INFO("[direct-hook]   {} done: {} lock calls "
+                             "(guard-RET'd), {} unlock calls redirected "
+                             "to NOP stub", name, lock_seen, redirected);
             };
 
-            redirect_fn_locks(dhook_.newthread_addr, 200, "lua_newthread");
-            redirect_fn_locks(dhook_.load_addr, 1000, "luau_load");
-            redirect_fn_locks(dhook_.resume_addr, 500, "lua_resume");
+            // Redirect unlock calls in every function the trampoline calls.
+            // lua_lock calls are NOT patched — the guard-RET path in the
+            // trampoline (Cluster 2) handles them transparently.
+            redirect_unlock_calls(dhook_.newthread_addr, 200,
+                                  "lua_newthread");
+            redirect_unlock_calls(dhook_.load_addr, 1500, "luau_load");
+            redirect_unlock_calls(dhook_.resume_addr, 600, "lua_resume");
             if (dhook_.real_settop_addr &&
                 dhook_.real_settop_addr != dhook_.settop_addr)
-                redirect_fn_locks(dhook_.real_settop_addr, 80, "lua_settop");
+                redirect_unlock_calls(dhook_.real_settop_addr, 100,
+                                      "lua_settop");
 
             if (!lock_bypassed)
-                LOG_INFO("[direct-hook] all functions already use active lock");
+                LOG_INFO("[direct-hook] no unlock redirects needed — "
+                         "functions may not call active_unlock directly");
         } else {
-            LOG_WARN("[direct-hook] lua_lock hook but missing active_unlock "
-                     "— cannot redirect, falling back to guard-only");
+            LOG_WARN("[direct-hook] lua_lock hook but missing "
+                     "active_unlock (0x{:X}) or nop_stub (0x{:X}) "
+                     "— guard-RET handles lock, unlock may cause issues",
+                     aul, nop);
         }
     } else {
         LOG_INFO("[direct-hook] lock bypass skipped — hook target 0x{:X} is outside lock scope "
@@ -5630,6 +5617,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
