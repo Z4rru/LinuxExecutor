@@ -3834,11 +3834,20 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 int64_t rd0 = static_cast<int64_t>(r.start) -
                               static_cast<int64_t>(active_lock);
                 if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
+                if (out.resume) {
+                    int64_t rdr = static_cast<int64_t>(r.start) -
+                                  static_cast<int64_t>(out.resume);
+                    int64_t rdr_e = static_cast<int64_t>(r.end) -
+                                    static_cast<int64_t>(out.resume);
+                    bool near_resume = (rdr > -0xA00000LL && rdr < 0xA00000LL) ||
+                                       (rdr_e > -0xA00000LL && rdr_e < 0xA00000LL);
+                    if (!near_resume) continue;
+                }
                 size_t scan_sz = std::min(r.size(),
                                           static_cast<size_t>(0x4000000));
                 std::vector<uint8_t> code(scan_sz);
-                struct iovec sli = {code.data(), scan_sz};
-                struct iovec sri = {reinterpret_cast<void*>(r.start),
+                struct iovec lli = {code.data(), scan_sz};
+                struct iovec lri = {reinterpret_cast<void*>(r.start),
                                     scan_sz};
                 if (process_vm_readv(pid, &sli, 1, &sri, 1, 0) !=
                     static_cast<ssize_t>(scan_sz)) continue;
@@ -4443,7 +4452,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                             break;
                         }
                     }
-                    if (!sr_di || !sr_si || !sr_dx) continue;
+                    if (!sr_di || !sr_si) continue;
+                    if (!sr_dx && (fsz < 400 || calls < 8)) continue;
                     if (fsz < 200 || calls < 5) continue;
                     int shared = 0;
                     if (out.settop) {
@@ -6791,6 +6801,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
