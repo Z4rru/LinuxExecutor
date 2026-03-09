@@ -4297,8 +4297,6 @@ static std::vector<uint8_t> gen_entry_trampoline(
     return c;
 }
 
-    return c;
-}
 
 bool Injection::inject_via_direct_hook(pid_t pid) {
     if (dhook_.active) {
@@ -5617,6 +5615,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
