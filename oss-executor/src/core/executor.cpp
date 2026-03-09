@@ -127,13 +127,14 @@ bool Executor::send_to_payload(const std::string& source) {
             LOG_WARN("Bytecode version {} outside expected range [3..6]", static_cast<int>(bc_ver));
         }
 
-        bool ok = inj.send_via_mailbox(bc, bc_len, 1);
+        uint64_t armed_seq = inj.send_via_mailbox(bc, bc_len, 1);
         free(bc);
+        bool ok = (armed_seq != 0);
 
         if (ok) {
             // FIX 4: Wait for the payload to consume/acknowledge the mailbox
             // data instead of returning immediately.
-            bool ack = inj.wait_for_mailbox_ack(bc_len, bc_ver);
+            bool ack = inj.wait_for_mailbox_ack(armed_seq, bc_len, bc_ver);
             if (!ack) {
                 LOG_WARN("Mailbox send succeeded but execution was not "
                          "confirmed within timeout ({} bytes, v{})",
@@ -535,3 +536,4 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
+
