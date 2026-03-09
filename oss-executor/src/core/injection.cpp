@@ -4883,10 +4883,18 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                      "lock/unlock calls (active_lock=0x{:X} active_unlock=0x{:X})",
                      al, aul);
 
-            // Read prologues of active lock/unlock to identify copies
+                        // Use saved stolen bytes for lock prologue — the live bytes
+            // at active_lock are overwritten with our JMP hook patch.
             uint8_t lock_prologue[8] = {};
             uint8_t unlock_prologue[8] = {};
-            proc_mem_read(pid, al, lock_prologue, 8);
+            if (dhook_.hook_is_lock_fn && dhook_.stolen_len >= 6) {
+                memcpy(lock_prologue, dhook_.stolen_bytes,
+                       std::min(dhook_.stolen_len, static_cast<size_t>(8)));
+                LOG_DEBUG("[direct-hook] using saved stolen bytes as lock "
+                          "prologue (hook is on lua_lock)");
+            } else {
+                proc_mem_read(pid, al, lock_prologue, 8);
+            }
             proc_mem_read(pid, aul, unlock_prologue, 8);
             LOG_DEBUG("[direct-hook] lock prologue: {:02X}{:02X}{:02X}{:02X}"
                       "{:02X}{:02X}{:02X}{:02X}",
@@ -5622,6 +5630,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
