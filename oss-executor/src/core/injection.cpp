@@ -5241,14 +5241,15 @@ brute_done:
                         if (lock_sym && unlock_sym) {
                             int64_t delta = static_cast<int64_t>(pml_addr) -
                                             static_cast<int64_t>(libc_base + lock_sym);
-                            pmu_addr = libc_base + unlock_sym + delta;
+                            if (delta >= -0x100000LL && delta <= 0x100000LL) {
+                                pmu_addr = libc_base + unlock_sym + delta;
+                            } else {
+                                pmu_addr = libc_base + unlock_sym;
+                                delta = 0;
+                            }
                             LOG_DEBUG("[direct-hook] ELF: lock_sym=0x{:X} unlock_sym=0x{:X} "
                                       "delta={} → remote_unlock=0x{:X}",
                                       lock_sym, unlock_sym, delta, pmu_addr);
-                        } else if (unlock_sym) {
-                            pmu_addr = libc_base + unlock_sym;
-                            LOG_DEBUG("[direct-hook] ELF: unlock_sym offset=0x{:X} "
-                                      "→ remote_unlock=0x{:X}", unlock_sym, pmu_addr);
                         }
                     }
                 }
@@ -5261,7 +5262,12 @@ brute_done:
                 if (!pmu_sym) pmu_sym = find_remote_symbol(pid, "pthread", "pthread_mutex_unlock");
                 if (pml_sym && pmu_sym && pml_addr) {
                     int64_t delta = static_cast<int64_t>(pml_addr) - static_cast<int64_t>(pml_sym);
-                    pmu_addr = pmu_sym + delta;
+                    if (delta >= -0x100000LL && delta <= 0x100000LL) {
+                        pmu_addr = pmu_sym + delta;
+                    } else {
+                        pmu_addr = pmu_sym;
+                        delta = 0;
+                    }
                     LOG_DEBUG("[direct-hook] dlsym: lock_sym=0x{:X} unlock_sym=0x{:X} "
                               "delta={} → remote_unlock=0x{:X}",
                               pml_sym, pmu_sym, delta, pmu_addr);
@@ -6406,15 +6412,13 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                  "unavailable — held-lock hook will likely deadlock");
                     }
 
-                    bool can_release_lock = addrs.unlock_fn != 0 ||
-                                            addrs.lock_internals_valid;
-                    hook_needs_unlock = can_release_lock;
+                    hook_needs_unlock = false;
 
                     auto held_tramp = gen_entry_trampoline(
                         addrs, mb_addr, cave.padding_start,
                         best_live_settop, prologue, steal,
                         false,
-                        can_release_lock);
+                        false);
                     if (held_tramp.size() <= 512 &&
                         proc_mem_write(pid, cave.padding_start,
                                        held_tramp.data(),
@@ -6505,17 +6509,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         }
     } else {
         settop_probe_live = true;
-        bool can_release = addrs.unlock_fn != 0 || addrs.lock_internals_valid;
-        if (can_release) {
-            hook_needs_unlock = true;
-            LOG_INFO("[direct-hook] primary settop is live — enabling unlock "
-                     "bracket (unlock_fn={} internals={})",
-                     addrs.unlock_fn != 0, addrs.lock_internals_valid);
-        } else {
-            LOG_INFO("[direct-hook] primary settop is live — no unlock "
-                     "mechanism available, trampoline will fire without "
-                     "lock release (may deadlock if called with lock held)");
-        }
+        hook_needs_unlock = false;
     }
           // Re-generate trampoline with the final validated addrs
     // (lua_settop may have been re-scanned by lock-anchored validation)
@@ -7813,6 +7807,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
