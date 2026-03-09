@@ -213,6 +213,7 @@ private:
         uintptr_t active_lock_addr = 0;
         uintptr_t active_unlock_addr = 0;
         uintptr_t real_settop_addr = 0;
+        uintptr_t nop_stub_addr = 0;
     };
 
     bool inject_via_direct_hook(pid_t pid);
@@ -223,6 +224,7 @@ private:
 };
 
 }
+
 
 
 
