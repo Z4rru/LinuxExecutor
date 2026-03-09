@@ -3483,13 +3483,253 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                          "lua_resume, CROSS-VALIDATED)",
                          best_addr, best_fsz, best_shared, best_score,
                          fd / (1024.0 * 1024.0));
-            } else if (best_addr) {
+                        } else if (best_addr) {
                 LOG_WARN("[direct-hook] proximity signature: candidate 0x{:X} "
                          "rejected (score={}, need >=12)", best_addr, best_score);
             }
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // Validate luau_load calls active_lock.
+    // luau_load is a Lua C API function — it MUST call lua_lock.
+    // The proximity signature scan matches based on shared CALL targets
+    // with lua_resume, but if lua_resume is from a wrong copy the
+    // cross-validation anchors against a wrong reference.  Checking
+    // that luau_load calls active_lock confirms it's from the active
+    // Luau instance whose internal state (global_State, string tables,
+    // allocators) matches the thread created by lua_newthread.
+    // ═══════════════════════════════════════════════════════════════
+    if (out.load && active_lock) {
+        uint8_t load_head[200];
+        struct iovec lhl = {load_head, sizeof(load_head)};
+        struct iovec lhr = {reinterpret_cast<void*>(out.load),
+                            sizeof(load_head)};
+        bool load_calls_active_lock = false;
+        ssize_t lhrd = process_vm_readv(pid, &lhl, 1, &lhr, 1, 0);
+        if (lhrd >= 50) {
+            for (size_t li = 0; li + 5 <= static_cast<size_t>(lhrd); li++) {
+                if (load_head[li] != 0xE8) continue;
+                int32_t ld;
+                memcpy(&ld, &load_head[li + 1], 4);
+                uintptr_t lt = out.load + li + 5 + static_cast<int64_t>(ld);
+                if (lt == active_lock) {
+                    load_calls_active_lock = true;
+                    LOG_INFO("[direct-hook] luau_load confirmed — calls "
+                             "active_lock at +{}", li);
+                    break;
+                }
+                // One-hop check (wrapper function that calls active_lock)
+                if (!load_calls_active_lock && li < 80) {
+                    uint8_t hop[30];
+                    struct iovec hpl = {hop, 30};
+                    struct iovec hpr = {reinterpret_cast<void*>(lt), 30};
+                    if (process_vm_readv(pid, &hpl, 1, &hpr, 1, 0) == 30) {
+                        for (int hi = 0; hi < 25; hi++) {
+                            if (hop[hi] != 0xE8) continue;
+                            int32_t hd;
+                            memcpy(&hd, &hop[hi + 1], 4);
+                            uintptr_t ht = lt + hi + 5 +
+                                           static_cast<int64_t>(hd);
+                            if (ht == active_lock) {
+                                load_calls_active_lock = true;
+                                LOG_INFO("[direct-hook] luau_load confirmed"
+                                         " — reaches active_lock via "
+                                         "one-hop through 0x{:X} at +{}",
+                                         lt, li);
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (load_calls_active_lock) break;
+            }
+        }
+        if (!load_calls_active_lock) {
+            int64_t load_dist = static_cast<int64_t>(out.load) -
+                                static_cast<int64_t>(active_lock);
+            if (load_dist < 0) load_dist = -load_dist;
+            LOG_WARN("[direct-hook] luau_load at 0x{:X} does NOT call "
+                     "active_lock 0x{:X} ({:.1f}MB away) — wrong Luau "
+                     "copy, clearing for lock-anchored re-scan",
+                     out.load, active_lock,
+                     load_dist / (1024.0 * 1024.0));
+            out.load = 0;
+
+            // Lock-anchored re-scan: find luau_load by requiring a CALL
+            // to active_lock and matching the luau_load signature (large
+            // 3+ arg function, 200+ bytes, many CALL instructions).
+            LOG_INFO("[direct-hook] luau_load: lock-anchored re-scan "
+                     "(active_lock=0x{:X})", active_lock);
+            int best_lscore = -1;
+            uintptr_t best_laddr = 0;
+            size_t best_lfsz = 0;
+            int best_lcalls = 0;
+            for (const auto& r : regions) {
+                if (out.load) break;
+                if (!r.readable() || !r.executable()) continue;
+                if (r.size() < 512) continue;
+                int64_t rd0 = static_cast<int64_t>(r.start) -
+                              static_cast<int64_t>(active_lock);
+                if (rd0 < -0x5000000LL || rd0 > 0x5000000LL) continue;
+                size_t scan_sz = std::min(r.size(),
+                                          static_cast<size_t>(0x4000000));
+                std::vector<uint8_t> code(scan_sz);
+                struct iovec lli = {code.data(), scan_sz};
+                struct iovec lri = {reinterpret_cast<void*>(r.start),
+                                    scan_sz};
+                if (process_vm_readv(pid, &lli, 1, &lri, 1, 0) !=
+                    static_cast<ssize_t>(scan_sz)) continue;
+                for (size_t off = 1; off + 500 < scan_sz; off++) {
+                    if (code[off - 1] != 0xC3 && code[off - 1] != 0xCC &&
+                        code[off - 1] != 0x90) continue;
+                    uintptr_t addr = r.start + off;
+                    if (addr == out.resume || addr == out.settop ||
+                        addr == out.newthread || addr == out.sandbox)
+                        continue;
+                    size_t p = off;
+                    if (p + 3 < scan_sz && code[p] == 0xF3 &&
+                        code[p + 1] == 0x0F && code[p + 2] == 0x1E &&
+                        code[p + 3] == 0xFA) p += 4;
+                    if (p >= scan_sz) continue;
+                    if (!(code[p] == 0x55 || code[p] == 0x53 ||
+                          (code[p] == 0x41 && p + 1 < scan_sz &&
+                           code[p + 1] >= 0x54 &&
+                           code[p + 1] <= 0x57) ||
+                          (code[p] == 0x48 && p + 2 < scan_sz &&
+                           code[p + 1] == 0x83 &&
+                           code[p + 2] == 0xEC)))
+                        continue;
+                    // Must call active_lock
+                    bool has_alock = false;
+                    for (size_t fi = 0; fi < 100 && off + fi + 5 <= scan_sz;
+                         fi++) {
+                        if (code[off + fi] != 0xE8) continue;
+                        int32_t fd;
+                        memcpy(&fd, &code[off + fi + 1], 4);
+                        uintptr_t ft = r.start + off + fi + 5 +
+                                       static_cast<int64_t>(fd);
+                        if (ft == active_lock) { has_alock = true; break; }
+                        // One-hop
+                        uint8_t hb[30];
+                        struct iovec hbl = {hb, 30};
+                        struct iovec hbr = {
+                            reinterpret_cast<void*>(ft), 30};
+                        if (process_vm_readv(pid, &hbl, 1, &hbr, 1,
+                                             0) == 30) {
+                            for (int hi = 0; hi < 25; hi++) {
+                                if (hb[hi] != 0xE8) continue;
+                                int32_t hd;
+                                memcpy(&hd, &hb[hi + 1], 4);
+                                uintptr_t ht = ft + hi + 5 +
+                                    static_cast<int64_t>(hd);
+                                if (ht == active_lock) has_alock = true;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    if (!has_alock) continue;
+                    // luau_load signature: 3+ args, 200-2000 bytes, 5+ calls
+                    bool sr_di = false, sr_si = false, sr_dx = false;
+                    int calls = 0;
+                    size_t fsz = 0;
+                    for (size_t j = 0; j < 2000 && off + j + 5 < scan_sz;
+                         j++) {
+                        size_t i = off + j;
+                        if (code[i] == 0xE8) calls++;
+                        if (j < 30 && i + 2 < scan_sz) {
+                            if (code[i] == 0x89 &&
+                                (code[i + 1] & 0x38) == 0x38)
+                                sr_di = true;
+                            if ((code[i] == 0x48 || code[i] == 0x49) &&
+                                code[i + 1] == 0x89 &&
+                                (code[i + 2] & 0x38) == 0x38)
+                                sr_di = true;
+                            if (code[i] == 0x89 &&
+                                (code[i + 1] & 0x38) == 0x30)
+                                sr_si = true;
+                            if ((code[i] == 0x48 || code[i] == 0x49) &&
+                                code[i + 1] == 0x89 &&
+                                (code[i + 2] & 0x38) == 0x30)
+                                sr_si = true;
+                            if (code[i] == 0x89 &&
+                                (code[i + 1] & 0x38) == 0x10)
+                                sr_dx = true;
+                            if ((code[i] == 0x48 || code[i] == 0x49) &&
+                                code[i + 1] == 0x89 &&
+                                (code[i + 2] & 0x38) == 0x10)
+                                sr_dx = true;
+                        }
+                        if (code[i] == 0xC3 && j >= 200) {
+                            fsz = j + 1;
+                            break;
+                        }
+                    }
+                    if (!sr_di || !sr_si || !sr_dx) continue;
+                    if (fsz < 200 || calls < 5) continue;
+                    // Cross-validate: shared call targets with lua_settop
+                    // (which is confirmed active via active_lock extraction)
+                    int shared = 0;
+                    if (out.settop) {
+                        uint8_t stbuf[100];
+                        struct iovec stbl = {stbuf, 100};
+                        struct iovec stbr = {
+                            reinterpret_cast<void*>(out.settop), 100};
+                        if (process_vm_readv(pid, &stbl, 1, &stbr, 1,
+                                             0) >= 50) {
+                            for (size_t si2 = 0; si2 + 5 <= 100; si2++) {
+                                if (stbuf[si2] != 0xE8) continue;
+                                int32_t sd;
+                                memcpy(&sd, &stbuf[si2 + 1], 4);
+                                uintptr_t stt = out.settop + si2 + 5 +
+                                    static_cast<int64_t>(sd);
+                                for (size_t cj = 0;
+                                     cj < fsz && off + cj + 5 < scan_sz;
+                                     cj++) {
+                                    if (code[off + cj] != 0xE8) continue;
+                                    int32_t cd;
+                                    memcpy(&cd, &code[off + cj + 1], 4);
+                                    uintptr_t ct = r.start + off + cj + 5
+                                        + static_cast<int64_t>(cd);
+                                    if (ct == stt) { shared++; break; }
+                                }
+                            }
+                        }
+                    }
+                    int score = 20 + shared * 5 + (fsz >= 500 ? 3 : 0) +
+                                (calls >= 8 ? 2 : 0);
+                    if (score > best_lscore) {
+                        best_lscore = score;
+                        best_laddr = addr;
+                        best_lfsz = fsz;
+                        best_lcalls = calls;
+                    }
+                }
+            }
+            if (best_laddr && best_lscore >= 25) {
+                out.load = best_laddr;
+                int64_t fd = static_cast<int64_t>(best_laddr) -
+                             static_cast<int64_t>(active_lock);
+                if (fd < 0) fd = -fd;
+                LOG_INFO("[direct-hook] lock-anchored: luau_load=0x{:X} "
+                         "({}B, {} calls, score={}, {:.1f}MB from "
+                         "active_lock, VERIFIED)",
+                         best_laddr, best_lfsz, best_lcalls, best_lscore,
+                         fd / (1024.0 * 1024.0));
+            } else if (best_laddr) {
+                LOG_WARN("[direct-hook] lock-anchored luau_load candidate "
+                         "0x{:X} rejected (score={}, need >=25)",
+                         best_laddr, best_lscore);
+            } else {
+                LOG_WARN("[direct-hook] lock-anchored re-scan found no "
+                         "luau_load calling active_lock 0x{:X}",
+                         active_lock);
+            }
+        }
+    }
+
+                // Extract active lua_lock from the confirmed-active lua_settop.
     
     // ═══════════════════════════════════════════════════════════════
     // Extract active lua_lock from the confirmed-active lua_settop.
@@ -5529,6 +5769,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
