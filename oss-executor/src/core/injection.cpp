@@ -2616,84 +2616,59 @@ static size_t dh_insn_len(const uint8_t* p) {
     bool rex_w = false;
     if (p[i] >= 0x40 && p[i] <= 0x4F) { rex_w = (p[i] & 0x08) != 0; i++; }
     uint8_t op = p[i++];
-
-    // ═══════════════════════════════════════════════════════════
-    // VEX 2-byte prefix (C5 xx opcode modrm ...)
-    // Format: C5 [RvvvvLpp] [opcode] [modrm] [SIB] [disp] [imm]
-    // Common in AVX-compiled Sober/Roblox binaries.
-    // ═══════════════════════════════════════════════════════════
     if (op == 0xC5) {
         if (i >= 14) return 0;
-        i++;                      // skip VEX byte 2
-        uint8_t vop = p[i++];    // opcode (implied 0F map)
-        if (vop == 0x77) return i; // VZEROUPPER / VZEROALL — no modrm
+        i++;
+        uint8_t vop = p[i++];
+        if (vop == 0x77) return i;
         if (i >= 15) return 0;
-        // Parse modrm like any 0F-prefixed instruction
         uint8_t m = p[i++];
         uint8_t mod = (m >> 6) & 3, rm = m & 7;
-        if (mod != 3 && rm == 4) { uint8_t sib = p[i++]; if (mod == 0 && (sib & 7) == 5) i += 4; }
+        if (mod != 3 && rm == 4) { if (i>=15) return 0; uint8_t sib = p[i++]; if (mod == 0 && (sib & 7) == 5) i += 4; }
         if (mod == 0 && rm == 5) i += 4;
         else if (mod == 1) i += 1;
         else if (mod == 2) i += 4;
-        // Check if this opcode takes an imm8 (comparison predicates, shuffles)
-        // 0F3A-map opcodes always take imm8, but C5 implies 0F map.
-        // Common 0F-map opcodes with imm8: C6 (VSHUFPS), C2 (VCMPPS)
-        if (vop == 0xC6 || vop == 0xC2 || vop == 0xC4 || vop == 0xC5 ||
-            vop == 0x70 || vop == 0x71 || vop == 0x72 || vop == 0x73 ||
-            vop == 0xA4 || vop == 0xAC) i += 1;
+        if (vop==0xC6||vop==0xC2||vop==0xC4||vop==0xC5||vop==0x70||
+            vop==0x71||vop==0x72||vop==0x73||vop==0xA4||vop==0xAC) i += 1;
         return i;
     }
-    // ═══════════════════════════════════════════════════════════
-    // VEX 3-byte prefix (C4 xx xx opcode modrm ...)
-    // Format: C4 [RXBmmmmm] [WvvvvLpp] [opcode] [modrm] ...
-    // mmmmm: 1=0F, 2=0F38, 3=0F3A opcode map
-    // ═══════════════════════════════════════════════════════════
     if (op == 0xC4) {
         if (i + 1 >= 14) return 0;
-        uint8_t vb1 = p[i++];    // VEX byte 2
-        i++;                      // VEX byte 3
+        uint8_t vb1 = p[i++];
+        i++;
         uint8_t mmmmm = vb1 & 0x1F;
         if (i >= 15) return 0;
-        uint8_t vop = p[i++];    // opcode
+        uint8_t vop = p[i++];
         if (i >= 15) return 0;
-        // Parse modrm
         uint8_t m = p[i++];
         uint8_t mod = (m >> 6) & 3, rm = m & 7;
-        if (mod != 3 && rm == 4) { uint8_t sib = p[i++]; if (mod == 0 && (sib & 7) == 5) i += 4; }
+        if (mod != 3 && rm == 4) { if (i>=15) return 0; uint8_t sib = p[i++]; if (mod == 0 && (sib & 7) == 5) i += 4; }
         if (mod == 0 && rm == 5) i += 4;
         else if (mod == 1) i += 1;
         else if (mod == 2) i += 4;
-        // 0F3A map always has imm8; some 0F map opcodes have imm8 too
         if (mmmmm == 3) i += 1;
-        else if (mmmmm == 1 && (vop == 0xC6 || vop == 0xC2 || vop == 0xC4 ||
-                                vop == 0xC5 || vop == 0x70 || vop == 0x71 ||
-                                vop == 0x72 || vop == 0x73)) i += 1;
+        else if (mmmmm == 1 && (vop==0xC6||vop==0xC2||vop==0xC4||vop==0xC5||
+                                vop==0x70||vop==0x71||vop==0x72||vop==0x73)) i += 1;
         return i;
     }
-    // ═══════════════════════════════════════════════════════════
-    // EVEX 4-byte prefix (62 xx xx xx opcode modrm ...)
-    // In 64-bit mode, 0x62 is always EVEX (BOUND doesn't exist).
-    // ═══════════════════════════════════════════════════════════
     if (op == 0x62) {
         if (i + 2 >= 14) return 0;
-        uint8_t eb1 = p[i++];    // EVEX byte 2
-        i++;                      // EVEX byte 3
-        i++;                      // EVEX byte 4
+        uint8_t eb1 = p[i++];
+        i++; i++;
         uint8_t mmmmm = eb1 & 0x07;
         if (i >= 15) return 0;
-        i++;                      // skip opcode byte
+        uint8_t eop = p[i++];
+        (void)eop;
         if (i >= 15) return 0;
-        // Parse modrm
         uint8_t m = p[i++];
         uint8_t mod = (m >> 6) & 3, rm = m & 7;
-        if (mod != 3 && rm == 4) { uint8_t sib = p[i++]; if (mod == 0 && (sib & 7) == 5) i += 4; }
+        if (mod != 3 && rm == 4) { if (i>=15) return 0; uint8_t sib = p[i++]; if (mod == 0 && (sib & 7) == 5) i += 4; }
         if (mod == 0 && rm == 5) i += 4;
-        else if (mod == 1) i += 1;  // EVEX disp8*N compressed
+        else if (mod == 1) i += 1;
         else if (mod == 2) i += 4;
-        if (mmmmm == 3) i += 1;    // 0F3A map → imm8
+        if (mmmmm == 3) i += 1;
         return i;
     }
-
     if ((op>=0x50&&op<=0x5F)||op==0x90||op==0xC3||op==0xCC||op==0xC9) return i;
     if (op==0xC2) return i+2;
     if (op>=0xB0&&op<=0xB7) return i+1;
@@ -2705,7 +2680,7 @@ static size_t dh_insn_len(const uint8_t* p) {
         if (j >= 15) return 0;
         uint8_t m = p[j++];
         uint8_t mod = (m>>6)&3, rm = m&7;
-        if (mod!=3&&rm==4) { if (j>=15) return 0; uint8_t sib=p[j++]; if(mod==0&&(sib&7)==5) j+=4; }
+        if (mod!=3&&rm==4) { if(j>=15) return 0; uint8_t sib=p[j++]; if(mod==0&&(sib&7)==5) j+=4; }
         if (mod==0&&rm==5) j+=4;
         else if (mod==1) j+=1;
         else if (mod==2) j+=4;
@@ -2717,26 +2692,18 @@ static size_t dh_insn_len(const uint8_t* p) {
     if (op==0x0F) {
         uint8_t op2=p[i++];
         if (op2>=0x80&&op2<=0x8F) return i+4;
-        if (op2>=0x40&&op2<=0x4F) return mlen(i); // CMOVcc
-        if (op2>=0x90&&op2<=0x9F) return mlen(i); // SETcc
-        if (op2==0xB6||op2==0xB7||op2==0xBE||op2==0xBF) return mlen(i); // MOVZX/MOVSX
-        if (op2==0xAF) return mlen(i); // IMUL r, r/m
-        if (op2==0xA3||op2==0xAB||op2==0xB3||op2==0xBB) return mlen(i); // BT/BTS/BTR/BTC
-        if (op2==0xBC||op2==0xBD) return mlen(i); // BSF/BSR/TZCNT/LZCNT
-        if (op2==0xA4||op2==0xAC) return mlen(i)+1; // SHLD/SHRD imm8
-        if (op2==0xA5||op2==0xAD) return mlen(i); // SHLD/SHRD cl
-        if (op2==0xBA) return mlen(i)+1; // BT/BTS/BTR/BTC imm8
+        if (op2>=0x40&&op2<=0x4F) return mlen(i);
+        if (op2>=0x90&&op2<=0x9F) return mlen(i);
+        if (op2==0xB6||op2==0xB7||op2==0xBE||op2==0xBF) return mlen(i);
+        if (op2==0xAF) return mlen(i);
+        if (op2==0xA3||op2==0xAB||op2==0xB3||op2==0xBB) return mlen(i);
+        if (op2==0xBC||op2==0xBD) return mlen(i);
+        if (op2==0xA4||op2==0xAC) return mlen(i)+1;
+        if (op2==0xA5||op2==0xAD) return mlen(i);
+        if (op2==0xBA) return mlen(i)+1;
         if (op2==0x1F||op2==0x44||(op2>=0x10&&op2<=0x17)||(op2>=0x28&&op2<=0x2F)) return mlen(i);
-        if (op2==0x38) { // 0F 38 xx — 3-byte opcode map
-            if (i >= 15) return 0;
-            i++; // third opcode byte
-            return mlen(i);
-        }
-        if (op2==0x3A) { // 0F 3A xx — 3-byte opcode map with imm8
-            if (i >= 15) return 0;
-            i++; // third opcode byte
-            return mlen(i)+1;
-        }
+        if (op2==0x38) { if (i>=15) return 0; i++; return mlen(i); }
+        if (op2==0x3A) { if (i>=15) return 0; i++; return mlen(i)+1; }
         return mlen(i);
     }
     if ((op&0xC4)==0x00||(op&0xFE)==0x84||(op&0xFC)==0x88||op==0x8C||op==0x8E||
@@ -2760,7 +2727,6 @@ static size_t dh_insn_len(const uint8_t* p) {
         op==0xAC||op==0xAD||op==0xAE||op==0xAF) return i;
     if (op==0xCD) return i+1;
     if (op==0xE4||op==0xE5||op==0xE6||op==0xE7) return i+1;
-    // LOOP/LOOPcc/JCXZ — 2-byte with rel8
     if (op==0xE0||op==0xE1||op==0xE2||op==0xE3) return i+1;
     return 0;
 }
@@ -5792,22 +5758,7 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // Stack growth is bounded: Roblox creates fresh lua_States regularly,
     // and one extra slot per script execution is negligible vs LUAI_MAXSTACK.
     size_t settop_label = c.size();
-    size_t step4_settop_movabs = 0;
-    if (hook_target_is_settop && hook_target != 0) {
-        // Step 4 will CALL a cleanup thunk embedded at the end of this
-        // trampoline. The thunk address is not yet known — use a placeholder
-        // and patch it after the thunk is emitted.
-        e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 4
-        e({0x4C,0x89,0xFF});           // mov rdi, r15 (original L)
-        e({0xBE,0xFE,0xFF,0xFF,0xFF}); // mov esi, -2
-        step4_settop_movabs = c.size();
-        e({0x48,0xB8}); e64(0);       // mov rax, <thunk_addr> — PATCHED BELOW
-        e({0xFF,0xD0});                // call rax
-    } else if (a.settop != 0 && !hook_target_is_settop) {
-        // hook_target is NOT settop (e.g., lua_resume fallback).
-        // Skip step 4: the dead settop has broken inlined unlock.
-        // The new thread stays on L's stack and will be GC'd.
-        e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00}); // step 4 skipped (0x44 = indicator)
+    e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00});
     } else {
         e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00}); // step 4 skipped
     }
@@ -8070,6 +8021,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
