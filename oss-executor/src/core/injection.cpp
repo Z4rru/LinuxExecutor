@@ -6005,6 +6005,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         free(test_bc);
 
         if (!dryrun_pass) {
+            uint32_t fail_step = 0;
+            proc_mem_read(pid, mb_addr + 44, &fail_step, 4);
+
             LOG_ERROR("[direct-hook] dry-run validation FAILED — "
                       "cleaning up hook and reporting failure");
 
@@ -6013,21 +6016,323 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
             uint32_t reset_step = 0;
             uint8_t reset_guard = 0;
-            proc_mem_write(pid, dhook_.mailbox_addr + 44,
-                           &reset_step, 4);
-            proc_mem_write(pid, dhook_.mailbox_addr + 40,
-                           &reset_guard, 1);
+            proc_mem_write(pid, mb_addr + 44, &reset_step, 4);
+            proc_mem_write(pid, mb_addr + 40, &reset_guard, 1);
 
             DirectMailbox empty_mb{};
-            proc_mem_write(pid, dhook_.mailbox_addr, &empty_mb,
+            proc_mem_write(pid, mb_addr, &empty_mb,
                            sizeof(DirectMailbox));
 
             dhook_ = {};
 
-            error_ = "Direct hook dry-run failed — trampoline "
-                     "deadlocked at lua_newthread (step 1). "
-                     "The hook target likely passes "
-                     "global_State* instead of lua_State* in rdi.";
+            if (fail_step == 1 && addrs.resume != 0 &&
+                hook_addr != addrs.resume) {
+                LOG_INFO("[direct-hook] step-1 deadlock: live settop "
+                         "called with Lua lock held. Retrying with "
+                         "lua_resume (top-level API, never lock-held)");
+
+                uint8_t resume_pro[32];
+                if (proc_mem_read(pid, addrs.resume, resume_pro,
+                                  sizeof(resume_pro))) {
+                    size_t resume_steal = 0;
+                    while (resume_steal < 5) {
+                        size_t il = dh_insn_len(
+                            resume_pro + resume_steal);
+                        if (il == 0 ||
+                            resume_steal + il > sizeof(resume_pro))
+                            break;
+                        resume_steal += il;
+                    }
+
+                    int64_t resume_cave_dist =
+                        static_cast<int64_t>(cave.padding_start) -
+                        static_cast<int64_t>(addrs.resume + 5);
+                    bool cave_reachable =
+                        (resume_cave_dist >= INT32_MIN &&
+                         resume_cave_dist <= INT32_MAX) ||
+                        resume_steal >= 14;
+
+                    if (resume_steal >= 5 && cave_reachable) {
+                        auto rt = gen_entry_trampoline(
+                            addrs, mb_addr, cave.padding_start,
+                            addrs.resume, resume_pro, resume_steal,
+                            false, false);
+
+                        if (rt.size() <= 400 &&
+                            proc_mem_write(pid, cave.padding_start,
+                                           rt.data(), rt.size())) {
+
+                            uint8_t rp[16];
+                            size_t rpl;
+                            if (resume_cave_dist >= INT32_MIN &&
+                                resume_cave_dist <= INT32_MAX &&
+                                resume_steal >= 5) {
+                                rp[0] = 0xE9;
+                                int32_t r32 = static_cast<int32_t>(
+                                    resume_cave_dist);
+                                memcpy(rp + 1, &r32, 4);
+                                for (size_t i = 5; i < resume_steal;
+                                     i++)
+                                    rp[i] = 0x90;
+                                rpl = resume_steal;
+                            } else {
+                                rp[0] = 0xFF; rp[1] = 0x25;
+                                memset(rp + 2, 0, 4);
+                                uintptr_t ca = cave.padding_start;
+                                memcpy(rp + 6, &ca, 8);
+                                rpl = 14;
+                            }
+
+                            if (proc_mem_write(pid, addrs.resume,
+                                               rp, rpl)) {
+                                uint8_t vf[16] = {};
+                                proc_mem_read(pid, addrs.resume,
+                                              vf, rpl);
+                                if (memcmp(vf, rp, rpl) != 0) {
+                                    LOG_ERROR("[direct-hook] "
+                                        "lua_resume patch did not "
+                                        "persist");
+                                } else {
+                                    uint16_t zh = 0;
+                                    proc_mem_write(pid, mb_addr + 42,
+                                                   &zh, 2);
+                                    usleep(1000000);
+                                    uint16_t rh = 0;
+                                    proc_mem_read(pid, mb_addr + 42,
+                                                  &rh, 2);
+
+                                    if (rh < 1) {
+                                        LOG_WARN("[direct-hook] "
+                                            "lua_resume at 0x{:X} "
+                                            "has {} hits in 1s — "
+                                            "may not be called "
+                                            "frequently", addrs.resume,
+                                            rh);
+                                        proc_mem_write(pid,
+                                            addrs.resume, resume_pro,
+                                            resume_steal);
+                                    } else {
+                                        LOG_INFO("[direct-hook] "
+                                            "lua_resume probe: {} "
+                                            "hits in 1s — LIVE",
+                                            rh);
+
+                                        hook_addr = addrs.resume;
+                                        memcpy(prologue, resume_pro,
+                                               resume_steal);
+                                        steal = resume_steal;
+                                        patch_len = rpl;
+                                        memcpy(patch, rp, rpl);
+                                        is_lock_hook = false;
+
+                                        auto rt_final =
+                                            gen_entry_trampoline(
+                                                addrs, mb_addr,
+                                                cave.padding_start,
+                                                addrs.resume,
+                                                resume_pro,
+                                                resume_steal,
+                                                false, false);
+                                        proc_mem_write(pid,
+                                            cave.padding_start,
+                                            rt_final.data(),
+                                            rt_final.size());
+
+                                        DirectMailbox mb2{};
+                                        memcpy(mb2.magic,
+                                            "OSS_DMBOX_V3\0\0\0\0",
+                                            16);
+                                        proc_mem_write(pid, mb_addr,
+                                            &mb2, sizeof(mb2));
+
+                                        size_t r_bc_len = 0;
+                                        const char* r_src = "return";
+                                        char* r_bc = luau_compile(
+                                            r_src, strlen(r_src),
+                                            nullptr, &r_bc_len);
+                                        bool r_pass = false;
+
+                                        if (r_bc && r_bc_len > 0 &&
+                                            static_cast<uint8_t>(
+                                                r_bc[0]) != 0 &&
+                                            r_bc_len <= 16320) {
+
+                                            proc_mem_write(pid,
+                                                mb_addr + 64, r_bc,
+                                                r_bc_len);
+                                            uint32_t rsz =
+                                                static_cast<uint32_t>(
+                                                    r_bc_len);
+                                            uint32_t rfl = 1;
+                                            proc_mem_write(pid,
+                                                mb_addr + 32, &rsz, 4);
+                                            proc_mem_write(pid,
+                                                mb_addr + 36, &rfl, 4);
+                                            uint32_t z32 = 0;
+                                            proc_mem_write(pid,
+                                                mb_addr + 44, &z32, 4);
+                                            uint8_t z8 = 0;
+                                            proc_mem_write(pid,
+                                                mb_addr + 40, &z8, 1);
+                                            uint16_t z16 = 0;
+                                            proc_mem_write(pid,
+                                                mb_addr + 42, &z16, 2);
+                                            uint64_t r_seq = 1;
+                                            proc_mem_write(pid,
+                                                mb_addr + 16, &r_seq,
+                                                8);
+
+                                            for (int ri = 0; ri < 100;
+                                                 ri++) {
+                                                usleep(50000);
+                                                if (kill(pid, 0) != 0)
+                                                    break;
+                                                uint64_t r_ack = 0;
+                                                proc_mem_read(pid,
+                                                    mb_addr + 24,
+                                                    &r_ack, 8);
+                                                if (r_ack >= r_seq) {
+                                                    r_pass = true;
+                                                    uint32_t r_st = 0;
+                                                    proc_mem_read(pid,
+                                                        mb_addr + 44,
+                                                        &r_st, 4);
+                                                    LOG_INFO(
+                                                        "[direct-hook]"
+                                                        " lua_resume "
+                                                        "dry-run "
+                                                        "PASSED in "
+                                                        "{}ms (step="
+                                                        "{})",
+                                                        (ri + 1) * 50,
+                                                        r_st);
+                                                    break;
+                                                }
+                                                if (ri % 20 == 19) {
+                                                    uint32_t rs = 0;
+                                                    uint8_t rg = 0;
+                                                    proc_mem_read(pid,
+                                                        mb_addr + 44,
+                                                        &rs, 4);
+                                                    proc_mem_read(pid,
+                                                        mb_addr + 40,
+                                                        &rg, 1);
+                                                    LOG_DEBUG(
+                                                        "[direct-hook]"
+                                                        " resume "
+                                                        "dry-run "
+                                                        "wait[{}]: "
+                                                        "step={} "
+                                                        "guard={}",
+                                                        ri, rs, rg);
+                                                    if (rs == 1 &&
+                                                        rg == 1 &&
+                                                        ri >= 39) {
+                                                        LOG_ERROR(
+                                                            "[direct-"
+                                                            "hook] "
+                                                            "lua_resume"
+                                                            " dry-run "
+                                                            "also "
+                                                            "deadlocked"
+                                                            " at step 1"
+                                                        );
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        free(r_bc);
+
+                                        if (r_pass) {
+                                            dhook_.cave_addr =
+                                                cave.padding_start;
+                                            dhook_.mailbox_addr =
+                                                mb_addr;
+                                            dhook_.cave_size = 400;
+                                            dhook_.nop_stub_addr = 0;
+                                            dhook_.stolen_len =
+                                                resume_steal;
+                                            dhook_.resume_addr =
+                                                addrs.resume;
+                                            dhook_.newthread_addr =
+                                                addrs.newthread;
+                                            dhook_.load_addr =
+                                                addrs.load;
+                                            dhook_.settop_addr =
+                                                addrs.resume;
+                                            memcpy(
+                                                dhook_.stolen_bytes,
+                                                resume_pro,
+                                                resume_steal);
+                                            memcpy(
+                                                dhook_.orig_patch,
+                                                resume_pro,
+                                                rpl);
+                                            dhook_.patch_len = rpl;
+                                            {
+                                                auto tm =
+                                                    gen_entry_trampoline(
+                                                        addrs, mb_addr,
+                                                        cave.padding_start,
+                                                        addrs.resume,
+                                                        resume_pro,
+                                                        resume_steal,
+                                                        false, false);
+                                                dhook_.nop_stub_addr =
+                                                    cave.padding_start +
+                                                    tm.size() - 1;
+                                            }
+                                            dhook_.active = true;
+                                            dhook_.has_compile =
+                                                (addrs.compile != 0);
+                                            dhook_.hook_is_lock_fn =
+                                                false;
+
+                                            LOG_INFO("[direct-hook] "
+                                                "ENTRY HOOK ARMED — "
+                                                "lua_resume at "
+                                                "0x{:X} (step-1 "
+                                                "retry SUCCESS)",
+                                                addrs.resume);
+                                            set_state(
+                                                InjectionState::Ready,
+                                                "Direct hook active "
+                                                "\u2014 ready for "
+                                                "scripts");
+                                            return true;
+                                        }
+
+                                        LOG_WARN("[direct-hook] "
+                                            "lua_resume dry-run also "
+                                            "failed — giving up");
+                                        proc_mem_write(pid,
+                                            addrs.resume, resume_pro,
+                                            resume_steal);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            {
+                const char* sn[] = {
+                    "trampoline never entered payload path",
+                    "lua_newthread", "luau_load",
+                    "lua_resume", "lua_settop(-2) cleanup"
+                };
+                const char* step_name = (fail_step <= 4)
+                    ? sn[fail_step] : "unknown";
+                error_ = "Direct hook dry-run failed — trampoline "
+                         "deadlocked at step " +
+                         std::to_string(fail_step) + " (" +
+                         step_name + ").";
+                if (fail_step == 1)
+                    error_ += " Hook target called with Lua lock "
+                              "held — lua_resume retry also failed.";
+            }
             set_state(InjectionState::Failed, error_);
             return false;
         }
@@ -6806,6 +7111,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
