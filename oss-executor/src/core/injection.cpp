@@ -3564,7 +3564,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 std::vector<uint8_t> code(scan_sz);
                 struct iovec sli = {code.data(), scan_sz};
                 struct iovec sri = {reinterpret_cast<void*>(r.start), scan_sz};
-                if (process_vm_readv(pid, &sli, 1, &sri, 1, 0) !=
+                if (process_vm_readv(pid, &lli, 1, &lri, 1, 0) !=
                     static_cast<ssize_t>(scan_sz)) continue;
                 for (size_t off = 1; off + 500 < scan_sz; off++) {
                     if (code[off-1]!=0xC3 && code[off-1]!=0xCC &&
@@ -6801,6 +6801,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
