@@ -3849,30 +3849,84 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
 
-            // Extract active_unlock from lua_settop (last CALL before RET).
-    // In every Lua C API function, the last CALL before RET is lua_unlock.
-    if (active_lock && out.settop && !out.unlock_fn) {
-        uint8_t ul_buf[80];
-        struct iovec ul_l = {ul_buf, sizeof(ul_buf)};
-        struct iovec ul_r = {reinterpret_cast<void*>(out.settop), sizeof(ul_buf)};
-        if (process_vm_readv(pid, &ul_l, 1, &ul_r, 1, 0) ==
-            static_cast<ssize_t>(sizeof(ul_buf))) {
-            size_t ul_fend = sizeof(ul_buf);
-            for (size_t ui = 20; ui < sizeof(ul_buf); ui++) {
-                if (ul_buf[ui] == 0xC3) { ul_fend = ui; break; }
-            }
-            for (int ui = static_cast<int>(ul_fend) - 5; ui >= 0; ui--) {
-                if (ul_buf[ui] != 0xE8) continue;
+             // Extract active_unlock from Lua API functions.
+    // lua_unlock is the last CALL (E8) or tail-call JMP (E9) before RET.
+    // lua_settop often uses E9 tail-call, so we check both opcodes.
+    // Try multiple source functions for robustness.
+    auto extract_unlock = [&](uintptr_t fn_addr, size_t buf_size,
+                              const char* name) -> uintptr_t {
+        if (!fn_addr || out.unlock_fn) return 0;
+        std::vector<uint8_t> ul_buf(buf_size);
+        struct iovec ul_l = {ul_buf.data(), buf_size};
+        struct iovec ul_r = {reinterpret_cast<void*>(fn_addr), buf_size};
+        if (process_vm_readv(pid, &ul_l, 1, &ul_r, 1, 0) !=
+            static_cast<ssize_t>(buf_size)) return 0;
+
+        // Find function boundary: C3 after offset 20
+        size_t ul_fend = buf_size;
+        for (size_t ui = 20; ui < buf_size; ui++) {
+            if (ul_buf[ui] == 0xC3) { ul_fend = ui; break; }
+        }
+
+        // Scan backward for E9 (jmp rel32 tail-call) or E8 (call)
+        // Check E9 first — if function ends with jmp, there may be no
+        // E8 unlock at all (the jmp IS the unlock as a tail call)
+        for (int ui = static_cast<int>(ul_fend) - 1; ui >= 10; ui--) {
+            uint8_t op = ul_buf[ui];
+            if (op != 0xE8 && op != 0xE9) continue;
+            if (ui + 5 > static_cast<int>(buf_size)) continue;
+            int32_t ud; memcpy(&ud, &ul_buf[ui + 1], 4);
+            uintptr_t ut = fn_addr + ui + 5 + static_cast<int64_t>(ud);
+            if (ut == active_lock) continue; // skip lock, want unlock
+            if (ut == fn_addr) continue;     // skip self-recursion
+            // Validate target looks like a function (not garbage)
+            uint8_t probe[8];
+            struct iovec pl = {probe, 8};
+            struct iovec pr = {reinterpret_cast<void*>(ut), 8};
+            if (process_vm_readv(pid, &pl, 1, &pr, 1, 0) != 8) continue;
+            if (probe[0]==0x00||probe[0]==0xCC) continue;
+            LOG_INFO("[direct-hook] active lua_unlock at 0x{:X} "
+                     "(from {}+{}, opcode={:02X})",
+                     ut, name, ui, op);
+            return ut;
+        }
+
+        // If no C3 found in buffer (pure tail-call function), scan for
+        // the last E9 in the buffer that isn't active_lock
+        if (ul_fend == buf_size) {
+            for (int ui = static_cast<int>(buf_size) - 5; ui >= 10; ui--) {
+                if (ul_buf[ui] != 0xE9) continue;
                 int32_t ud; memcpy(&ud, &ul_buf[ui + 1], 4);
-                uintptr_t ut = out.settop + ui + 5 + static_cast<int64_t>(ud);
-                if (ut != active_lock) {
-                    out.unlock_fn = ut;
-                    LOG_INFO("[direct-hook] active lua_unlock at 0x{:X} "
-                             "(from lua_settop+{})", ut, ui);
-                }
-                break;
+                uintptr_t ut = fn_addr + ui + 5 + static_cast<int64_t>(ud);
+                if (ut == active_lock || ut == fn_addr) continue;
+                uint8_t probe[4];
+                struct iovec pl = {probe, 4};
+                struct iovec pr = {reinterpret_cast<void*>(ut), 4};
+                if (process_vm_readv(pid, &pl, 1, &pr, 1, 0) != 4) continue;
+                if (probe[0]==0x00||probe[0]==0xCC) continue;
+                LOG_INFO("[direct-hook] active lua_unlock at 0x{:X} "
+                         "(from {}+{}, tail-call E9, no RET in function)",
+                         ut, name, ui);
+                return ut;
             }
         }
+        return 0;
+    };
+
+    if (active_lock && !out.unlock_fn) {
+        uintptr_t ul = 0;
+        // Try lua_settop first (small, clean API function)
+        if (!ul && out.settop)
+            ul = extract_unlock(out.settop, 80, "lua_settop");
+        // Try lua_resume (larger, less likely to tail-call)
+        if (!ul && out.resume)
+            ul = extract_unlock(out.resume, 200, "lua_resume");
+        // Try lua_newthread
+        if (!ul && out.newthread)
+            ul = extract_unlock(out.newthread, 200, "lua_newthread");
+        if (ul) out.unlock_fn = ul;
+        else LOG_WARN("[direct-hook] could not extract active lua_unlock "
+                      "from any source function");
     }
 
     // Ensure lock_fn always points to the live active_lock if we found one.
@@ -4508,6 +4562,10 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         dhook_.active_lock_addr = hook_addr;
         dhook_.active_unlock_addr = addrs.unlock_fn;
         dhook_.real_settop_addr = addrs.settop;
+        if (!addrs.unlock_fn) {
+            LOG_WARN("[direct-hook] active_unlock not found during symbol "
+                     "resolution — lock redirects may fail");
+        }
         LOG_INFO("[direct-hook] lock hook addrs: active_lock=0x{:X} "
                  "active_unlock=0x{:X} real_settop=0x{:X}",
                  hook_addr, addrs.unlock_fn, addrs.settop);
@@ -4834,9 +4892,10 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                     }
                 }
 
-                // First CALL → lock
+                // First CALL (E8) or JMP-after-prologue (E9) → lock
                 for (size_t i = 0; i + 5 <= fend; i++) {
-                    if (buf[i] != 0xE8) continue;
+                    if (buf[i] != 0xE8 && !(buf[i] == 0xE9 && i >= 8))
+                        continue;
                     int32_t d; memcpy(&d, &buf[i+1], 4);
                     uintptr_t tgt = fn_addr + i + 5 +
                                     static_cast<int64_t>(d);
@@ -4863,9 +4922,11 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                     break;
                 }
 
-                // Last CALL → unlock
-                for (int i = static_cast<int>(fend) - 5; i >= 20; i--) {
-                    if (buf[i] != 0xE8) continue;
+                               // Last CALL (E8) or JMP (E9) → unlock
+                // lua_unlock is often a tail-call (E9 jmp) in small functions
+                for (int i = static_cast<int>(fend) - 1; i >= 20; i--) {
+                    if (buf[i] != 0xE8 && buf[i] != 0xE9) continue;
+                    if (i + 5 > static_cast<int>(scan_size)) continue;
                     int32_t d; memcpy(&d, &buf[i+1], 4);
                     uintptr_t tgt = fn_addr + i + 5 +
                                     static_cast<int64_t>(d);
@@ -4874,12 +4935,14 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                                   name);
                         break;
                     }
-                    if (tgt == al) break; // same as lock — skip
+                    if (tgt == al) continue; // skip lock refs, keep searching
+                    if (tgt == fn_addr) continue; // skip self-call
                     int64_t nd = static_cast<int64_t>(aul) -
                                  static_cast<int64_t>(fn_addr + i + 5);
                     if (nd < INT32_MIN || nd > INT32_MAX) {
                         LOG_WARN("[direct-hook]   {} unlock redirect out of "
-                                 "rel32 range", name);
+                                 "rel32 range (at +{}, {:02X})", name, i,
+                                 buf[i]);
                         break;
                     }
                     int32_t nd32 = static_cast<int32_t>(nd);
@@ -4888,7 +4951,8 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                         call_redirects.push_back({pa, d});
                         lock_bypassed = true;
                         LOG_INFO("[direct-hook]   {} unlock: 0x{:X}→0x{:X} "
-                                 "(at +{})", name, tgt, aul, i);
+                                 "(at +{}, {:02X})", name, tgt, aul, i,
+                                 buf[i]);
                     }
                     break;
                 }
@@ -5495,6 +5559,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
