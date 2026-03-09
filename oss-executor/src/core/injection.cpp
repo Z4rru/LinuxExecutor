@@ -3289,14 +3289,23 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                             static_cast<ssize_t>(rdsz)) continue;
                         for (size_t li = 0; li + 7 <= rdsz && !out.load; li++) {
                             bool xf = false;
-                            if (lrbuf[li]==0x8D && (lrbuf[li+1]&0xC7)==0x05) {
+                                                        // LEA or MOV reg,[rip+disp32] (0x8D=LEA, 0x8B=MOV)
+                            if ((lrbuf[li]==0x8D || lrbuf[li]==0x8B) && (lrbuf[li+1]&0xC7)==0x05) {
                                 int32_t d; memcpy(&d, &lrbuf[li+2], 4);
                                 if (xr.start+lroff+li+6+(int64_t)d == str_addr) xf=true;
                             }
+                            // REX + LEA/MOV reg,[rip+disp32]
                             if (!xf && lrbuf[li]>=0x40 && lrbuf[li]<=0x4F &&
-                                lrbuf[li+1]==0x8D && (lrbuf[li+2]&0xC7)==0x05) {
+                                (lrbuf[li+1]==0x8D || lrbuf[li+1]==0x8B) && (lrbuf[li+2]&0xC7)==0x05) {
                                 int32_t d; memcpy(&d, &lrbuf[li+3], 4);
                                 if (xr.start+lroff+li+7+(int64_t)d == str_addr) xf=true;
+                            }
+                            // MOVABS reg, imm64 — absolute address in immediate
+                            if (!xf && li + 10 <= rdsz &&
+                                lrbuf[li]>=0x48 && lrbuf[li]<=0x4F &&
+                                lrbuf[li+1]>=0xB8 && lrbuf[li+1]<=0xBF) {
+                                uintptr_t imm; memcpy(&imm, &lrbuf[li+2], 8);
+                                if (imm == str_addr) xf=true;
                             }
                             if (!xf) continue;
                             uintptr_t xa = xr.start + lroff + li;
@@ -4019,15 +4028,32 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         }
         std::vector<uint8_t> buf(scan_range);
         if (!proc_mem_read(pid, fn_addr, buf.data(), scan_range)) return;
+        // Detect function boundary to prevent scanning into adjacent functions.
+        // Without this, scan_range=800 for a 579-byte function finds the "unlock"
+        // CALL in a neighboring function, and patching it with RET corrupts that code.
+        // Looks for RET followed by boundary marker (padding, new prologue, etc.)
+        // to skip early-exit RETs within the function body.
+        int func_end = scan_range;
+        for (int i = 25; i < scan_range - 1; i++) {
+            if (buf[i] != 0xC3) continue;
+            uint8_t next = buf[i + 1];
+            if (next == 0xCC || next == 0x90 || next == 0x55 || next == 0x53 ||
+                next == 0xF3 || next == 0x00 ||
+                (next == 0x41 && i + 2 < scan_range &&
+                 buf[i+2] >= 0x54 && buf[i+2] <= 0x57)) {
+                func_end = i + 1;
+                break;
+            }
+        }
         uintptr_t targets[2] = {0, 0};
-        for (int i = 0; i < std::min(first_range, scan_range - 4); i++) {
+        for (int i = 0; i < std::min(first_range, func_end - 4); i++) {
             if (buf[i] == 0xE8) {
                 int32_t d; memcpy(&d, &buf[i+1], 4);
                 targets[0] = fn_addr + i + 5 + (int64_t)d;
                 break;
             }
         }
-        for (int i = scan_range - 5; i >= 20; i--) {
+        for (int i = func_end - 5; i >= 20; i--) {
             if (buf[i] == 0xE8) {
                 int32_t d; memcpy(&d, &buf[i+1], 4);
                 targets[1] = fn_addr + i + 5 + (int64_t)d;
@@ -4061,7 +4087,19 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
         }
     };
 
-    if (!dhook_.hook_is_lock_fn) {
+        // Lock bypass is only needed when hook target is inside a lock scope.
+    // lua_settop is called by Roblox while the Lua mutex is held — without
+    // bypass, our internal API calls (newthread/load/resume) would deadlock.
+    // lua_resume/newthread/load are called from OUTSIDE the lock scope — each
+    // API call acquires/releases its own lock safely.  Bypassing locks when
+    // hooking these functions patches unrelated code with RET, corrupting
+    // internal state and causing luau_load to hang at step 2.
+    bool hook_needs_lock_bypass = !dhook_.hook_is_lock_fn &&
+        dhook_.settop_addr != dhook_.resume_addr &&
+        dhook_.settop_addr != dhook_.newthread_addr &&
+        dhook_.settop_addr != dhook_.load_addr;
+
+    if (hook_needs_lock_bypass) {
         // Bypass locks in functions the trampoline calls internally.
         // The hook target itself is skipped by the lambda (prologue is patched).
         bypass_locks_in(dhook_.newthread_addr, 18, 200, "newthread");
@@ -4110,11 +4148,23 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
             // For small scan sizes (e.g. lua_settop ~65B scanned as 100),
             // estimate function boundary to avoid scanning into adjacent functions.
             // Uses first RET after offset 20 as the boundary.
+                        // Detect function boundary for ALL scan sizes.
+            // Without this, deep scans of 1500 bytes for a 579-byte function
+            // find lock/unlock calls in adjacent functions, causing false RET patches.
+            // Uses RET+boundary-marker to skip early-exit RETs within the function.
             size_t effective_end = scan_size;
-            if (scan_size <= 300) {
-                for (size_t i = 20; i < scan_size; i++) {
-                    if (buf[i] == 0xC3) { effective_end = i + 1; break; }
+            for (size_t i = 25; i < scan_size - 1; i++) {
+                if (buf[i] != 0xC3) continue;
+                uint8_t next = buf[i + 1];
+                if (next == 0xCC || next == 0x90 || next == 0x55 || next == 0x53 ||
+                    next == 0xF3 || next == 0x00 ||
+                    (next == 0x41 && i + 2 < scan_size &&
+                     buf[i+2] >= 0x54 && buf[i+2] <= 0x57)) {
+                    effective_end = i + 1;
+                    break;
                 }
+            }
+            if (effective_end < scan_size) {
                 LOG_DEBUG("[direct-hook] {} effective boundary: {}/{} bytes",
                           name, effective_end, scan_size);
             }
@@ -4189,8 +4239,12 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                 deep_bypass_fn(real_settop, 100, "lua_settop");
             }
         }
-    } else {
+    } else if (dhook_.hook_is_lock_fn) {
         LOG_INFO("[direct-hook] lock bypass skipped — lua_lock hook uses guard for reentrancy");
+    } else {
+        LOG_INFO("[direct-hook] lock bypass skipped — hook target 0x{:X} is outside lock scope "
+                 "(API calls handle own locking, bypass would corrupt internal state)",
+                 dhook_.settop_addr);
     }
 
     uint64_t new_seq = seq + 1;
@@ -4772,6 +4826,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
