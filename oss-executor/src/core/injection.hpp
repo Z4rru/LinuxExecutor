@@ -195,6 +195,12 @@ private:
         uintptr_t unlock_fn = 0;
         uintptr_t free_fn   = 0;
         uintptr_t lock_fn   = 0;
+      
+        uintptr_t pthread_mutex_unlock_addr = 0;
+        uintptr_t pthread_mutex_lock_addr = 0;
+        int32_t lock_global_state_offset = 0;
+        int32_t lock_mutex_offset = 0;
+        bool lock_internals_valid = false;
     };
 
     struct DirectHookState {
@@ -227,3 +233,4 @@ private:
 };
 
 }
+
