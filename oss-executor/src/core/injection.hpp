@@ -88,7 +88,7 @@ public:
     uintptr_t           vm_marker_addr() const { return vm_marker_addr_; }
 
     Memory& memory() { return memory_; }
-    bool send_via_mailbox(const void* data, size_t len, uint32_t flags);
+    uint64_t send_via_mailbox(const void* data, size_t len, uint32_t flags);
     bool is_direct_hook() const { return dhook_.active; }
 
 private:
@@ -224,6 +224,7 @@ private:
 };
 
 }
+
 
 
 
