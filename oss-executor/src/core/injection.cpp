@@ -3875,61 +3875,295 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                          "({}B, score={}, calls active_lock VERIFIED)",
                          best_raddr, best_rfsz, best_rscore);
 
-                // ═══════════════════════════════════════════════════
-                // lua_resume moved — re-validate lua_settop.
-                // The previous lua_settop was proximity-scanned near
-                // the OLD (wrong-copy) lua_resume.  It may be >100MB
-                // from the active copy.  Re-scan near the NEW resume.
-                // ═══════════════════════════════════════════════════
                 if (out.settop) {
+                    bool st_ok = false;
                     int64_t st_dist = static_cast<int64_t>(out.settop) -
                                      static_cast<int64_t>(best_raddr);
                     if (st_dist < 0) st_dist = -st_dist;
                     if (static_cast<uint64_t>(st_dist) > 0x5000000ULL) {
-                        LOG_WARN("[direct-hook] lua_settop at 0x{:X} is "
-                                 "{:.0f}MB from new lua_resume 0x{:X} — "
-                                 "clearing for lock-anchored re-scan",
+                        LOG_WARN("[direct-hook] lua_settop 0x{:X} is {:.0f}MB "
+                                 "from new lua_resume 0x{:X} — wrong copy",
                                  out.settop, st_dist / (1024.0 * 1024.0),
                                  best_raddr);
-                        out.settop = 0;
                     } else {
-                        // Verify it calls active_lock
                         uint8_t st_chk[100];
                         struct iovec scl = {st_chk, 100};
                         struct iovec scr = {reinterpret_cast<void*>(out.settop), 100};
-                        bool st_has_lock = false;
                         if (process_vm_readv(pid, &scl, 1, &scr, 1, 0) >= 50) {
                             for (size_t si = 0; si + 5 <= 100; si++) {
                                 if (st_chk[si] != 0xE8) continue;
-                                int32_t sd; memcpy(&sd, &st_chk[si+1], 4);
+                                int32_t sd;
+                                memcpy(&sd, &st_chk[si + 1], 4);
                                 uintptr_t st_t = out.settop + si + 5 +
                                                  static_cast<int64_t>(sd);
-                                if (st_t == active_lock) { st_has_lock = true; break; }
-                                // One-hop
+                                if (st_t == active_lock) {
+                                    st_ok = true;
+                                    LOG_INFO("[direct-hook] lua_settop 0x{:X} "
+                                             "calls active_lock — valid",
+                                             out.settop);
+                                    break;
+                                }
                                 uint8_t hb[25];
                                 struct iovec hl = {hb, 25};
                                 struct iovec hr = {reinterpret_cast<void*>(st_t), 25};
                                 if (process_vm_readv(pid, &hl, 1, &hr, 1, 0) == 25) {
                                     for (int hi = 0; hi < 20; hi++) {
                                         if (hb[hi] != 0xE8) continue;
-                                        int32_t hd; memcpy(&hd, &hb[hi+1], 4);
+                                        int32_t hd;
+                                        memcpy(&hd, &hb[hi + 1], 4);
                                         uintptr_t ht = st_t + hi + 5 +
                                                        static_cast<int64_t>(hd);
-                                        if (ht == active_lock) st_has_lock = true;
+                                        if (ht == active_lock) {
+                                            st_ok = true;
+                                            LOG_INFO("[direct-hook] lua_settop "
+                                                     "0x{:X} reaches active_lock "
+                                                     "via one-hop", out.settop);
+                                        }
                                         break;
                                     }
                                 }
                                 break;
                             }
                         }
-                        if (!st_has_lock) {
-                            LOG_WARN("[direct-hook] lua_settop at 0x{:X} does "
-                                     "NOT call active_lock — clearing",
-                                     out.settop);
-                            out.settop = 0;
+                        if (!st_ok) {
+                            LOG_WARN("[direct-hook] lua_settop 0x{:X} does NOT "
+                                     "call active_lock — wrong copy", out.settop);
                         }
                     }
+                    if (!st_ok) {
+                        LOG_INFO("[direct-hook] clearing stale lua_settop "
+                                 "0x{:X}", out.settop);
+                        out.settop = 0;
+                    }
                 }
+
+                if (!out.settop) {
+                    LOG_INFO("[direct-hook] lua_settop: lock-anchored re-scan "
+                             "(active_lock=0x{:X}, near lua_resume=0x{:X})",
+                             active_lock, best_raddr);
+                    int best_st_score = -1;
+                    uintptr_t best_st_addr = 0;
+                    size_t best_st_fsz = 0;
+                    for (const auto& r : regions) {
+                        if (best_st_addr && best_st_score >= 20) break;
+                        if (!r.readable() || !r.executable()) continue;
+                        if (r.size() < 256) continue;
+                        int64_t rd0 = static_cast<int64_t>(r.start) -
+                                      static_cast<int64_t>(active_lock);
+                        if (rd0 < -0x5000000LL || rd0 > 0x5000000LL) continue;
+                        size_t scan_sz = std::min(r.size(),
+                                                  static_cast<size_t>(0x4000000));
+                        std::vector<uint8_t> code(scan_sz);
+                        struct iovec sli = {code.data(), scan_sz};
+                        struct iovec sri = {reinterpret_cast<void*>(r.start),
+                                            scan_sz};
+                        if (process_vm_readv(pid, &sli, 1, &sri, 1, 0) !=
+                            static_cast<ssize_t>(scan_sz)) continue;
+                        for (size_t off = 1; off + 260 < scan_sz; off++) {
+                            if (code[off - 1] != 0xC3 &&
+                                code[off - 1] != 0xCC &&
+                                code[off - 1] != 0x90) continue;
+                            uintptr_t addr = r.start + off;
+                            if (addr == best_raddr || addr == out.newthread ||
+                                addr == out.load) continue;
+                            size_t p = off;
+                            if (p + 3 < scan_sz && code[p] == 0xF3 &&
+                                code[p + 1] == 0x0F && code[p + 2] == 0x1E &&
+                                code[p + 3] == 0xFA) p += 4;
+                            if (p >= scan_sz) continue;
+                            if (!(code[p] == 0x55 || code[p] == 0x53 ||
+                                  (code[p] == 0x41 && p + 1 < scan_sz &&
+                                   code[p + 1] >= 0x54 &&
+                                   code[p + 1] <= 0x57))) continue;
+                            bool has_alock = false;
+                            for (size_t fi = 0;
+                                 fi < 60 && off + fi + 5 <= scan_sz; fi++) {
+                                if (code[off + fi] != 0xE8) continue;
+                                int32_t fd;
+                                memcpy(&fd, &code[off + fi + 1], 4);
+                                uintptr_t ft = r.start + off + fi + 5 +
+                                               static_cast<int64_t>(fd);
+                                if (ft == active_lock) {
+                                    has_alock = true;
+                                    break;
+                                }
+                                uint8_t hb[25];
+                                struct iovec hbl = {hb, 25};
+                                struct iovec hbr = {
+                                    reinterpret_cast<void*>(ft), 25};
+                                if (process_vm_readv(pid, &hbl, 1, &hbr, 1,
+                                                     0) == 25) {
+                                    for (int hi = 0; hi < 20; hi++) {
+                                        if (hb[hi] != 0xE8) continue;
+                                        int32_t hd;
+                                        memcpy(&hd, &hb[hi + 1], 4);
+                                        uintptr_t ht = ft + hi + 5 +
+                                            static_cast<int64_t>(hd);
+                                        if (ht == active_lock)
+                                            has_alock = true;
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                            if (!has_alock) continue;
+                            bool sr_di = false, sr_si = false, sr_dx = false;
+                            int calls = 0;
+                            size_t fsz = 0;
+                            for (size_t j = 0;
+                                 j < 250 && off + j + 8 < scan_sz; j++) {
+                                size_t i = off + j;
+                                if (code[i] == 0xE8) calls++;
+                                if (j < 20 && i + 2 < scan_sz) {
+                                    if (code[i] == 0x89 &&
+                                        (code[i + 1] & 0x38) == 0x38)
+                                        sr_di = true;
+                                    if ((code[i] == 0x48 ||
+                                         code[i] == 0x49) &&
+                                        code[i + 1] == 0x89 &&
+                                        (code[i + 2] & 0x38) == 0x38)
+                                        sr_di = true;
+                                    if (code[i] == 0x89 &&
+                                        (code[i + 1] & 0x38) == 0x30)
+                                        sr_si = true;
+                                    if ((code[i] == 0x48 ||
+                                         code[i] == 0x49) &&
+                                        code[i + 1] == 0x89 &&
+                                        (code[i + 2] & 0x38) == 0x30)
+                                        sr_si = true;
+                                    if (code[i] == 0x48 &&
+                                        code[i + 1] == 0x63 &&
+                                        (code[i + 2] & 0xC7) == 0xC6)
+                                        sr_si = true;
+                                    if (code[i] == 0x89 &&
+                                        (code[i + 1] & 0x38) == 0x10)
+                                        sr_dx = true;
+                                    if ((code[i] == 0x48 ||
+                                         code[i] == 0x49) &&
+                                        code[i + 1] == 0x89 &&
+                                        (code[i + 2] & 0x38) == 0x10)
+                                        sr_dx = true;
+                                }
+                                if (code[i] == 0xC3 && j >= 20) {
+                                    fsz = j + 1;
+                                    break;
+                                }
+                            }
+                            if (!sr_di || !sr_si || sr_dx) continue;
+                            if (fsz < 30 || fsz > 250 || calls < 1 ||
+                                calls > 8) continue;
+                            int score = 10;
+                            if (calls >= 1 && calls <= 4) score += 2;
+                            if (fsz >= 40 && fsz <= 150) score += 2;
+                            {
+                                uint8_t rc[1024];
+                                struct iovec rcl = {rc, 1024};
+                                struct iovec rcr = {
+                                    reinterpret_cast<void*>(best_raddr),
+                                    1024};
+                                ssize_t rrd = process_vm_readv(
+                                    pid, &rcl, 1, &rcr, 1, 0);
+                                if (rrd >= 64) {
+                                    for (size_t cj = 0;
+                                         cj < fsz &&
+                                         off + cj + 5 < scan_sz; cj++) {
+                                        if (code[off + cj] != 0xE8)
+                                            continue;
+                                        int32_t cd;
+                                        memcpy(&cd,
+                                               &code[off + cj + 1], 4);
+                                        uintptr_t ct = r.start + off +
+                                            cj + 5 +
+                                            static_cast<int64_t>(cd);
+                                        for (size_t rj = 0;
+                                             rj + 5 <=
+                                             static_cast<size_t>(rrd);
+                                             rj++) {
+                                            if (rc[rj] != 0xE8) continue;
+                                            int32_t rd2;
+                                            memcpy(&rd2, &rc[rj + 1], 4);
+                                            uintptr_t rt = best_raddr +
+                                                rj + 5 +
+                                                static_cast<int64_t>(rd2);
+                                            if (ct == rt) {
+                                                score += 10;
+                                                goto st_rescan_xv_done;
+                                            }
+                                        }
+                                    }
+                                    st_rescan_xv_done:;
+                                }
+                            }
+                            if (score > best_st_score) {
+                                best_st_score = score;
+                                best_st_addr = addr;
+                                best_st_fsz = fsz;
+                            }
+                        }
+                    }
+                    if (best_st_addr && best_st_score >= 15) {
+                        out.settop = best_st_addr;
+                        int64_t sd2 = static_cast<int64_t>(best_st_addr) -
+                                     static_cast<int64_t>(best_raddr);
+                        if (sd2 < 0) sd2 = -sd2;
+                        LOG_INFO("[direct-hook] lock-anchored: lua_settop="
+                                 "0x{:X} ({}B, score={}, {:.1f}MB from "
+                                 "lua_resume, VERIFIED)",
+                                 best_st_addr, best_st_fsz,
+                                 best_st_score, sd2 / (1024.0 * 1024.0));
+                    } else if (best_st_addr) {
+                        LOG_WARN("[direct-hook] lock-anchored settop "
+                                 "candidate 0x{:X} rejected (score={})",
+                                 best_st_addr, best_st_score);
+                    } else {
+                        LOG_WARN("[direct-hook] lock-anchored re-scan "
+                                 "found no lua_settop calling active_lock");
+                    }
+                }
+
+                if (out.settop) {
+                    active_lock = 0;
+                    uint8_t stbuf2[256];
+                    struct iovec stl2 = {stbuf2, sizeof(stbuf2)};
+                    struct iovec str2 = {reinterpret_cast<void*>(out.settop),
+                                         sizeof(stbuf2)};
+                    ssize_t strd2 = process_vm_readv(pid, &stl2, 1,
+                                                      &str2, 1, 0);
+                    if (strd2 >= 40) {
+                        size_t st2_fend = 0;
+                        {
+                            size_t pos = 0;
+                            size_t st2_read = static_cast<size_t>(strd2);
+                            while (pos + 15 < st2_read && pos < 250) {
+                                size_t il = dh_insn_len(stbuf2 + pos);
+                                if (il == 0) break;
+                                if (stbuf2[pos] == 0xC3) {
+                                    st2_fend = pos + 1;
+                                    break;
+                                }
+                                pos += il;
+                            }
+                        }
+                        if (st2_fend > 0) {
+                            for (size_t i = 0; i + 5 <= st2_fend; i++) {
+                                if (stbuf2[i] != 0xE8) continue;
+                                int32_t d;
+                                memcpy(&d, &stbuf2[i + 1], 4);
+                                uintptr_t t = out.settop + i + 5 +
+                                              static_cast<int64_t>(d);
+                                active_lock = t;
+                                LOG_INFO("[direct-hook] re-extracted "
+                                         "active_lock=0x{:X} from new "
+                                         "lua_settop+{}", t, i);
+                                break;
+                            }
+                        }
+                    }
+                    if (active_lock) {
+                        out.lock_fn = active_lock;
+                    }
+                }
+            } else if (best_raddr) {
 
                 // Lock-anchored re-scan for lua_settop if invalidated
                 if (!out.settop) {
@@ -5392,8 +5626,10 @@ bool Injection::execute_script(const std::string& source) {
             for (int i = 0; i < 100; i++) {
                 usleep(50000);
                 if (kill(mpid, 0) != 0) {
-                    set_state(InjectionState::Ready, "Target process died during execution");
-                    LOG_ERROR("[direct-hook] process died while waiting for ack");
+                    set_state(InjectionState::Ready,
+                              "Target process died during execution");
+                    LOG_ERROR("[direct-hook] process died while waiting "
+                              "for ack");
                     return false;
                 }
                 proc_mem_read(mpid, dhook_.mailbox_addr + 24, &post_ack, 8);
@@ -5405,20 +5641,23 @@ bool Injection::execute_script(const std::string& source) {
                 proc_mem_read(mpid, dhook_.mailbox_addr + 41, &hits, 1);
 
                 if (post_ack >= post_seq) {
-                    LOG_INFO("[direct-hook] execution confirmed: ack={} step={} "
-                             "({} bytes, v{})", post_ack, step,
-                             sent_bc_len, static_cast<int>(sent_bc_ver));
+                    LOG_INFO("[direct-hook] execution confirmed: ack={} "
+                             "step={} ({} bytes, v{})", post_ack, step,
+                             sent_bc_len,
+                             static_cast<int>(sent_bc_ver));
                     executed = true;
                     break;
                 }
                 if (i % 10 == 0) {
-                    LOG_DEBUG("[direct-hook] waiting: step={} guard={} hits={} "
-                              "ack={} seq={}", step, guard, hits, post_ack, post_seq);
+                    LOG_DEBUG("[direct-hook] waiting: step={} guard={} "
+                              "hits={} ack={} seq={}",
+                              step, guard, hits, post_ack, post_seq);
                 }
             }
 
             if (executed) {
-                set_state(InjectionState::Ready, "Script executed in Roblox");
+                set_state(InjectionState::Ready,
+                          "Script executed in Roblox");
                 return true;
             }
 
@@ -5431,22 +5670,23 @@ bool Injection::execute_script(const std::string& source) {
             proc_mem_read(mpid, dhook_.mailbox_addr + 24, &post_ack, 8);
 
             if (final_step == 0 && final_guard == 0) {
-                LOG_ERROR("[direct-hook] trampoline never entered payload path "
-                          "(step=0, guard=0, hits={}) — hook may be dead or "
-                          "seq not visible to target", final_hits);
+                LOG_ERROR("[direct-hook] trampoline never entered payload "
+                          "path (step=0, guard=0, hits={}) — hook may be "
+                          "dead or seq not visible to target", final_hits);
             } else if (final_step > 0 && final_step < 5) {
                 const char* step_names[] = {
                     "?", "lua_newthread", "luau_load", "lua_resume",
                     "lua_settop(-2)", "ack"
                 };
-                const char* sn = (final_step <= 5) ? step_names[final_step] : "?";
-                LOG_ERROR("[direct-hook] execution stalled at step {} ({}) — "
-                          "likely deadlock or crash inside Luau call",
-                          final_step, sn);
+                const char* sn = (final_step <= 5)
+                    ? step_names[final_step] : "?";
+                LOG_ERROR("[direct-hook] execution stalled at step {} "
+                          "({}) — likely deadlock or crash inside Luau "
+                          "call", final_step, sn);
             } else {
-                LOG_ERROR("[direct-hook] execution timeout: step={} guard={} "
-                          "ack={} seq={}", final_step, final_guard,
-                          post_ack, post_seq);
+                LOG_ERROR("[direct-hook] execution timeout: step={} "
+                          "guard={} ack={} seq={}",
+                          final_step, final_guard, post_ack, post_seq);
             }
             set_state(InjectionState::Ready,
                       "Script dispatch timeout — step " +
@@ -5643,6 +5883,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
