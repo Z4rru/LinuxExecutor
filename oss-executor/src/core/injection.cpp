@@ -3849,13 +3849,163 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
 
-        // Ensure lock_fn always points to the live active_lock if we found one.
-    // This guarantees inject_via_direct_hook can use it as a hook target
-    // even if the lock-anchored scan path was skipped or took a different
-    // code path that didn't set lock_fn.
+         // Ensure lock_fn always points to the live active_lock if we found one.
     if (active_lock && !out.lock_fn) {
         out.lock_fn = active_lock;
         LOG_INFO("[direct-hook] lock_fn set to active_lock 0x{:X} (safety net)", active_lock);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // FINAL GATE: validate lua_newthread reaches active_lock via its
+    // FIRST call (direct) or first call's first call (one-hop).
+    // Dead-copy functions have their first CALL targeting dead lua_lock
+    // (different address) which hangs on a stale/corrupted mutex.
+    // A later call may coincidentally resolve to active_lock, but the
+    // function EXECUTES the first call FIRST, causing step-1 deadlock.
+    // ═══════════════════════════════════════════════════════════════
+    if (out.newthread && active_lock) {
+        uint8_t ntfv[40];
+        struct iovec nfl = {ntfv, 40};
+        struct iovec nfr = {reinterpret_cast<void*>(out.newthread), 40};
+        bool gate_pass = false;
+        if (process_vm_readv(pid, &nfl, 1, &nfr, 1, 0) == 40) {
+            for (int fi = 0; fi < 35; fi++) {
+                if (ntfv[fi] != 0xE8) continue;
+                int32_t fd; memcpy(&fd, &ntfv[fi+1], 4);
+                uintptr_t t1 = out.newthread + fi + 5 + static_cast<int64_t>(fd);
+                if (t1 == active_lock) {
+                    gate_pass = true;
+                    LOG_INFO("[direct-hook] FINAL GATE: lua_newthread 0x{:X} first CALL "
+                             "directly targets active_lock — PASS", out.newthread);
+                } else {
+                    // One-hop: does t1 itself call active_lock as ITS first call?
+                    uint8_t hop[25];
+                    struct iovec hl = {hop, 25};
+                    struct iovec hr = {reinterpret_cast<void*>(t1), 25};
+                    if (process_vm_readv(pid, &hl, 1, &hr, 1, 0) == 25) {
+                        for (int hi = 0; hi < 20; hi++) {
+                            if (hop[hi] != 0xE8) continue;
+                            int32_t hd; memcpy(&hd, &hop[hi+1], 4);
+                            uintptr_t t2 = t1 + hi + 5 + static_cast<int64_t>(hd);
+                            if (t2 == active_lock) {
+                                gate_pass = true;
+                                LOG_INFO("[direct-hook] FINAL GATE: lua_newthread 0x{:X} "
+                                         "reaches active_lock via one-hop through 0x{:X} — PASS",
+                                         out.newthread, t1);
+                            } else {
+                                LOG_WARN("[direct-hook] FINAL GATE: lua_newthread 0x{:X} "
+                                         "first CALL→0x{:X}, whose first CALL→0x{:X} "
+                                         "(neither is active_lock 0x{:X})",
+                                         out.newthread, t1, t2, active_lock);
+                            }
+                            break;
+                        }
+                    }
+                }
+                break;  // MUST stop at first E8 — that's what executes first
+            }
+        }
+
+        if (!gate_pass) {
+            LOG_WARN("[direct-hook] FINAL GATE: lua_newthread 0x{:X} REJECTED — "
+                     "dead copy (first call chain does not reach active_lock)",
+                     out.newthread);
+            out.newthread = 0;
+
+            // Rescue scan: search ±80MB from lua_resume for functions with
+            // the known lua_newthread prologue whose first CALL (or one-hop)
+            // reaches active_lock. Prologue is consistent across all Luau
+            // copies: push rbp; mov rbp,rsp; push rbx; push rax; mov rbx,rdi
+            if (out.resume) {
+                LOG_INFO("[direct-hook] rescue: prologue-pattern scan near lua_resume "
+                         "for active lua_newthread");
+                // Also accept ENDBR64 prefix variant
+                const uint8_t pro9[] = {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB};
+                uintptr_t best_addr = 0;
+                int64_t best_dist = INT64_MAX;
+                for (const auto& r : regions) {
+                    if (best_addr) break;
+                    if (!r.readable() || !r.executable() || r.size() < 512) continue;
+                    int64_t rd = static_cast<int64_t>(r.start) -
+                                 static_cast<int64_t>(out.resume);
+                    if (rd < -0x5000000LL || rd > 0x5000000LL) continue;
+                    size_t scan_sz = std::min(r.size(),
+                                              static_cast<size_t>(0x4000000));
+                    std::vector<uint8_t> code(scan_sz);
+                    struct iovec rsl = {code.data(), scan_sz};
+                    struct iovec rsr = {reinterpret_cast<void*>(r.start), scan_sz};
+                    if (process_vm_readv(pid, &rsl, 1, &rsr, 1, 0) !=
+                        static_cast<ssize_t>(scan_sz)) continue;
+                    for (size_t off = 1; off + sizeof(pro9) + 30 < scan_sz; off++) {
+                        // Must be at a function boundary
+                        uint8_t prev = code[off - 1];
+                        if (prev != 0xC3 && prev != 0xCC && prev != 0x90) continue;
+                        // Check for prologue (with optional ENDBR64 prefix)
+                        size_t pro_off = off;
+                        if (pro_off + 4 + sizeof(pro9) + 20 < scan_sz &&
+                            code[pro_off]==0xF3 && code[pro_off+1]==0x0F &&
+                            code[pro_off+2]==0x1E && code[pro_off+3]==0xFA)
+                            pro_off += 4;
+                        if (pro_off + sizeof(pro9) + 20 >= scan_sz) continue;
+                        if (memcmp(&code[pro_off], pro9, sizeof(pro9)) != 0) continue;
+                        uintptr_t cand = r.start + off;
+                        if (cand == out.resume || cand == out.settop ||
+                            cand == out.load) continue;
+                        // Find first E8 after prologue
+                        for (size_t ci = pro_off - off + sizeof(pro9);
+                             ci < pro_off - off + sizeof(pro9) + 20 &&
+                             off + ci + 5 < scan_sz; ci++) {
+                            if (code[off + ci] != 0xE8) continue;
+                            int32_t cd; memcpy(&cd, &code[off + ci + 1], 4);
+                            uintptr_t ct = cand + ci + 5 + static_cast<int64_t>(cd);
+                            if (ct == active_lock) {
+                                int64_t d = static_cast<int64_t>(cand) -
+                                            static_cast<int64_t>(out.resume);
+                                if (d < 0) d = -d;
+                                if (d < best_dist) {
+                                    best_dist = d;
+                                    best_addr = cand;
+                                }
+                            } else {
+                                // One-hop check
+                                uint8_t rh[25];
+                                struct iovec rhl = {rh, 25};
+                                struct iovec rhr = {reinterpret_cast<void*>(ct), 25};
+                                if (process_vm_readv(pid, &rhl, 1, &rhr, 1, 0) == 25) {
+                                    for (int rhi = 0; rhi < 20; rhi++) {
+                                        if (rh[rhi] != 0xE8) continue;
+                                        int32_t rhd; memcpy(&rhd, &rh[rhi+1], 4);
+                                        uintptr_t rt2 = ct + rhi + 5 +
+                                                         static_cast<int64_t>(rhd);
+                                        if (rt2 == active_lock) {
+                                            int64_t d = static_cast<int64_t>(cand) -
+                                                        static_cast<int64_t>(out.resume);
+                                            if (d < 0) d = -d;
+                                            if (d < best_dist) {
+                                                best_dist = d;
+                                                best_addr = cand;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            break;  // only check first E8
+                        }
+                    }
+                }
+                if (best_addr) {
+                    out.newthread = best_addr;
+                    out.lock_fn = active_lock;
+                    LOG_INFO("[direct-hook] rescue: lua_newthread=0x{:X} "
+                             "({:.1f}MB from lua_resume, prologue+lock verified)",
+                             best_addr, best_dist / (1024.0 * 1024.0));
+                } else {
+                    LOG_WARN("[direct-hook] rescue: no prologue-matching function "
+                             "near lua_resume reaches active_lock");
+                }
+            }
+        }
     }
 
     if (!out.resume || !out.load || !out.settop) {
@@ -3869,7 +4019,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         return false;
     }
     return true;
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // Phase 1: Fires inside lua_resume prologue (lua_lock HELD).
@@ -5200,6 +5349,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
