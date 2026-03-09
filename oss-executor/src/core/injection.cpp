@@ -3489,8 +3489,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             }
         }
     }
-
-    // ═══════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
     // Validate luau_load calls active_lock.
     // luau_load is a Lua C API function — it MUST call lua_lock.
     // The proximity signature scan matches based on shared CALL targets
@@ -6207,6 +6206,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
