@@ -3284,7 +3284,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     if (out.load && out.resume) {
         int64_t ld = static_cast<int64_t>(out.load) - static_cast<int64_t>(out.resume);
         if (ld < 0) ld = -ld;
-        if (static_cast<uint64_t>(ld) > 0x5000000ULL) { // >80MB
+        if (static_cast<uint64_t>(ld) > 0x2800000ULL) { // >40MB
             LOG_WARN("[direct-hook] luau_load at 0x{:X} is {:.0f}MB from lua_resume "
                      "0x{:X} — wrong Luau copy, clearing for proximity re-scan",
                      out.load, ld / (1024.0 * 1024.0), out.resume);
@@ -3321,7 +3321,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     if (!xr.readable() || !xr.executable() || xr.size() < 7) continue;
                     int64_t xdist = static_cast<int64_t>(xr.start) -
                                     static_cast<int64_t>(out.resume);
-                    if (xdist < -0x5000000LL || xdist > 0x5000000LL) continue;
+                    if (xdist < -0x2800000LL || xdist > 0x2800000LL) continue;
                     size_t xscan = std::min(xr.size(), static_cast<size_t>(0x4000000));
                     constexpr size_t LR_CHK = 4096;
                     std::vector<uint8_t> lrbuf(LR_CHK + 16);
@@ -3457,8 +3457,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                               static_cast<int64_t>(out.resume);
                 int64_t rd1 = static_cast<int64_t>(r.end) -
                               static_cast<int64_t>(out.resume);
-                if (!((rd0 > -0x5000000LL && rd0 < 0x5000000LL) ||
-                      (rd1 > -0x5000000LL && rd1 < 0x5000000LL))) continue;
+                if (!((rd0 > -0x2800000LL && rd0 < 0x2800000LL) ||
+                      (rd1 > -0x2800000LL && rd1 < 0x2800000LL))) continue;
                 size_t scan_sz = std::min(r.size(),
                                           static_cast<size_t>(0x4000000));
                 std::vector<uint8_t> code(scan_sz);
@@ -3727,7 +3727,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (r.size() < 512) continue;
                 int64_t rd0 = static_cast<int64_t>(r.start) -
                               static_cast<int64_t>(active_lock);
-                if (rd0 < -0x5000000LL || rd0 > 0x5000000LL) continue;
+                if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
                 size_t scan_sz = std::min(r.size(),
                                           static_cast<size_t>(0x4000000));
                 std::vector<uint8_t> code(scan_sz);
@@ -3880,7 +3880,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     int64_t st_dist = static_cast<int64_t>(out.settop) -
                                      static_cast<int64_t>(best_raddr);
                     if (st_dist < 0) st_dist = -st_dist;
-                    if (static_cast<uint64_t>(st_dist) > 0x5000000ULL) {
+                    if (static_cast<uint64_t>(st_dist) > 0x2800000ULL) {
                         LOG_WARN("[direct-hook] lua_settop 0x{:X} is {:.0f}MB "
                                  "from new lua_resume 0x{:X} — wrong copy",
                                  out.settop, st_dist / (1024.0 * 1024.0),
@@ -3950,7 +3950,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if (r.size() < 256) continue;
                         int64_t rd0 = static_cast<int64_t>(r.start) -
                                       static_cast<int64_t>(active_lock);
-                        if (rd0 < -0x5000000LL || rd0 > 0x5000000LL) continue;
+                        if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
                         size_t scan_sz = std::min(r.size(),
                                                   static_cast<size_t>(0x4000000));
                         std::vector<uint8_t> code(scan_sz);
@@ -4178,7 +4178,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if (r.size() < 256) continue;
                         int64_t rd0 = static_cast<int64_t>(r.start) -
                                       static_cast<int64_t>(active_lock);
-                        if (rd0 < -0x5000000LL || rd0 > 0x5000000LL) continue;
+                        if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
                         size_t scan_sz = std::min(r.size(),
                                                   static_cast<size_t>(0x4000000));
                         std::vector<uint8_t> code(scan_sz);
@@ -4375,7 +4375,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (r.size() < 512) continue;
                 int64_t rd0 = static_cast<int64_t>(r.start) -
                               static_cast<int64_t>(active_lock);
-                if (rd0 < -0x5000000LL || rd0 > 0x5000000LL) continue;
+                if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
                 size_t scan_sz = std::min(r.size(),
                                           static_cast<size_t>(0x4000000));
                 std::vector<uint8_t> code(scan_sz);
@@ -4602,7 +4602,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     if (!r.readable() || !r.executable() || r.size() < 512) continue;
                     int64_t rd = static_cast<int64_t>(r.start) -
                                  static_cast<int64_t>(out.resume);
-                    if (rd < -0x5000000LL || rd > 0x5000000LL) continue;
+                    if (rd < -0x2800000LL || rd > 0x2800000LL) continue;
                     size_t scan_sz = std::min(r.size(),
                                               static_cast<size_t>(0x4000000));
                     std::vector<uint8_t> code(scan_sz);
@@ -4810,7 +4810,7 @@ static std::vector<uint8_t> gen_entry_trampoline(
     size_t j_load_fail = c.size();
     e({0x0F,0x85}); e32(0);       // jnz -> settop_label (load failed)
 
-    // === STEP 3: lua_resume(thread, NULL, 0) ===
+        // === STEP 3: lua_resume(thread, NULL, 0) ===
     e({0xC7,0x43,0x2C,0x03,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 3
     e({0x4C,0x89,0xF7});           // mov rdi, r14 (thread)
     e({0x31,0xF6});                // xor esi, esi (from=NULL)
@@ -4819,14 +4819,21 @@ static std::vector<uint8_t> gen_entry_trampoline(
     e({0xFF,0xD0});                // call lua_resume
 
     // === STEP 4: cleanup — lua_settop(L, -2) to pop the new thread ===
+    // Only emit step 4 if lua_settop address is known and confirmed live.
+    // When settop is 0 (dead/unknown), skip cleanup. The thread object
+    // pushed by lua_newthread stays on L's stack but will be garbage
+    // collected. One extra stack slot per execution is acceptable vs.
+    // calling dead code that may deadlock.
     size_t settop_label = c.size();
-    e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 4
-    e({0x4C,0x89,0xFF});           // mov rdi, r15 (original L)
-    e({0xBE,0xFE,0xFF,0xFF,0xFF}); // mov esi, -2
-    // Call lua_settop via its ORIGINAL address (will re-enter hook,
-    // but guard byte is set so it skips straight to stolen bytes)
-    e({0x48,0xB8}); e64(a.settop);
-    e({0xFF,0xD0});                // call lua_settop
+    if (a.settop != 0) {
+        e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 4
+        e({0x4C,0x89,0xFF});           // mov rdi, r15 (original L)
+        e({0xBE,0xFE,0xFF,0xFF,0xFF}); // mov esi, -2
+        e({0x48,0xB8}); e64(a.settop);
+        e({0xFF,0xD0});                // call lua_settop
+    } else {
+        e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 0x44 (step 4 skipped marker)
+    }
 
     // === STEP 5: acknowledge — set ack = seq, clear guard ===
     size_t ack_label = c.size();
@@ -5088,10 +5095,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         return true;
     };
 
-    // === Attempt 1: lua_settop ===
+       // === Attempt 1: lua_settop ===
+    bool settop_probe_live = false;
     if (!try_hook_target(addrs.settop, "lua_settop", prologue, steal)) {
-        // === Attempt 2: lua_lock (guaranteed to be called) ===
-                // === Attempt 2: lua_lock ===
+        LOG_WARN("[direct-hook] lua_settop at 0x{:X} is dead (0 hits) — "
+                 "will clear for trampoline step 4 safety", addrs.settop);
+        uintptr_t dead_settop_addr = addrs.settop;
+
+        // === Attempt 2: lua_lock ===
         bool lock_ok = false;
         if (addrs.lock_fn) {
             uint8_t lock_pro[32];
@@ -5107,7 +5118,6 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                              lock_pro[0], lock_pro[1], lock_pro[2], lock_pro[3],
                              lock_pro[4], lock_pro[5], lock_pro[6], lock_pro[7], lock_steal);
                     if (try_hook_target(addrs.lock_fn, "lua_lock", lock_pro, lock_steal)) {
-
                         hook_addr = addrs.lock_fn;
                         is_lock_hook = true;
                         lock_ok = true;
@@ -5122,11 +5132,6 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             LOG_WARN("[direct-hook] lua_lock address not available");
         }
 
-        // === Attempt 3+: try other Lua API functions as hook targets ===
-        // All Lua C API functions take lua_State* L as first argument (rdi).
-        // The guard byte in the trampoline safely handles re-entrant calls:
-        // e.g. if we hook lua_resume, the trampoline's internal lua_resume call
-        // re-enters the hook but the guard skips straight to the stolen bytes.
         if (!lock_ok) {
             LOG_WARN("[direct-hook] lua_settop and lua_lock both failed — trying other Lua API functions");
 
@@ -5157,10 +5162,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                     continue;
                 }
 
-                // Check if existing code cave is reachable via rel32 JMP from this target
                 int64_t cave_dist = (int64_t)cave.padding_start - (int64_t)(fb.addr + 5);
                 if ((cave_dist < INT32_MIN || cave_dist > INT32_MAX) && fb_steal < 14) {
-                    // Cave out of rel32 range and prologue too short for abs64 — find new cave
                     LOG_INFO("[direct-hook] code cave too far from {} — searching nearby", fb.name);
                     std::vector<MemoryRegion> fb_nearby;
                     for (const auto& r : regions) {
@@ -5195,8 +5198,220 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 return false;
             }
         }
-    }
 
+        // ═══════════════════════════════════════════════════════════════
+        // Re-scan for a LIVE lua_settop near the validated lua_resume.
+        //
+        // The original lua_settop passed all static validation (calls
+        // active_lock, 2-arg, cross-validated) but got 0 hits when
+        // probed — it is structurally correct but never called by the
+        // runtime.  We need a live lua_settop for step 4 cleanup.
+        //
+        // Strategy: scan ±4MB of lua_resume for 2-arg functions that
+        // call active_lock, then PROBE each candidate for 200ms.
+        // Accept the first one with ≥5 hits.
+        //
+        // If no live lua_settop is found, set addrs.settop = 0 so
+        // gen_entry_trampoline skips step 4 (safe: thread stays on
+        // stack, GC will collect it).
+        // ═══════════════════════════════════════════════════════════════
+        LOG_INFO("[direct-hook] searching for LIVE lua_settop near "
+                 "lua_resume=0x{:X} (dead settop was 0x{:X})",
+                 addrs.resume, dead_settop_addr);
+        addrs.settop = 0;
+        uintptr_t best_live_settop = 0;
+        int best_live_hits = 0;
+
+        for (const auto& r : regions) {
+            if (best_live_settop) break;
+            if (!r.readable() || !r.executable()) continue;
+            if (r.size() < 256) continue;
+            int64_t rd = static_cast<int64_t>(r.start) -
+                         static_cast<int64_t>(addrs.resume);
+            if (rd < -0x400000LL || rd > 0x400000LL) continue;
+            size_t scan_sz = std::min(r.size(),
+                                      static_cast<size_t>(0x400000));
+            std::vector<uint8_t> code(scan_sz);
+            struct iovec sli = {code.data(), scan_sz};
+            struct iovec sri = {reinterpret_cast<void*>(r.start), scan_sz};
+            if (process_vm_readv(pid, &sli, 1, &sri, 1, 0) !=
+                static_cast<ssize_t>(scan_sz)) continue;
+
+            for (size_t off = 1; off + 260 < scan_sz; off++) {
+                if (best_live_settop) break;
+                if (code[off - 1] != 0xC3 && code[off - 1] != 0xCC &&
+                    code[off - 1] != 0x90) continue;
+                uintptr_t cand = r.start + off;
+                if (cand == addrs.resume || cand == addrs.newthread ||
+                    cand == addrs.load || cand == addrs.lock_fn ||
+                    cand == dead_settop_addr) continue;
+
+                size_t p = off;
+                if (p + 3 < scan_sz && code[p] == 0xF3 &&
+                    code[p + 1] == 0x0F && code[p + 2] == 0x1E &&
+                    code[p + 3] == 0xFA) p += 4;
+                if (p >= scan_sz) continue;
+                if (!(code[p] == 0x55 || code[p] == 0x53 ||
+                      (code[p] == 0x41 && p + 1 < scan_sz &&
+                       code[p + 1] >= 0x54 && code[p + 1] <= 0x57)))
+                    continue;
+
+                bool sr_di = false, sr_si = false, sr_dx = false;
+                bool has_alock = false;
+                int calls = 0;
+                size_t fsz = 0;
+
+                for (size_t j = 0; j < 250 && off + j + 8 < scan_sz; j++) {
+                    size_t i = off + j;
+                    if (code[i] == 0xE8) {
+                        calls++;
+                        if (!has_alock && j < 60) {
+                            int32_t cd;
+                            memcpy(&cd, &code[i + 1], 4);
+                            uintptr_t ct = r.start + i + 5 +
+                                           static_cast<int64_t>(cd);
+                            if (ct == addrs.lock_fn) has_alock = true;
+                            if (!has_alock) {
+                                uint8_t hb[25];
+                                struct iovec hbl = {hb, 25};
+                                struct iovec hbr = {
+                                    reinterpret_cast<void*>(ct), 25};
+                                if (process_vm_readv(pid, &hbl, 1, &hbr,
+                                                     1, 0) == 25) {
+                                    for (int hi = 0; hi < 20; hi++) {
+                                        if (hb[hi] != 0xE8) continue;
+                                        int32_t hd;
+                                        memcpy(&hd, &hb[hi + 1], 4);
+                                        uintptr_t ht = ct + hi + 5 +
+                                            static_cast<int64_t>(hd);
+                                        if (ht == addrs.lock_fn)
+                                            has_alock = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (j < 20 && i + 2 < scan_sz) {
+                        if (code[i] == 0x89 &&
+                            (code[i + 1] & 0x38) == 0x38) sr_di = true;
+                        if ((code[i] == 0x48 || code[i] == 0x49) &&
+                            code[i + 1] == 0x89 &&
+                            (code[i + 2] & 0x38) == 0x38) sr_di = true;
+                        if (code[i] == 0x89 &&
+                            (code[i + 1] & 0x38) == 0x30) sr_si = true;
+                        if ((code[i] == 0x48 || code[i] == 0x49) &&
+                            code[i + 1] == 0x89 &&
+                            (code[i + 2] & 0x38) == 0x30) sr_si = true;
+                        if (code[i] == 0x48 && code[i + 1] == 0x63 &&
+                            (code[i + 2] & 0xC7) == 0xC6) sr_si = true;
+                        if (code[i] == 0x89 &&
+                            (code[i + 1] & 0x38) == 0x10) sr_dx = true;
+                        if ((code[i] == 0x48 || code[i] == 0x49) &&
+                            code[i + 1] == 0x89 &&
+                            (code[i + 2] & 0x38) == 0x10) sr_dx = true;
+                    }
+                    if (code[i] == 0xC3 && j >= 20) {
+                        fsz = j + 1;
+                        break;
+                    }
+                }
+
+                if (!has_alock || !sr_di || !sr_si || sr_dx) continue;
+                if (fsz < 30 || fsz > 250 || calls < 1 || calls > 8)
+                    continue;
+
+                LOG_DEBUG("[direct-hook] live-settop candidate 0x{:X} "
+                          "({}B, {} calls) — probing 200ms...", cand,
+                          fsz, calls);
+
+                uint8_t cand_pro[32];
+                if (!proc_mem_read(pid, cand, cand_pro, sizeof(cand_pro)))
+                    continue;
+                size_t cand_steal = 0;
+                while (cand_steal < 5) {
+                    size_t il = dh_insn_len(cand_pro + cand_steal);
+                    if (il == 0 || cand_steal + il > sizeof(cand_pro))
+                        break;
+                    cand_steal += il;
+                }
+                if (cand_steal < 5) continue;
+
+                int64_t cand_cave_dist = static_cast<int64_t>(
+                    cave.padding_start) -
+                    static_cast<int64_t>(cand + 5);
+                if ((cand_cave_dist < INT32_MIN ||
+                     cand_cave_dist > INT32_MAX) && cand_steal < 14)
+                    continue;
+
+                auto probe_tramp = gen_entry_trampoline(
+                    addrs, mb_addr, cave.padding_start, cand,
+                    cand_pro, cand_steal);
+                if (probe_tramp.size() > 400) continue;
+                if (!proc_mem_write(pid, cave.padding_start,
+                                    probe_tramp.data(),
+                                    probe_tramp.size())) continue;
+
+                uint8_t probe_patch[16];
+                size_t probe_pl;
+                if (cand_cave_dist >= INT32_MIN &&
+                    cand_cave_dist <= INT32_MAX && cand_steal >= 5) {
+                    probe_patch[0] = 0xE9;
+                    int32_t r32 = static_cast<int32_t>(cand_cave_dist);
+                    memcpy(probe_patch + 1, &r32, 4);
+                    for (size_t i = 5; i < cand_steal; i++)
+                        probe_patch[i] = 0x90;
+                    probe_pl = cand_steal;
+                } else if (cand_steal >= 14) {
+                    probe_patch[0] = 0xFF; probe_patch[1] = 0x25;
+                    memset(probe_patch + 2, 0, 4);
+                    uintptr_t ca = cave.padding_start;
+                    memcpy(probe_patch + 6, &ca, 8);
+                    probe_pl = 14;
+                } else {
+                    continue;
+                }
+
+                if (!proc_mem_write(pid, cand, probe_patch, probe_pl)) {
+                    continue;
+                }
+
+                uint8_t zh = 0;
+                proc_mem_write(pid, mb_addr + 41, &zh, 1);
+                usleep(200000);
+                uint8_t probe_hits = 0;
+                proc_mem_read(pid, mb_addr + 41, &probe_hits, 1);
+
+                proc_mem_write(pid, cand, cand_pro, cand_steal);
+
+                if (probe_hits >= 5) {
+                    LOG_INFO("[direct-hook] LIVE lua_settop found at "
+                             "0x{:X} ({} hits in 200ms, {}B, {} calls)",
+                             cand, probe_hits, fsz, calls);
+                    best_live_settop = cand;
+                    best_live_hits = probe_hits;
+                    break;
+                } else {
+                    LOG_DEBUG("[direct-hook] candidate 0x{:X} dead "
+                              "({} hits in 200ms)", cand, probe_hits);
+                }
+            }
+        }
+
+        if (best_live_settop) {
+            addrs.settop = best_live_settop;
+            LOG_INFO("[direct-hook] using live lua_settop=0x{:X} "
+                     "({} hits) for step 4 cleanup",
+                     best_live_settop, best_live_hits);
+        } else {
+            addrs.settop = 0;
+            LOG_WARN("[direct-hook] no live lua_settop found near "
+                     "lua_resume — step 4 cleanup will be SKIPPED "
+                     "(thread stays on stack, GC collects)");
+        }
+    } else {
+        settop_probe_live = true;
+    }
        // Re-generate trampoline with the final validated addrs
     // (lua_settop may have been re-scanned by lock-anchored validation)
     LOG_INFO("[direct-hook] final function addresses: resume=0x{:X} newthread=0x{:X} "
@@ -5247,7 +5462,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                  "(re-entrant calls execute real lua_lock — no unlock bypass needed)",
                  hook_addr, addrs.settop,
                  st_resume_dist / (1024.0 * 1024.0));
-        if (static_cast<uint64_t>(st_resume_dist) > 0x5000000ULL) {
+        if (static_cast<uint64_t>(st_resume_dist) > 0x2800000ULL) {
             LOG_ERROR("[direct-hook] WARNING: lua_settop is {:.0f}MB from "
                       "lua_resume — likely dead copy! Step 4 cleanup may "
                       "deadlock or crash. The trampoline will still attempt "
@@ -5255,10 +5470,11 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         }
     }
 
-    LOG_INFO("[direct-hook] ENTRY HOOK ARMED — {} at 0x{:X}, cave at 0x{:X}, mailbox at 0x{:X}{}",
+    LOG_INFO("[direct-hook] ENTRY HOOK ARMED — {} at 0x{:X}, cave at 0x{:X}, mailbox at 0x{:X}{}{}",
              is_lock_hook ? "lua_lock" : "lua_settop", hook_addr,
              cave.padding_start, mb_addr,
-             is_lock_hook ? " (guard handles reentrancy, no lock bypass needed)" : "");
+             is_lock_hook ? " (guard handles reentrancy, no lock bypass needed)" : "",
+             addrs.settop == 0 ? " [step4-cleanup DISABLED: no live settop]" : "");
     set_state(InjectionState::Ready, "Direct hook active — ready for scripts");
     return true;
 }
@@ -5279,18 +5495,18 @@ void Injection::cleanup_direct_hook() {
     LOG_INFO("[direct-hook] cleaned up");
 }
 
-bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
-    if (!dhook_.active || !dhook_.mailbox_addr) return false;
+uint64_t Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
+    if (!dhook_.active || !dhook_.mailbox_addr) return 0;
     pid_t pid = memory_.get_pid();
-    if (pid <= 0) return false;
+    if (pid <= 0) return 0;
     if (len > 16320) {
         LOG_ERROR("[direct-hook] script too large for mailbox: {} > 16320", len);
-        return false;
+        return 0;
     }
 
     uint64_t seq = 0, ack = 0;
-    if (!proc_mem_read(pid, dhook_.mailbox_addr + 16, &seq, 8)) return false;
-    if (!proc_mem_read(pid, dhook_.mailbox_addr + 24, &ack, 8)) return false;
+    if (!proc_mem_read(pid, dhook_.mailbox_addr + 16, &seq, 8)) return 0;
+    if (!proc_mem_read(pid, dhook_.mailbox_addr + 24, &ack, 8)) return 0;
 
     for (int i = 0; i < 200 && seq > ack; i++) {
         usleep(10000);
@@ -5298,13 +5514,13 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     }
     if (seq > ack) {
         LOG_WARN("[direct-hook] mailbox not consumed after 2s (seq={} ack={})", seq, ack);
-        return false;
+        return 0;
     }
 
-    if (!proc_mem_write(pid, dhook_.mailbox_addr + 64, data, len)) return false;
+    if (!proc_mem_write(pid, dhook_.mailbox_addr + 64, data, len)) return 0;
     uint32_t sz = static_cast<uint32_t>(len);
-    if (!proc_mem_write(pid, dhook_.mailbox_addr + 32, &sz, 4)) return false;
-    if (!proc_mem_write(pid, dhook_.mailbox_addr + 36, &flags, 4)) return false;
+    if (!proc_mem_write(pid, dhook_.mailbox_addr + 32, &sz, 4)) return 0;
+    if (!proc_mem_write(pid, dhook_.mailbox_addr + 36, &flags, 4)) return 0;
     uint32_t zero_step = 0;
     proc_mem_write(pid, dhook_.mailbox_addr + 44, &zero_step, 4);
     uint8_t zero_guard = 0;
@@ -5312,21 +5528,15 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     uint8_t zero_hit = 0;
     proc_mem_write(pid, dhook_.mailbox_addr + 41, &zero_hit, 1);
 
-    // ═══════════════════════════════════════════════════════════════
-    // Increment seq LAST — this is the release barrier that tells
-    // the trampoline new data is ready.  All prior writes (data,
-    // data_size, flags, guard=0, step=0) are visible on x86 due
-    // to Total Store Order before this write lands.
-    // ═══════════════════════════════════════════════════════════════
     uint64_t new_seq = seq + 1;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) {
         LOG_ERROR("[direct-hook] failed to write seq={} — mailbox stuck", new_seq);
-        return false;
+        return 0;
     }
 
     LOG_INFO("[direct-hook] mailbox armed: seq={} data={} bytes flags=0x{:X}",
              new_seq, len, flags);
-    return true;
+    return new_seq;
 }
 
 bool Injection::inject() {
@@ -5613,14 +5823,16 @@ bool Injection::execute_script(const std::string& source) {
             LOG_ERROR("Bytecode {} bytes exceeds mailbox limit 16320", bc_len);
             return false;
         }
-        bool ok = send_via_mailbox(bc, bc_len, 1);
+        uint64_t armed_seq = send_via_mailbox(bc, bc_len, 1);
         size_t sent_bc_len = bc_len;
         uint8_t sent_bc_ver = bc_ver;
         free(bc);
-        if (ok) {
+        if (armed_seq > 0) {
             pid_t mpid = memory_.get_pid();
-            uint64_t post_seq = 0, post_ack = 0;
-            proc_mem_read(mpid, dhook_.mailbox_addr + 16, &post_seq, 8);
+
+            uint8_t pre_hits = 0;
+            proc_mem_read(mpid, dhook_.mailbox_addr + 41, &pre_hits, 1);
+            LOG_DEBUG("[direct-hook] dispatch: armed_seq={} pre_hits={}", armed_seq, pre_hits);
 
             bool executed = false;
             for (int i = 0; i < 100; i++) {
@@ -5632,7 +5844,8 @@ bool Injection::execute_script(const std::string& source) {
                               "for ack");
                     return false;
                 }
-                proc_mem_read(mpid, dhook_.mailbox_addr + 24, &post_ack, 8);
+                uint64_t cur_ack = 0;
+                proc_mem_read(mpid, dhook_.mailbox_addr + 24, &cur_ack, 8);
                 uint32_t step = 0;
                 proc_mem_read(mpid, dhook_.mailbox_addr + 44, &step, 4);
                 uint8_t guard = 0;
@@ -5640,18 +5853,26 @@ bool Injection::execute_script(const std::string& source) {
                 uint8_t hits = 0;
                 proc_mem_read(mpid, dhook_.mailbox_addr + 41, &hits, 1);
 
-                if (post_ack >= post_seq) {
+                if (cur_ack >= armed_seq) {
                     LOG_INFO("[direct-hook] execution confirmed: ack={} "
-                             "step={} ({} bytes, v{})", post_ack, step,
+                             "seq={} step={} hits={} ({} bytes, v{})",
+                             cur_ack, armed_seq, step, hits,
                              sent_bc_len,
                              static_cast<int>(sent_bc_ver));
                     executed = true;
                     break;
                 }
-                if (i % 10 == 0) {
-                    LOG_DEBUG("[direct-hook] waiting: step={} guard={} "
-                              "hits={} ack={} seq={}",
-                              step, guard, hits, post_ack, post_seq);
+                if (i == 0 || i % 10 == 0) {
+                    LOG_DEBUG("[direct-hook] waiting[{}]: step={} guard={} "
+                              "hits={} ack={} armed_seq={}",
+                              i, step, guard, hits, cur_ack, armed_seq);
+                }
+                if (i == 20 && step == 0 && guard == 0 && hits > pre_hits + 10) {
+                    LOG_WARN("[direct-hook] hook is live ({} hits) but "
+                             "payload path never entered after 1s — "
+                             "seq may not be visible to target or "
+                             "trampoline guard/seq check has a bug",
+                             hits);
                 }
             }
 
@@ -5664,15 +5885,29 @@ bool Injection::execute_script(const std::string& source) {
             uint32_t final_step = 0;
             uint8_t final_guard = 0;
             uint8_t final_hits = 0;
+            uint64_t final_ack = 0;
             proc_mem_read(mpid, dhook_.mailbox_addr + 44, &final_step, 4);
             proc_mem_read(mpid, dhook_.mailbox_addr + 40, &final_guard, 1);
             proc_mem_read(mpid, dhook_.mailbox_addr + 41, &final_hits, 1);
-            proc_mem_read(mpid, dhook_.mailbox_addr + 24, &post_ack, 8);
+            proc_mem_read(mpid, dhook_.mailbox_addr + 24, &final_ack, 8);
+
+            uint64_t verify_seq = 0;
+            proc_mem_read(mpid, dhook_.mailbox_addr + 16, &verify_seq, 8);
+
+            if (verify_seq != armed_seq) {
+                LOG_ERROR("[direct-hook] CRITICAL: seq in mailbox is {} but "
+                          "we wrote {} — memory write did not persist or "
+                          "target overwrote seq", verify_seq, armed_seq);
+            }
 
             if (final_step == 0 && final_guard == 0) {
                 LOG_ERROR("[direct-hook] trampoline never entered payload "
-                          "path (step=0, guard=0, hits={}) — hook may be "
-                          "dead or seq not visible to target", final_hits);
+                          "path (step=0, guard=0, hits={}, ack={}, "
+                          "armed_seq={}, verify_seq={}) — hook is {} "
+                          "but seq/ack comparison in trampoline never "
+                          "triggered",
+                          final_hits, final_ack, armed_seq, verify_seq,
+                          final_hits > pre_hits + 5 ? "LIVE" : "possibly dead");
             } else if (final_step > 0 && final_step < 5) {
                 const char* step_names[] = {
                     "?", "lua_newthread", "luau_load", "lua_resume",
@@ -5682,11 +5917,15 @@ bool Injection::execute_script(const std::string& source) {
                     ? step_names[final_step] : "?";
                 LOG_ERROR("[direct-hook] execution stalled at step {} "
                           "({}) — likely deadlock or crash inside Luau "
-                          "call", final_step, sn);
+                          "call (guard={}, hits={}, ack={}, armed_seq={})",
+                          final_step, sn, final_guard, final_hits,
+                          final_ack, armed_seq);
             } else {
                 LOG_ERROR("[direct-hook] execution timeout: step={} "
-                          "guard={} ack={} seq={}",
-                          final_step, final_guard, post_ack, post_seq);
+                          "guard={} ack={} armed_seq={} verify_seq={} "
+                          "hits={}",
+                          final_step, final_guard, final_ack, armed_seq,
+                          verify_seq, final_hits);
             }
             set_state(InjectionState::Ready,
                       "Script dispatch timeout — step " +
@@ -5883,6 +6122,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
