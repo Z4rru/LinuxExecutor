@@ -3849,7 +3849,36 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
 
-         // Ensure lock_fn always points to the live active_lock if we found one.
+            // Extract active_unlock from lua_settop (last CALL before RET).
+    // In every Lua C API function, the last CALL before RET is lua_unlock.
+    if (active_lock && out.settop && !out.unlock_fn) {
+        uint8_t ul_buf[80];
+        struct iovec ul_l = {ul_buf, sizeof(ul_buf)};
+        struct iovec ul_r = {reinterpret_cast<void*>(out.settop), sizeof(ul_buf)};
+        if (process_vm_readv(pid, &ul_l, 1, &ul_r, 1, 0) ==
+            static_cast<ssize_t>(sizeof(ul_buf))) {
+            size_t ul_fend = sizeof(ul_buf);
+            for (size_t ui = 20; ui < sizeof(ul_buf); ui++) {
+                if (ul_buf[ui] == 0xC3) { ul_fend = ui; break; }
+            }
+            for (int ui = static_cast<int>(ul_fend) - 5; ui >= 0; ui--) {
+                if (ul_buf[ui] != 0xE8) continue;
+                int32_t ud; memcpy(&ud, &ul_buf[ui + 1], 4);
+                uintptr_t ut = out.settop + ui + 5 + static_cast<int64_t>(ud);
+                if (ut != active_lock) {
+                    out.unlock_fn = ut;
+                    LOG_INFO("[direct-hook] active lua_unlock at 0x{:X} "
+                             "(from lua_settop+{})", ut, ui);
+                }
+                break;
+            }
+        }
+    }
+
+    // Ensure lock_fn always points to the live active_lock if we found one.
+    // This guarantees inject_via_direct_hook can use it as a hook target
+    // even if the lock-anchored scan path was skipped or took a different
+    // code path that didn't set lock_fn.
     if (active_lock && !out.lock_fn) {
         out.lock_fn = active_lock;
         LOG_INFO("[direct-hook] lock_fn set to active_lock 0x{:X} (safety net)", active_lock);
@@ -4475,6 +4504,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     dhook_.active = true;
     dhook_.has_compile = (addrs.compile != 0);
     dhook_.hook_is_lock_fn = is_lock_hook;
+    if (is_lock_hook) {
+        dhook_.active_lock_addr = hook_addr;
+        dhook_.active_unlock_addr = addrs.unlock_fn;
+        dhook_.real_settop_addr = addrs.settop;
+        LOG_INFO("[direct-hook] lock hook addrs: active_lock=0x{:X} "
+                 "active_unlock=0x{:X} real_settop=0x{:X}",
+                 hook_addr, addrs.unlock_fn, addrs.settop);
+    }
 
     LOG_INFO("[direct-hook] ENTRY HOOK ARMED — {} at 0x{:X}, cave at 0x{:X}, mailbox at 0x{:X}{}",
              is_lock_hook ? "lua_lock" : "lua_settop", hook_addr,
@@ -4535,8 +4572,9 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
 
     struct LockPatch { uintptr_t addr; uint8_t saved; };
     std::vector<LockPatch> lock_patches;
+    struct CallRedirect { uintptr_t addr; int32_t orig; };
+    std::vector<CallRedirect> call_redirects;
     bool lock_bypassed = false;
-
     // dhook_.settop_addr stores the actual hook target (may be lua_resume,
     // lua_settop, or lua_lock depending on which succeeded). Its prologue
     // is patched with a JMP — scanning it for CALL instructions finds garbage.
@@ -4764,7 +4802,111 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
             }
         }
     } else if (dhook_.hook_is_lock_fn) {
-        LOG_INFO("[direct-hook] lock bypass skipped — lua_lock hook uses guard for reentrancy");
+        // When hooked on lua_lock, guard-based re-entrancy only works if
+        // called functions use the SAME lua_lock.  Functions from wrong
+        // Luau copies call dead lua_lock → hang on stale mutex.
+        // Fix: redirect their internal lock/unlock CALLs to active ones.
+        uintptr_t al  = dhook_.active_lock_addr;
+        uintptr_t aul = dhook_.active_unlock_addr;
+
+        if (al && aul) {
+            LOG_INFO("[direct-hook] lua_lock hook: redirecting internal "
+                     "lock/unlock calls (active_lock=0x{:X} active_unlock=0x{:X})",
+                     al, aul);
+
+            auto redirect_fn_locks = [&](uintptr_t fn_addr, size_t scan_size,
+                                         const char* name) {
+                if (!fn_addr || fn_addr == dhook_.settop_addr) return;
+                std::vector<uint8_t> buf(scan_size);
+                if (!proc_mem_read(pid, fn_addr, buf.data(), scan_size)) return;
+
+                // Function boundary
+                size_t fend = scan_size;
+                for (size_t i = 25; i + 1 < scan_size; i++) {
+                    if (buf[i] != 0xC3) continue;
+                    uint8_t nx = buf[i + 1];
+                    if (nx==0xCC||nx==0x90||nx==0x55||nx==0x53||
+                        nx==0xF3||nx==0x00||
+                        (nx==0x41 && i+2<scan_size &&
+                         buf[i+2]>=0x54 && buf[i+2]<=0x57)) {
+                        fend = i + 1;
+                        break;
+                    }
+                }
+
+                // First CALL → lock
+                for (size_t i = 0; i + 5 <= fend; i++) {
+                    if (buf[i] != 0xE8) continue;
+                    int32_t d; memcpy(&d, &buf[i+1], 4);
+                    uintptr_t tgt = fn_addr + i + 5 +
+                                    static_cast<int64_t>(d);
+                    if (tgt == al) {
+                        LOG_DEBUG("[direct-hook]   {} lock already active",
+                                  name);
+                        break;
+                    }
+                    int64_t nd = static_cast<int64_t>(al) -
+                                 static_cast<int64_t>(fn_addr + i + 5);
+                    if (nd < INT32_MIN || nd > INT32_MAX) {
+                        LOG_WARN("[direct-hook]   {} lock redirect out of "
+                                 "rel32 range", name);
+                        break;
+                    }
+                    int32_t nd32 = static_cast<int32_t>(nd);
+                    uintptr_t pa = fn_addr + i + 1;
+                    if (proc_mem_write(pid, pa, &nd32, 4)) {
+                        call_redirects.push_back({pa, d});
+                        lock_bypassed = true;
+                        LOG_INFO("[direct-hook]   {} lock: 0x{:X}→0x{:X} "
+                                 "(at +{})", name, tgt, al, i);
+                    }
+                    break;
+                }
+
+                // Last CALL → unlock
+                for (int i = static_cast<int>(fend) - 5; i >= 20; i--) {
+                    if (buf[i] != 0xE8) continue;
+                    int32_t d; memcpy(&d, &buf[i+1], 4);
+                    uintptr_t tgt = fn_addr + i + 5 +
+                                    static_cast<int64_t>(d);
+                    if (tgt == aul) {
+                        LOG_DEBUG("[direct-hook]   {} unlock already active",
+                                  name);
+                        break;
+                    }
+                    if (tgt == al) break; // same as lock — skip
+                    int64_t nd = static_cast<int64_t>(aul) -
+                                 static_cast<int64_t>(fn_addr + i + 5);
+                    if (nd < INT32_MIN || nd > INT32_MAX) {
+                        LOG_WARN("[direct-hook]   {} unlock redirect out of "
+                                 "rel32 range", name);
+                        break;
+                    }
+                    int32_t nd32 = static_cast<int32_t>(nd);
+                    uintptr_t pa = fn_addr + i + 1;
+                    if (proc_mem_write(pid, pa, &nd32, 4)) {
+                        call_redirects.push_back({pa, d});
+                        lock_bypassed = true;
+                        LOG_INFO("[direct-hook]   {} unlock: 0x{:X}→0x{:X} "
+                                 "(at +{})", name, tgt, aul, i);
+                    }
+                    break;
+                }
+            };
+
+            redirect_fn_locks(dhook_.newthread_addr, 200, "lua_newthread");
+            redirect_fn_locks(dhook_.load_addr, 800, "luau_load");
+            redirect_fn_locks(dhook_.resume_addr, 500, "lua_resume");
+            if (dhook_.real_settop_addr &&
+                dhook_.real_settop_addr != dhook_.settop_addr)
+                redirect_fn_locks(dhook_.real_settop_addr, 80, "lua_settop");
+
+            if (!lock_bypassed)
+                LOG_INFO("[direct-hook] all functions already use active lock");
+        } else {
+            LOG_WARN("[direct-hook] lua_lock hook but missing active_unlock "
+                     "— cannot redirect, falling back to guard-only");
+        }
     } else {
         LOG_INFO("[direct-hook] lock bypass skipped — hook target 0x{:X} is outside lock scope "
                  "(API calls handle own locking, bypass would corrupt internal state)",
@@ -4863,7 +5005,10 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     if (lock_bypassed) {
         for (auto& p : lock_patches)
             proc_mem_write(pid, p.addr, &p.saved, 1);
-        LOG_INFO("[direct-hook] restored {} lock/unlock patches", lock_patches.size());
+        for (auto& r : call_redirects)
+            proc_mem_write(pid, r.addr, &r.orig, 4);
+        LOG_INFO("[direct-hook] restored {} lock/unlock patches, {} call redirects",
+                 lock_patches.size(), call_redirects.size());
     }
 
     return true;
@@ -5350,6 +5495,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
