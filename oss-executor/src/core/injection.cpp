@@ -2665,6 +2665,173 @@ static size_t dh_insn_len(const uint8_t* p) {
     return 0;
 }
 
+static bool extract_lock_internals(pid_t pid, uintptr_t lock_fn_addr,
+                                    int32_t& global_offset_out,
+                                    int32_t& mutex_offset_out,
+                                    uintptr_t& pthread_lock_out) {
+    uint8_t code[64];
+    struct iovec local_iov = {code, sizeof(code)};
+    struct iovec remote_iov = {reinterpret_cast<void*>(lock_fn_addr), sizeof(code)};
+    if (process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0) !=
+        static_cast<ssize_t>(sizeof(code)))
+        return false;
+
+    size_t pos = 0;
+    if (pos + 4 <= sizeof(code) && code[pos] == 0xF3 && code[pos + 1] == 0x0F &&
+        code[pos + 2] == 0x1E && code[pos + 3] == 0xFA)
+        pos += 4;
+
+    if (pos < sizeof(code) && code[pos] == 0x55) pos++;
+    if (pos + 3 <= sizeof(code) && code[pos] == 0x48 &&
+        code[pos + 1] == 0x89 && code[pos + 2] == 0xE5)
+        pos += 3;
+    if (pos + 4 <= sizeof(code) && code[pos] == 0x48 &&
+        code[pos + 1] == 0x83 && code[pos + 2] == 0xEC)
+        pos += 4;
+
+    bool found_global = false;
+    bool found_mutex = false;
+    bool found_call = false;
+    int32_t gs_off = 0;
+    int32_t mx_off = 0;
+    uintptr_t pl_addr = 0;
+
+    for (int iter = 0; iter < 16 && pos + 2 < sizeof(code); iter++) {
+        if (!found_global && pos + 7 <= sizeof(code) &&
+            code[pos] == 0x48 && code[pos + 1] == 0x8B && code[pos + 2] == 0xBF) {
+            memcpy(&gs_off, &code[pos + 3], 4);
+            found_global = true;
+            pos += 7;
+            continue;
+        }
+        if (!found_global && pos + 4 <= sizeof(code) &&
+            code[pos] == 0x48 && code[pos + 1] == 0x8B && code[pos + 2] == 0x7F) {
+            gs_off = static_cast<int8_t>(code[pos + 3]);
+            found_global = true;
+            pos += 4;
+            continue;
+        }
+        if (!found_global && pos + 3 <= sizeof(code) &&
+            code[pos] == 0x48 && code[pos + 1] == 0x8B && code[pos + 2] == 0x3F) {
+            gs_off = 0;
+            found_global = true;
+            pos += 3;
+            continue;
+        }
+        if (!found_global && pos + 7 <= sizeof(code) &&
+            code[pos] == 0x48 && code[pos + 1] == 0x8B &&
+            (code[pos + 2] & 0xC7) == 0x47) {
+            uint8_t reg = (code[pos + 2] >> 3) & 7;
+            if (reg != 7) {
+                if ((code[pos + 2] & 0xC0) == 0x80) {
+                    memcpy(&gs_off, &code[pos + 3], 4);
+                    found_global = true;
+                    pos += 7;
+                } else if ((code[pos + 2] & 0xC0) == 0x40) {
+                    gs_off = static_cast<int8_t>(code[pos + 3]);
+                    found_global = true;
+                    pos += 4;
+                }
+                continue;
+            }
+        }
+        if (found_global && !found_mutex && pos + 7 <= sizeof(code) &&
+            code[pos] == 0x48 && code[pos + 1] == 0x81 && code[pos + 2] == 0xC7) {
+            memcpy(&mx_off, &code[pos + 3], 4);
+            found_mutex = true;
+            pos += 7;
+            continue;
+        }
+        if (found_global && !found_mutex && pos + 4 <= sizeof(code) &&
+            code[pos] == 0x48 && code[pos + 1] == 0x83 && code[pos + 2] == 0xC7) {
+            mx_off = static_cast<int8_t>(code[pos + 3]);
+            found_mutex = true;
+            pos += 4;
+            continue;
+        }
+        if (found_global && !found_mutex && pos + 7 <= sizeof(code) &&
+            code[pos] == 0x48 && code[pos + 1] == 0x8D && code[pos + 2] == 0xBF) {
+            memcpy(&mx_off, &code[pos + 3], 4);
+            found_mutex = true;
+            pos += 7;
+            continue;
+        }
+        if (found_global && !found_mutex && pos + 4 <= sizeof(code) &&
+            code[pos] == 0x48 && code[pos + 1] == 0x8D && code[pos + 2] == 0x7F) {
+            mx_off = static_cast<int8_t>(code[pos + 3]);
+            found_mutex = true;
+            pos += 4;
+            continue;
+        }
+        if (found_global && !found_mutex && pos + 7 <= sizeof(code) &&
+            code[pos] == 0x48 && code[pos + 1] == 0x8D) {
+            uint8_t modrm = code[pos + 2];
+            uint8_t rm = modrm & 7;
+            uint8_t mod = (modrm >> 6) & 3;
+            if (rm != 4 && rm != 5) {
+                if (mod == 1 && pos + 4 <= sizeof(code)) {
+                    mx_off = static_cast<int8_t>(code[pos + 3]);
+                    found_mutex = true;
+                    pos += 4;
+                    continue;
+                } else if (mod == 2 && pos + 7 <= sizeof(code)) {
+                    memcpy(&mx_off, &code[pos + 3], 4);
+                    found_mutex = true;
+                    pos += 7;
+                    continue;
+                }
+            }
+        }
+        if (found_global && pos + 5 <= sizeof(code) && code[pos] == 0xE8) {
+            int32_t disp;
+            memcpy(&disp, &code[pos + 1], 4);
+            pl_addr = lock_fn_addr + pos + 5 + static_cast<int64_t>(disp);
+            found_call = true;
+            if (!found_mutex) mx_off = 0;
+            break;
+        }
+        if (found_global && pos + 5 <= sizeof(code) && code[pos] == 0xE9) {
+            int32_t disp;
+            memcpy(&disp, &code[pos + 1], 4);
+            pl_addr = lock_fn_addr + pos + 5 + static_cast<int64_t>(disp);
+            found_call = true;
+            if (!found_mutex) mx_off = 0;
+            break;
+        }
+        if (found_global && pos + 6 <= sizeof(code) &&
+            code[pos] == 0xFF && code[pos + 1] == 0x25) {
+            int32_t disp;
+            memcpy(&disp, &code[pos + 2], 4);
+            uintptr_t ptr_addr = lock_fn_addr + pos + 6 + static_cast<int64_t>(disp);
+            uintptr_t resolved = 0;
+            struct iovec pl = {&resolved, 8};
+            struct iovec pr = {reinterpret_cast<void*>(ptr_addr), 8};
+            if (process_vm_readv(pid, &pl, 1, &pr, 1, 0) == 8 && resolved != 0) {
+                pl_addr = resolved;
+                found_call = true;
+                if (!found_mutex) mx_off = 0;
+            }
+            break;
+        }
+        if (found_global && pos + 2 <= sizeof(code) &&
+            code[pos] == 0xFF && (code[pos + 1] & 0x38) == 0x10) {
+            found_call = false;
+            break;
+        }
+        size_t il = dh_insn_len(code + pos);
+        if (il == 0) break;
+        pos += il;
+    }
+
+    if (found_global && found_call && pl_addr != 0) {
+        global_offset_out = gs_off;
+        mutex_offset_out = mx_off;
+        pthread_lock_out = pl_addr;
+        return true;
+    }
+    return false;
+}
+
 static uintptr_t dh_find_elf_sym_sections(const std::string& filepath,
                                            const std::string& name,
                                            uintptr_t load_bias) {
@@ -4698,6 +4865,53 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     // call or compiler-inlined.
     // ═══════════════════════════════════════════════════════════════
 
+    if (active_lock && !out.unlock_fn) {
+        int32_t gs_off = 0, mx_off = 0;
+        uintptr_t pml_addr = 0;
+        if (extract_lock_internals(pid, active_lock, gs_off, mx_off, pml_addr)) {
+            LOG_INFO("[direct-hook] lock internals extracted from 0x{:X}: "
+                     "global_State offset={}, mutex offset={}, "
+                     "pthread_mutex_lock=0x{:X}",
+                     active_lock, gs_off, mx_off, pml_addr);
+            out.lock_global_state_offset = gs_off;
+            out.lock_mutex_offset = mx_off;
+            out.pthread_mutex_lock_addr = pml_addr;
+
+            uintptr_t pmu_addr = find_remote_symbol(pid, "c", "pthread_mutex_unlock");
+            if (!pmu_addr)
+                pmu_addr = find_remote_symbol(pid, "pthread", "pthread_mutex_unlock");
+            if (!pmu_addr && pml_addr) {
+                uintptr_t pml_sym = find_remote_symbol(pid, "c", "pthread_mutex_lock");
+                if (!pml_sym)
+                    pml_sym = find_remote_symbol(pid, "pthread", "pthread_mutex_lock");
+                if (pml_sym) {
+                    int64_t lock_delta = static_cast<int64_t>(pml_addr) -
+                                         static_cast<int64_t>(pml_sym);
+                    uintptr_t pmu_sym = find_remote_symbol(pid, "c", "pthread_mutex_unlock");
+                    if (!pmu_sym)
+                        pmu_sym = find_remote_symbol(pid, "pthread", "pthread_mutex_unlock");
+                    if (pmu_sym)
+                        pmu_addr = pmu_sym + lock_delta;
+                }
+            }
+            if (pmu_addr) {
+                out.pthread_mutex_unlock_addr = pmu_addr;
+                out.lock_internals_valid = true;
+                LOG_INFO("[direct-hook] pthread_mutex_unlock=0x{:X} — "
+                         "inline unlock available for held-lock hooks",
+                         pmu_addr);
+            } else {
+                LOG_WARN("[direct-hook] pthread_mutex_unlock not found — "
+                         "inline unlock unavailable, held-lock hooks will "
+                         "deadlock if unlock_fn is also missing");
+            }
+        } else {
+            LOG_WARN("[direct-hook] failed to extract lock internals from "
+                     "active_lock 0x{:X} — inline unlock unavailable",
+                     active_lock);
+        }
+    }
+
     if (!out.resume || !out.load || !out.settop) {
         LOG_ERROR("[direct-hook] missing required functions: resume={:#x} load={:#x} settop={:#x}",
                   out.resume, out.load, out.settop);
@@ -4890,14 +5104,39 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // rdi IS lua_State* L for all hook targets (live settop, etc.)
     e({0x49,0x89,0xFF});           // mov r15, rdi
 
-    // --- Release the Lua global lock before API calls ---
+        // --- Release the Lua global lock before API calls ---
     // The hooked function was called with the lock held.
-    // lua_unlock(L) releases it so our nested API calls don't deadlock.
+    // Release it so our nested API calls (lua_newthread, luau_load, etc.)
+    // can acquire/release the lock independently without deadlocking.
     size_t j_no_captured_L = SIZE_MAX;
-    if (hook_held_lock && a.unlock_fn) {
-        e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
-        e({0x48,0xB8}); e64(a.unlock_fn);
-        e({0xFF,0xD0});            // call lua_unlock
+    if (hook_held_lock) {
+        if (a.unlock_fn) {
+            e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
+            e({0x48,0xB8}); e64(a.unlock_fn);
+            e({0xFF,0xD0});            // call lua_unlock
+        } else if (a.lock_internals_valid && a.pthread_mutex_unlock_addr) {
+            // Synthesized inline unlock: pthread_mutex_unlock(L->global + mutex_offset)
+            // Used when compiler inlined lua_unlock (no callable symbol exists).
+            e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
+            if (a.lock_global_state_offset >= -128 && a.lock_global_state_offset < 128) {
+                e({0x48,0x8B,0x7F});   // mov rdi, [rdi + disp8]
+                e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_global_state_offset)));
+            } else {
+                e({0x48,0x8B,0xBF});   // mov rdi, [rdi + disp32]
+                e32(static_cast<uint32_t>(a.lock_global_state_offset));
+            }
+            if (a.lock_mutex_offset != 0) {
+                if (a.lock_mutex_offset >= -128 && a.lock_mutex_offset < 128) {
+                    e({0x48,0x8D,0x7F}); // lea rdi, [rdi + disp8]
+                    e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_mutex_offset)));
+                } else {
+                    e({0x48,0x8D,0xBF}); // lea rdi, [rdi + disp32]
+                    e32(static_cast<uint32_t>(a.lock_mutex_offset));
+                }
+            }
+            e({0x48,0xB8}); e64(a.pthread_mutex_unlock_addr);
+            e({0xFF,0xD0});            // call pthread_mutex_unlock
+        }
     }
     // === STEP 1: lua_newthread(L) — create new thread ===
     size_t j_nt_fail = SIZE_MAX;
@@ -4949,14 +5188,38 @@ static std::vector<uint8_t> gen_entry_trampoline(
         e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00}); // step 4 skipped
     }
 
-    // === Re-acquire Lua global lock after API calls ===
+       // === Re-acquire Lua global lock after API calls ===
     // The hooked function's caller expects the lock to be held.
     // lua_lock(L) re-acquires it before we execute the stolen bytes
     // and return to the original function body.
-    if (hook_held_lock && a.lock_fn) {
-        e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
-        e({0x48,0xB8}); e64(a.lock_fn);
-        e({0xFF,0xD0});            // call lua_lock
+    // Note: lock_fn is NOT the hooked function here (we hook settop,
+    // not lua_lock), so calling it directly is safe and non-recursive.
+    if (hook_held_lock) {
+        if (a.lock_fn) {
+            e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
+            e({0x48,0xB8}); e64(a.lock_fn);
+            e({0xFF,0xD0});            // call lua_lock
+        } else if (a.lock_internals_valid && a.pthread_mutex_lock_addr) {
+            e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
+            if (a.lock_global_state_offset >= -128 && a.lock_global_state_offset < 128) {
+                e({0x48,0x8B,0x7F});
+                e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_global_state_offset)));
+            } else {
+                e({0x48,0x8B,0xBF});
+                e32(static_cast<uint32_t>(a.lock_global_state_offset));
+            }
+            if (a.lock_mutex_offset != 0) {
+                if (a.lock_mutex_offset >= -128 && a.lock_mutex_offset < 128) {
+                    e({0x48,0x8D,0x7F});
+                    e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_mutex_offset)));
+                } else {
+                    e({0x48,0x8D,0xBF});
+                    e32(static_cast<uint32_t>(a.lock_mutex_offset));
+                }
+            }
+            e({0x48,0xB8}); e64(a.pthread_mutex_lock_addr);
+            e({0xFF,0xD0});
+        }
     }
 
     // === STEP 5: acknowledge — set ack = seq, clear guard ===
@@ -5158,7 +5421,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
              cave.padding_start, cave.padding_size);
 
     uintptr_t hook_addr = addrs.settop;
-    bool is_lock_hook = false;  // tracks which function is hooked (for cleanup)
+    bool is_lock_hook = false;
+    bool hook_needs_unlock = false;
     size_t patch_len = 0;
     uint8_t patch[16] = {};
 
@@ -5714,17 +5978,27 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                         }
                     }
 
-                    if (!addrs.unlock_fn) {
+                    if (!addrs.unlock_fn && addrs.lock_internals_valid) {
                         LOG_INFO("[direct-hook] lua_unlock not found (compiler-inlined) — "
-                                 "lock-free mode: hook on prologue fires BEFORE lua_lock, "
-                                 "each API call acquires/releases lock independently");
+                                 "using synthesized inline unlock via pthread_mutex_unlock "
+                                 "(global_offset={}, mutex_offset={}, unlock=0x{:X})",
+                                 addrs.lock_global_state_offset,
+                                 addrs.lock_mutex_offset,
+                                 addrs.pthread_mutex_unlock_addr);
+                    } else if (!addrs.unlock_fn) {
+                        LOG_WARN("[direct-hook] lua_unlock not found and lock internals "
+                                 "unavailable — held-lock hook will likely deadlock");
                     }
+
+                    bool can_release_lock = addrs.unlock_fn != 0 ||
+                                            addrs.lock_internals_valid;
+                    hook_needs_unlock = can_release_lock;
 
                     auto held_tramp = gen_entry_trampoline(
                         addrs, mb_addr, cave.padding_start,
                         best_live_settop, prologue, steal,
                         false,
-                        addrs.unlock_fn != 0);
+                        can_release_lock);
                     if (held_tramp.size() <= 400 &&
                         proc_mem_write(pid, cave.padding_start,
                                        held_tramp.data(),
@@ -5816,17 +6090,20 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     } else {
         settop_probe_live = true;
     }
-       // Re-generate trampoline with the final validated addrs
+          // Re-generate trampoline with the final validated addrs
     // (lua_settop may have been re-scanned by lock-anchored validation)
+    bool effective_held_lock = is_lock_hook || hook_needs_unlock;
     LOG_INFO("[direct-hook] final function addresses: resume=0x{:X} newthread=0x{:X} "
-             "load=0x{:X} settop=0x{:X} lock=0x{:X}",
+             "load=0x{:X} settop=0x{:X} lock=0x{:X} held_lock={} internals={}",
              addrs.resume, addrs.newthread, addrs.load, addrs.settop,
-             addrs.lock_fn ? addrs.lock_fn : 0);
+             addrs.lock_fn ? addrs.lock_fn : 0,
+             effective_held_lock,
+             addrs.lock_internals_valid);
 
     {
         auto t_final = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
                                              hook_addr, prologue, steal,
-                                             false, is_lock_hook);
+                                             false, effective_held_lock);
         if (!proc_mem_write(pid, cave.padding_start, t_final.data(), t_final.size())) {
             LOG_ERROR("[direct-hook] failed to write final trampoline");
             proc_mem_write(pid, hook_addr, prologue, steal);
@@ -5849,11 +6126,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     memcpy(dhook_.orig_patch, prologue, patch_len);
     dhook_.patch_len = patch_len;
     {
-        bool measure_held_lock = !is_lock_hook && addrs.unlock_fn != 0 &&
-                                 hook_addr != addrs.settop;
         auto t_measure = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
                                                hook_addr, prologue, steal,
-                                               false, measure_held_lock);
+                                               false, effective_held_lock);
         dhook_.nop_stub_addr = cave.padding_start + t_measure.size() - 1;
     }
     dhook_.active = true;
@@ -7111,6 +7386,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
