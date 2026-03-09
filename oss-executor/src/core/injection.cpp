@@ -3222,6 +3222,137 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
 
+        // Validate luau_load: must be from the same Luau copy as lua_resume.
+    // Functions from the wrong copy use different lock implementations,
+    // GOT entries, and internal helpers — causing deadlocks at step 2.
+    if (out.load && out.resume) {
+        int64_t ld = static_cast<int64_t>(out.load) - static_cast<int64_t>(out.resume);
+        if (ld < 0) ld = -ld;
+        if (static_cast<uint64_t>(ld) > 0x5000000ULL) { // >80MB
+            LOG_WARN("[direct-hook] luau_load at 0x{:X} is {:.0f}MB from lua_resume "
+                     "0x{:X} — wrong Luau copy, clearing for proximity re-scan",
+                     out.load, ld / (1024.0 * 1024.0), out.resume);
+            out.load = 0;
+        }
+    }
+
+    // Proximity string-ref re-scan for luau_load near lua_resume (±80MB)
+    if (!out.load && out.resume) {
+        LOG_INFO("[direct-hook] luau_load: proximity string-ref scan near lua_resume");
+        const char* load_needles[] = {
+            "bytecode version mismatch", "truncated", nullptr
+        };
+        for (int si = 0; load_needles[si] && !out.load; si++) {
+            const char* needle = load_needles[si];
+            size_t nlen = strlen(needle);
+            for (const auto& r : regions) {
+                if (out.load) break;
+                if (!r.readable() || r.size() < nlen) continue;
+                int64_t rdist = static_cast<int64_t>(r.start) -
+                                static_cast<int64_t>(out.resume);
+                if (rdist < -0x5000000LL || rdist > 0x5000000LL) continue;
+                size_t scan_len = std::min(r.size(), static_cast<size_t>(0x4000000));
+                std::vector<uint8_t> pat(needle, needle + nlen);
+                std::string mask_s(nlen, 'x');
+                auto hit = memory_.pattern_scan(pat, mask_s, r.start, scan_len);
+                if (!hit) continue;
+                uintptr_t str_addr = *hit;
+                LOG_DEBUG("[direct-hook] found '{}' at 0x{:X} near lua_resume",
+                          needle, str_addr);
+                for (const auto& xr : regions) {
+                    if (out.load) break;
+                    if (!xr.readable() || !xr.executable() || xr.size() < 7) continue;
+                    int64_t xdist = static_cast<int64_t>(xr.start) -
+                                    static_cast<int64_t>(out.resume);
+                    if (xdist < -0x5000000LL || xdist > 0x5000000LL) continue;
+                    size_t xscan = std::min(xr.size(), static_cast<size_t>(0x4000000));
+                    constexpr size_t LR_CHK = 4096;
+                    std::vector<uint8_t> lrbuf(LR_CHK + 16);
+                    for (size_t lroff = 0; lroff + 7 <= xscan && !out.load;
+                         lroff += LR_CHK) {
+                        size_t avail = xscan - lroff;
+                        size_t rdsz = std::min(avail, LR_CHK + static_cast<size_t>(7));
+                        struct iovec lrl = {lrbuf.data(), rdsz};
+                        struct iovec lrr = {reinterpret_cast<void*>(xr.start + lroff), rdsz};
+                        if (process_vm_readv(pid, &lrl, 1, &lrr, 1, 0) !=
+                            static_cast<ssize_t>(rdsz)) continue;
+                        for (size_t li = 0; li + 7 <= rdsz && !out.load; li++) {
+                            bool xf = false;
+                            if (lrbuf[li]==0x8D && (lrbuf[li+1]&0xC7)==0x05) {
+                                int32_t d; memcpy(&d, &lrbuf[li+2], 4);
+                                if (xr.start+lroff+li+6+(int64_t)d == str_addr) xf=true;
+                            }
+                            if (!xf && lrbuf[li]>=0x40 && lrbuf[li]<=0x4F &&
+                                lrbuf[li+1]==0x8D && (lrbuf[li+2]&0xC7)==0x05) {
+                                int32_t d; memcpy(&d, &lrbuf[li+3], 4);
+                                if (xr.start+lroff+li+7+(int64_t)d == str_addr) xf=true;
+                            }
+                            if (!xf) continue;
+                            uintptr_t xa = xr.start + lroff + li;
+                            uintptr_t lim = (xa > 4096) ? xa - 4096 : 0;
+                            for (uintptr_t p = xa-1; p >= lim && !out.load; p--) {
+                                uint8_t w[8];
+                                struct iovec wl={w,8};
+                                struct iovec wr_v={reinterpret_cast<void*>(p),8};
+                                if (process_vm_readv(pid,&wl,1,&wr_v,1,0)!=8) continue;
+                                bool cand = false;
+                                if (w[0]==0xF3&&w[1]==0x0F&&w[2]==0x1E&&w[3]==0xFA&&
+                                    w[4]==0x55) cand=true;
+                                else if (w[0]==0x55&&w[1]==0x48&&w[2]==0x89&&
+                                         w[3]==0xE5) cand=true;
+                                else if (w[0]==0x55 && p > lim) {
+                                    uint8_t pv; struct iovec pvl={&pv,1};
+                                    struct iovec pvr={reinterpret_cast<void*>(p-1),1};
+                                    if (process_vm_readv(pid,&pvl,1,&pvr,1,0)==1 &&
+                                        (pv==0xC3||pv==0xCC||pv==0x90)) cand=true;
+                                } else if (w[0]==0x53 && p > lim) {
+                                    uint8_t pv; struct iovec pvl={&pv,1};
+                                    struct iovec pvr={reinterpret_cast<void*>(p-1),1};
+                                    if (process_vm_readv(pid,&pvl,1,&pvr,1,0)==1 &&
+                                        (pv==0xC3||pv==0xCC||pv==0x90)) cand=true;
+                                } else if (w[0]==0x41&&w[1]>=0x54&&w[1]<=0x57 &&
+                                           p > lim) {
+                                    uint8_t pv; struct iovec pvl={&pv,1};
+                                    struct iovec pvr={reinterpret_cast<void*>(p-1),1};
+                                    if (process_vm_readv(pid,&pvl,1,&pvr,1,0)==1 &&
+                                        (pv==0xC3||pv==0xCC||pv==0x90)) cand=true;
+                                }
+                                if (!cand) continue;
+                                if (p==out.resume || p==out.settop ||
+                                    p==out.newthread) continue;
+                                uint8_t ib[64];
+                                size_t ia = std::min(static_cast<size_t>(xa+32-p),
+                                                     sizeof(ib));
+                                struct iovec il={ib,ia};
+                                struct iovec ir_v={reinterpret_cast<void*>(p),ia};
+                                if (process_vm_readv(pid,&il,1,&ir_v,1,0) !=
+                                    static_cast<ssize_t>(ia)) continue;
+                                size_t dec=0; int cnt=0;
+                                while (dec+15<=ia && dec<32) {
+                                    size_t insn=dh_insn_len(ib+dec);
+                                    if (insn==0||dec+insn>ia) break;
+                                    dec+=insn; cnt++;
+                                }
+                                if (cnt >= 3) {
+                                    out.load = p;
+                                    int64_t fd = static_cast<int64_t>(p) -
+                                                 static_cast<int64_t>(out.resume);
+                                    if (fd < 0) fd = -fd;
+                                    LOG_INFO("[direct-hook] proximity string-ref: "
+                                             "luau_load at 0x{:X} ({:.1f}MB from "
+                                             "lua_resume)", p, fd/(1024.0*1024.0));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!out.load)
+            LOG_WARN("[direct-hook] luau_load proximity re-scan found nothing "
+                     "near lua_resume");
+    }
+
     if (!out.resume || !out.load || !out.settop) {
         LOG_ERROR("[direct-hook] missing required functions: resume={:#x} load={:#x} settop={:#x}",
                   out.resume, out.load, out.settop);
@@ -4513,6 +4644,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
