@@ -5683,15 +5683,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                                 }
                                             }
                                             if (!is_lock_like) {
-                                                addrs.unlock_fn =
-                                                    r_last;
-                                                LOG_INFO("[direct-hook]"
-                                                    " lua_unlock at "
-                                                    "0x{:X} (last "
-                                                    "non-lock call in "
-                                                    "lua_resume at "
-                                                    "+{})", r_last,
-                                                    r_last_off);
+                                                int64_t ul_dist = static_cast<int64_t>(r_last) - static_cast<int64_t>(addrs.lock_fn);
+                                                if (ul_dist < 0) ul_dist = -ul_dist;
+                                                if (static_cast<uint64_t>(ul_dist) < 0x800000ULL) {
+                                                    addrs.unlock_fn = r_last;
+                                                    LOG_INFO("[direct-hook] lua_unlock at 0x{:X} (last non-lock call in lua_resume at +{}, {:.1f}MB from lock)", r_last, r_last_off, ul_dist / (1024.0 * 1024.0));
+                                                } else {
+                                                    LOG_WARN("[direct-hook] rejected lua_unlock candidate 0x{:X} from lua_resume — {:.1f}MB from active_lock 0x{:X} (likely inlined unlock)", r_last, ul_dist / (1024.0 * 1024.0), addrs.lock_fn);
+                                                }
                                             }
                                         }
                                     }
@@ -5700,52 +5699,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                         }
                     }
 
-                    if (addrs.unlock_fn) {
-                        LOG_INFO("[direct-hook] using held-lock mode: "
-                                 "unlock=0x{:X} lock=0x{:X}",
-                                 addrs.unlock_fn, addrs.lock_fn);
-                    } else {
-                        LOG_WARN("[direct-hook] lua_unlock not found —"
-                                 " held-lock mode requires unlock. "
-                                 "Trying pthread_mutex_unlock as "
-                                 "fallback.");
-                        uintptr_t pmutex_unlock =
-                            find_remote_symbol(pid, "pthread",
-                                               "pthread_mutex_unlock");
-                        if (!pmutex_unlock)
-                            pmutex_unlock = find_remote_symbol(
-                                pid, "c", "pthread_mutex_unlock");
-                        if (pmutex_unlock) {
-                            addrs.unlock_fn = pmutex_unlock;
-                            LOG_INFO("[direct-hook] using "
-                                     "pthread_mutex_unlock at 0x{:X} "
-                                     "as lua_unlock substitute",
-                                     pmutex_unlock);
-                            uintptr_t pmutex_lock =
-                                find_remote_symbol(pid, "pthread",
-                                                   "pthread_mutex_lock");
-                            if (!pmutex_lock)
-                                pmutex_lock = find_remote_symbol(
-                                    pid, "c", "pthread_mutex_lock");
-                            if (pmutex_lock) {
-                                addrs.lock_fn = pmutex_lock;
-                                LOG_INFO("[direct-hook] using "
-                                         "pthread_mutex_lock at "
-                                         "0x{:X} as lua_lock "
-                                         "substitute", pmutex_lock);
-                            }
-                        }
-                        if (!addrs.unlock_fn) {
-                            LOG_WARN("[direct-hook] no unlock mechanism"
-                                     " available — live settop hook "
-                                     "will deadlock. Skipping this "
-                                     "candidate, will fallback to "
-                                     "lua_resume.");
-                            proc_mem_write(pid, best_live_settop,
-                                           prologue, steal);
-                            settop_probe_live = false;
-                            break;
-                        }
+                    if (!addrs.unlock_fn) {
+                        LOG_WARN("[direct-hook] lua_unlock not found (likely compiler-inlined) — "
+                                 "held-lock settop hook would deadlock. "
+                                 "Skipping live settop, falling back to lua_resume hook.");
+                        proc_mem_write(pid, best_live_settop,
+                                       prologue, steal);
+                        settop_probe_live = false;
+                        break;
                     }
 
                     auto held_tramp = gen_entry_trampoline(
@@ -6834,6 +6795,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
