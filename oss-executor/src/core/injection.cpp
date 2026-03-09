@@ -5609,6 +5609,103 @@ uint64_t Injection::send_via_mailbox(const void* data, size_t len, uint32_t flag
              new_seq, len, flags);
     return new_seq;
 }
+bool Injection::wait_for_mailbox_ack(uint64_t armed_seq, size_t bc_len, uint8_t bc_ver) {
+    if (!dhook_.active || !dhook_.mailbox_addr || armed_seq == 0) return false;
+    pid_t mpid = memory_.get_pid();
+    if (mpid <= 0) return false;
+
+    uint8_t pre_hits = 0;
+    proc_mem_read(mpid, dhook_.mailbox_addr + 41, &pre_hits, 1);
+    LOG_INFO("[direct-hook] dispatch: armed_seq={} pre_hits={} "
+             "— entering 5s wait loop", armed_seq, pre_hits);
+
+    bool executed = false;
+    for (int i = 0; i < 100; i++) {
+        usleep(50000);
+        if (kill(mpid, 0) != 0) {
+            LOG_ERROR("[direct-hook] process died while waiting for ack");
+            return false;
+        }
+        uint64_t cur_ack = 0;
+        proc_mem_read(mpid, dhook_.mailbox_addr + 24, &cur_ack, 8);
+        uint32_t step = 0;
+        proc_mem_read(mpid, dhook_.mailbox_addr + 44, &step, 4);
+        uint8_t guard = 0;
+        proc_mem_read(mpid, dhook_.mailbox_addr + 40, &guard, 1);
+        uint8_t hits = 0;
+        proc_mem_read(mpid, dhook_.mailbox_addr + 41, &hits, 1);
+
+        if (cur_ack >= armed_seq) {
+            LOG_INFO("[direct-hook] execution confirmed: ack={} "
+                     "seq={} step={} hits={} ({} bytes, v{})",
+                     cur_ack, armed_seq, step, hits,
+                     bc_len, static_cast<int>(bc_ver));
+            executed = true;
+            break;
+        }
+        if (i == 0 || i % 10 == 0) {
+            LOG_DEBUG("[direct-hook] waiting[{}]: step={} guard={} "
+                      "hits={} ack={} armed_seq={}",
+                      i, step, guard, hits, cur_ack, armed_seq);
+        }
+        if (i == 20 && step == 0 && guard == 0 && hits > pre_hits + 10) {
+            LOG_WARN("[direct-hook] hook is live ({} hits) but "
+                     "payload path never entered after 1s — "
+                     "seq may not be visible to target or "
+                     "trampoline guard/seq check has a bug",
+                     hits);
+        }
+    }
+
+    if (executed) return true;
+
+    uint32_t final_step = 0;
+    uint8_t final_guard = 0;
+    uint8_t final_hits = 0;
+    uint64_t final_ack = 0;
+    proc_mem_read(mpid, dhook_.mailbox_addr + 44, &final_step, 4);
+    proc_mem_read(mpid, dhook_.mailbox_addr + 40, &final_guard, 1);
+    proc_mem_read(mpid, dhook_.mailbox_addr + 41, &final_hits, 1);
+    proc_mem_read(mpid, dhook_.mailbox_addr + 24, &final_ack, 8);
+
+    uint64_t verify_seq = 0;
+    proc_mem_read(mpid, dhook_.mailbox_addr + 16, &verify_seq, 8);
+
+    if (verify_seq != armed_seq) {
+        LOG_ERROR("[direct-hook] CRITICAL: seq in mailbox is {} but "
+                  "we wrote {} — memory write did not persist or "
+                  "target overwrote seq", verify_seq, armed_seq);
+    }
+
+    if (final_step == 0 && final_guard == 0) {
+        LOG_ERROR("[direct-hook] trampoline never entered payload "
+                  "path (step=0, guard=0, hits={}, ack={}, "
+                  "armed_seq={}, verify_seq={}) — hook is {} "
+                  "but seq/ack comparison in trampoline never "
+                  "triggered",
+                  final_hits, final_ack, armed_seq, verify_seq,
+                  final_hits > pre_hits + 5 ? "LIVE" : "possibly dead");
+    } else if (final_step > 0 && final_step < 5) {
+        const char* step_names[] = {
+            "?", "lua_newthread", "luau_load", "lua_resume",
+            "lua_settop(-2)", "ack"
+        };
+        const char* sn = (final_step <= 5)
+            ? step_names[final_step] : "?";
+        LOG_ERROR("[direct-hook] execution stalled at step {} "
+                  "({}) — likely deadlock or crash inside Luau "
+                  "call (guard={}, hits={}, ack={}, armed_seq={})",
+                  final_step, sn, final_guard, final_hits,
+                  final_ack, armed_seq);
+    } else {
+        LOG_ERROR("[direct-hook] execution timeout: step={} "
+                  "guard={} ack={} armed_seq={} verify_seq={} "
+                  "hits={}",
+                  final_step, final_guard, final_ack, armed_seq,
+                  verify_seq, final_hits);
+    }
+    return false;
+}
 
 bool Injection::inject() {
     if (!attach()) return false;
@@ -5899,106 +5996,13 @@ bool Injection::execute_script(const std::string& source) {
         uint8_t sent_bc_ver = bc_ver;
         free(bc);
         if (armed_seq > 0) {
-            pid_t mpid = memory_.get_pid();
-
-            uint8_t pre_hits = 0;
-            proc_mem_read(mpid, dhook_.mailbox_addr + 41, &pre_hits, 1);
-            LOG_INFO("[direct-hook] dispatch: armed_seq={} pre_hits={} "
-                     "— entering 5s wait loop", armed_seq, pre_hits);
-
-            bool executed = false;
-            for (int i = 0; i < 100; i++) {
-                usleep(50000);
-                if (kill(mpid, 0) != 0) {
-                    set_state(InjectionState::Ready,
-                              "Target process died during execution");
-                    LOG_ERROR("[direct-hook] process died while waiting "
-                              "for ack");
-                    return false;
-                }
-                uint64_t cur_ack = 0;
-                proc_mem_read(mpid, dhook_.mailbox_addr + 24, &cur_ack, 8);
-                uint32_t step = 0;
-                proc_mem_read(mpid, dhook_.mailbox_addr + 44, &step, 4);
-                uint8_t guard = 0;
-                proc_mem_read(mpid, dhook_.mailbox_addr + 40, &guard, 1);
-                uint8_t hits = 0;
-                proc_mem_read(mpid, dhook_.mailbox_addr + 41, &hits, 1);
-
-                if (cur_ack >= armed_seq) {
-                    LOG_INFO("[direct-hook] execution confirmed: ack={} "
-                             "seq={} step={} hits={} ({} bytes, v{})",
-                             cur_ack, armed_seq, step, hits,
-                             sent_bc_len,
-                             static_cast<int>(sent_bc_ver));
-                    executed = true;
-                    break;
-                }
-                if (i == 0 || i % 10 == 0) {
-                    LOG_DEBUG("[direct-hook] waiting[{}]: step={} guard={} "
-                              "hits={} ack={} armed_seq={}",
-                              i, step, guard, hits, cur_ack, armed_seq);
-                }
-                if (i == 20 && step == 0 && guard == 0 && hits > pre_hits + 10) {
-                    LOG_WARN("[direct-hook] hook is live ({} hits) but "
-                             "payload path never entered after 1s — "
-                             "seq may not be visible to target or "
-                             "trampoline guard/seq check has a bug",
-                             hits);
-                }
-            }
-
+            bool executed = wait_for_mailbox_ack(armed_seq, sent_bc_len, sent_bc_ver);
             if (executed) {
-                set_state(InjectionState::Ready,
-                          "Script executed in Roblox");
+                set_state(InjectionState::Ready, "Script executed in Roblox");
                 return true;
             }
-
             uint32_t final_step = 0;
-            uint8_t final_guard = 0;
-            uint8_t final_hits = 0;
-            uint64_t final_ack = 0;
-            proc_mem_read(mpid, dhook_.mailbox_addr + 44, &final_step, 4);
-            proc_mem_read(mpid, dhook_.mailbox_addr + 40, &final_guard, 1);
-            proc_mem_read(mpid, dhook_.mailbox_addr + 41, &final_hits, 1);
-            proc_mem_read(mpid, dhook_.mailbox_addr + 24, &final_ack, 8);
-
-            uint64_t verify_seq = 0;
-            proc_mem_read(mpid, dhook_.mailbox_addr + 16, &verify_seq, 8);
-
-            if (verify_seq != armed_seq) {
-                LOG_ERROR("[direct-hook] CRITICAL: seq in mailbox is {} but "
-                          "we wrote {} — memory write did not persist or "
-                          "target overwrote seq", verify_seq, armed_seq);
-            }
-
-            if (final_step == 0 && final_guard == 0) {
-                LOG_ERROR("[direct-hook] trampoline never entered payload "
-                          "path (step=0, guard=0, hits={}, ack={}, "
-                          "armed_seq={}, verify_seq={}) — hook is {} "
-                          "but seq/ack comparison in trampoline never "
-                          "triggered",
-                          final_hits, final_ack, armed_seq, verify_seq,
-                          final_hits > pre_hits + 5 ? "LIVE" : "possibly dead");
-            } else if (final_step > 0 && final_step < 5) {
-                const char* step_names[] = {
-                    "?", "lua_newthread", "luau_load", "lua_resume",
-                    "lua_settop(-2)", "ack"
-                };
-                const char* sn = (final_step <= 5)
-                    ? step_names[final_step] : "?";
-                LOG_ERROR("[direct-hook] execution stalled at step {} "
-                          "({}) — likely deadlock or crash inside Luau "
-                          "call (guard={}, hits={}, ack={}, armed_seq={})",
-                          final_step, sn, final_guard, final_hits,
-                          final_ack, armed_seq);
-            } else {
-                LOG_ERROR("[direct-hook] execution timeout: step={} "
-                          "guard={} ack={} armed_seq={} verify_seq={} "
-                          "hits={}",
-                          final_step, final_guard, final_ack, armed_seq,
-                          verify_seq, final_hits);
-            }
+            proc_mem_read(memory_.get_pid(), dhook_.mailbox_addr + 44, &final_step, 4);
             set_state(InjectionState::Ready,
                       "Script dispatch timeout — step " +
                       std::to_string(final_step));
@@ -6194,6 +6198,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
