@@ -3490,19 +3490,21 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
 
-        // Extract active lua_lock from the confirmed-active lua_settop.
+                // Extract active lua_lock from the confirmed-active lua_settop.
     // lua_settop's first CALL is always lua_lock (Luau API contract).
     // This address uniquely identifies the active Luau copy's mutex —
     // functions from dead/wrong copies call a DIFFERENT lua_lock.
+    // Expanded to 80-byte buffer (lua_settop can be 65+ bytes with
+    // register saves pushing the first CALL past byte 35).
     uintptr_t active_lock = 0;
     if (out.settop) {
-        uint8_t stb[40];
+        uint8_t stb[80];
         struct iovec stl = {stb, sizeof(stb)};
         struct iovec str_v = {reinterpret_cast<void*>(out.settop), sizeof(stb)};
         if (process_vm_readv(pid, &stl, 1, &str_v, 1, 0) == static_cast<ssize_t>(sizeof(stb))) {
             int start = 0;
             if (stb[0]==0xF3 && stb[1]==0x0F && stb[2]==0x1E && stb[3]==0xFA) start = 4;
-            for (int i = start; i < 35; i++) {
+            for (int i = start; i < 75; i++) {
                 if (stb[i] == 0xE8) {
                     int32_t d; memcpy(&d, &stb[i+1], 4);
                     active_lock = out.settop + i + 5 + static_cast<int64_t>(d);
@@ -3512,6 +3514,94 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 }
             }
         }
+    }
+
+    // Fallback: extract active lua_lock by cross-referencing CALL targets
+    // from lua_resume and luau_load.  Both functions call lua_lock early in
+    // their body — the first COMMON short-function target is lua_lock.
+    // This handles the case where lua_settop's lock is inlined or the
+    // lua_settop found by proximity scan is the wrong function entirely.
+    if (!active_lock && out.resume) {
+        LOG_INFO("[direct-hook] lua_settop lock extraction failed — "
+                 "cross-referencing lua_resume + luau_load CALL targets");
+
+        auto extract_call_targets = [&](uintptr_t fn_addr, size_t scan_len)
+            -> std::vector<uintptr_t>
+        {
+            std::vector<uintptr_t> targets;
+            uint8_t buf[120];
+            size_t rd = std::min(scan_len, sizeof(buf));
+            struct iovec li = {buf, rd};
+            struct iovec ri = {reinterpret_cast<void*>(fn_addr), rd};
+            if (process_vm_readv(pid, &li, 1, &ri, 1, 0) !=
+                static_cast<ssize_t>(rd))
+                return targets;
+            int s = 0;
+            if (buf[0]==0xF3 && buf[1]==0x0F && buf[2]==0x1E && buf[3]==0xFA)
+                s = 4;
+            for (size_t i = static_cast<size_t>(s); i + 5 <= rd; i++) {
+                if (buf[i] != 0xE8) continue;
+                int32_t d;
+                memcpy(&d, &buf[i + 1], 4);
+                uintptr_t t = fn_addr + i + 5 + static_cast<int64_t>(d);
+                targets.push_back(t);
+                i += 4;
+            }
+            return targets;
+        };
+
+        auto is_short_function = [&](uintptr_t addr) -> bool {
+            uint8_t fb[80];
+            struct iovec fl = {fb, 80};
+            struct iovec fr = {reinterpret_cast<void*>(addr), 80};
+            if (process_vm_readv(pid, &fl, 1, &fr, 1, 0) != 80) return false;
+            size_t s = 0;
+            if (fb[0]==0xF3 && fb[1]==0x0F && fb[2]==0x1E && fb[3]==0xFA) s=4;
+            uint8_t b = fb[s];
+            if (b==0x00 || b==0xCC || b==0x90 || b==0xC3) return false;
+            for (size_t j = s + 1; j < 60; j++)
+                if (fb[j] == 0xC3) return true;
+            return false;
+        };
+
+        auto resume_calls = extract_call_targets(out.resume, 100);
+
+        // Cross-reference: find common CALL target between lua_resume
+        // and luau_load that is a short function (< 60 bytes to RET).
+        if (out.load) {
+            auto load_calls = extract_call_targets(out.load, 100);
+            for (auto rc : resume_calls) {
+                if (active_lock) break;
+                for (auto lc : load_calls) {
+                    if (rc == lc && is_short_function(rc)) {
+                        active_lock = rc;
+                        LOG_INFO("[direct-hook] active lua_lock at 0x{:X} "
+                                 "(cross-ref lua_resume + luau_load)", active_lock);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Last resort: first short-function CALL from lua_resume alone.
+        // In release builds api_check is a no-op macro, so the first
+        // real CALL is lua_lock.  Assertion functions in debug builds
+        // are typically longer than 60 bytes so is_short_function
+        // filters them out.
+        if (!active_lock) {
+            for (auto rc : resume_calls) {
+                if (is_short_function(rc)) {
+                    active_lock = rc;
+                    LOG_INFO("[direct-hook] active lua_lock at 0x{:X} "
+                             "(first short call in lua_resume)", active_lock);
+                    break;
+                }
+            }
+        }
+
+        if (!active_lock)
+            LOG_WARN("[direct-hook] could not extract active lua_lock "
+                     "from any source");
     }
 
     // Validate lua_newthread calls the active lua_lock.
@@ -3543,7 +3633,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                      "0x{:X} — wrong Luau copy, clearing for re-scan",
                      out.newthread, active_lock);
             out.newthread = 0;
-            out.lock_fn = 0;
+            out.lock_fn = active_lock;
         }
     }
 
@@ -3662,6 +3752,15 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             LOG_WARN("[direct-hook] lock-anchored scan found no lua_newthread "
                      "candidates calling active lua_lock 0x{:X}", active_lock);
         }
+    }
+
+        // Ensure lock_fn always points to the live active_lock if we found one.
+    // This guarantees inject_via_direct_hook can use it as a hook target
+    // even if the lock-anchored scan path was skipped or took a different
+    // code path that didn't set lock_fn.
+    if (active_lock && !out.lock_fn) {
+        out.lock_fn = active_lock;
+        LOG_INFO("[direct-hook] lock_fn set to active_lock 0x{:X} (safety net)", active_lock);
     }
 
     if (!out.resume || !out.load || !out.settop) {
@@ -3983,19 +4082,23 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         }
         LOG_INFO("[direct-hook] {} patch verified at 0x{:X}", name, target);
 
-        // Probe: wait and check hit counter
+                // Probe: wait and check hit counter.
+        // Require ≥10 hits in 1000ms to distinguish live functions
+        // (~400+ hits/s for lua_resume) from stale/dead copies that
+        // get sporadic hits (~3 in 500ms) then go completely silent.
         uint8_t zh = 0;
         proc_mem_write(pid, mb_addr + 41, &zh, 1);
-        usleep(500000);
+        usleep(1000000);
         uint8_t hits = 0;
         proc_mem_read(pid, mb_addr + 41, &hits, 1);
 
-        if (hits == 0) {
-            LOG_WARN("[direct-hook] {} at 0x{:X} is dead code (0 hits in 500ms)", name, target);
+        if (hits < 10) {
+            LOG_WARN("[direct-hook] {} at 0x{:X} has only {} hits in 1000ms "
+                     "(need ≥10) — likely dead/stale code", name, target, hits);
             proc_mem_write(pid, target, pro, st);  // restore prologue
             return false;
         }
-        LOG_INFO("[direct-hook] {} probe: {} hits in 500ms — LIVE!", name, hits);
+        LOG_INFO("[direct-hook] {} probe: {} hits in 1000ms — LIVE!", name, hits);
 
         // Commit: store stolen bytes and patch for cleanup
         memcpy(prologue, pro, st);
@@ -5002,6 +5105,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
