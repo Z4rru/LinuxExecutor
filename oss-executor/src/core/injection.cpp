@@ -6612,8 +6612,12 @@ bool Injection::execute_script(const std::string& source) {
             LOG_ERROR("Cannot create cmd file {}: {}", tmp_cmd, strerror(errno));
         }
 
-        payload_loaded_ = false;
-        set_state(InjectionState::Ready, "Payload unreachable (socket + file IPC failed)");
+        if (!dhook_.active) {
+            payload_loaded_ = false;
+            set_state(InjectionState::Ready, "Payload unreachable (socket + file IPC failed)");
+        } else {
+            set_state(InjectionState::Ready, "IPC channels unreachable but direct hook still active");
+        }
         return false;
     }
 
@@ -6678,6 +6682,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
