@@ -209,7 +209,10 @@ private:
         bool      active       = false;
         bool      has_compile  = false;
         bool      has_sandbox  = false;
-        bool      hook_is_lock_fn = false;
+        bool hook_is_lock_fn = false;
+        uintptr_t active_lock_addr = 0;
+        uintptr_t active_unlock_addr = 0;
+        uintptr_t real_settop_addr = 0;
     };
 
     bool inject_via_direct_hook(pid_t pid);
@@ -220,6 +223,7 @@ private:
 };
 
 }
+
 
 
 
