@@ -3623,62 +3623,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 LOG_INFO("[direct-hook] active_lock extracted from lua_settop+{}: 0x{:X}",
                          st_calls.front().first, active_lock);
             }
-
-            // Last CALL that targets a DIFFERENT address = lua_unlock.
-            // Validate: unlock must start with a valid prologue byte.
-            if (boundary_found && active_lock && st_calls.size() >= 2) {
-                uintptr_t active_unlock = 0;
-                size_t unlock_off = 0;
-                for (auto it = st_calls.rbegin(); it != st_calls.rend(); ++it) {
-                    if (it->second == active_lock) continue;
-                    // Validate the target looks like a function start
-                    uint8_t probe[4] = {};
-                    proc_mem_read(pid, it->second, probe, sizeof(probe));
-                    // Skip ENDBR64 prefix if present
-                    size_t ps = 0;
-                    if (probe[0]==0xF3 && probe[1]==0x0F && probe[2]==0x1E && probe[3]==0xFA)
-                        ps = 4;
-                    // Accept: push rbp(55), push rbx(53), push r12-15(41 54-57),
-                    // sub rsp(48 83 EC), push rdi(57), push rsi(56), mov(48 89/8B)
-                    bool valid_start = false;
-                    if (ps < 4) {
-                        uint8_t b = probe[ps];
-                        valid_start = (b==0x55 || b==0x53 || b==0x56 || b==0x57 ||
-                                       b==0x41 || b==0x48 || b==0x50 || b==0x51);
-                    } else {
-                        // Had ENDBR64, need to read more
-                        uint8_t probe2[8] = {};
-                        proc_mem_read(pid, it->second + 4, probe2, sizeof(probe2));
-                        valid_start = (probe2[0]==0x55 || probe2[0]==0x53 ||
-                                       probe2[0]==0x41 || probe2[0]==0x48);
-                    }
-                    if (!valid_start) {
-                        LOG_DEBUG("[direct-hook] lua_settop CALL+{} → 0x{:X} starts with "
-                                  "0x{:02X} — not a function prologue, skipping",
-                                  it->first, it->second, probe[0]);
-                        continue;
-                    }
-                    active_unlock = it->second;
-                    unlock_off = it->first;
-                    break;
-                }
-
-                if (active_unlock) {
-                    if (out.unlock_fn && out.unlock_fn != active_unlock) {
-                        LOG_WARN("[direct-hook] overriding stale unlock_fn 0x{:X} → 0x{:X} "
-                                 "(lua_settop instruction-decoded)", out.unlock_fn, active_unlock);
-                    }
-                    out.unlock_fn = active_unlock;
-                    LOG_INFO("[direct-hook] active_unlock extracted from lua_settop+{}: 0x{:X} "
-                             "(instruction-decoded boundary={})", unlock_off, active_unlock, st_fend);
-                } else {
-                    LOG_WARN("[direct-hook] no valid unlock target found in lua_settop "
-                             "({} calls, boundary={})", st_calls.size(), st_fend);
-                }
-            } else if (!boundary_found) {
-                LOG_WARN("[direct-hook] lua_settop boundary not found — "
-                         "skipping unlock extraction");
-            }
+// Unlock extraction removed — trampoline handles re-entrant
+            // lua_lock calls by executing the real function body.
         }
     }
         if (active_lock) {
@@ -4339,156 +4285,13 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     // 2. Instruction-decoded lua_newthread: last CALL before RET
     // 3. Instruction-decoded lua_settop (if CHUNK 1 found it)
     // ═══════════════════════════════════════════════════════════════
-
-    // Helper: collect unique CALL targets from a function's first N bytes
-    auto collect_call_targets = [&](uintptr_t fn_addr, size_t max_bytes)
-        -> std::vector<uintptr_t> {
-        std::vector<uintptr_t> targets;
-        if (!fn_addr) return targets;
-        std::vector<uint8_t> buf(max_bytes);
-        struct iovec cl = {buf.data(), max_bytes};
-        struct iovec cr = {reinterpret_cast<void*>(fn_addr), max_bytes};
-        ssize_t rd = process_vm_readv(pid, &cl, 1, &cr, 1, 0);
-        if (rd < 20) return targets;
-        size_t avail = static_cast<size_t>(rd);
-
-        // Instruction-decode to find actual function end
-        size_t fend = 0;
-        {
-            size_t pos = 0;
-            while (pos + 15 < avail && pos < max_bytes) {
-                size_t il = dh_insn_len(buf.data() + pos);
-                if (il == 0) break;
-                if (buf[pos] == 0xC3) { fend = pos + 1; break; }
-                pos += il;
-            }
-        }
-        // Fallback: byte-pattern boundary
-        if (fend == 0) {
-            fend = avail;
-            for (size_t i = 25; i + 1 < avail; i++) {
-                if (buf[i] != 0xC3) continue;
-                uint8_t nx = buf[i + 1];
-                if (nx==0xCC||nx==0x90||nx==0x55||nx==0x53||
-                    nx==0x56||nx==0x57||nx==0xF3||nx==0x00||
-                    (nx==0x41 && i+2<avail && buf[i+2]>=0x50 && buf[i+2]<=0x57)||
-                    (nx==0x48 && i+2<avail && buf[i+2]==0x83 &&
-                     i+3<avail && buf[i+3]==0xEC)) {
-                    fend = i + 1; break;
-                }
-            }
-        }
-
-        for (size_t i = 0; i + 5 <= fend; i++) {
-            if (buf[i] != 0xE8) continue;
-            int32_t d; memcpy(&d, &buf[i + 1], 4);
-            uintptr_t t = fn_addr + i + 5 + static_cast<int64_t>(d);
-            bool dup = false;
-            for (auto& ex : targets) if (ex == t) { dup = true; break; }
-            if (!dup) targets.push_back(t);
-        }
-        return targets;
-    };
-
-    // Helper: check if address looks like a function start
-    auto is_valid_func_start = [&](uintptr_t addr) -> bool {
-        uint8_t probe[8] = {};
-        if (!proc_mem_read(pid, addr, probe, sizeof(probe))) return false;
-        size_t ps = 0;
-        if (probe[0]==0xF3 && probe[1]==0x0F && probe[2]==0x1E && probe[3]==0xFA)
-            ps = 4; // skip ENDBR64
-        uint8_t b = probe[ps];
-        return (b==0x55 || b==0x53 || b==0x56 || b==0x57 ||
-                b==0x41 || b==0x48 || b==0x50 || b==0x51);
-    };
-
-    // Layer 1: Cross-validate between lua_newthread and lua_resume.
-    // lua_newthread is small (~60-80B) so its CALL targets are reliable.
-    // Find targets shared with lua_resume that aren't active_lock.
-    if (out.newthread && out.resume && active_lock) {
-        auto nt_targets = collect_call_targets(out.newthread, 128);
-        auto rs_targets = collect_call_targets(out.resume, 800);
-
-        LOG_DEBUG("[direct-hook] unlock cross-validate: newthread has {} targets, "
-                  "resume has {} targets", nt_targets.size(), rs_targets.size());
-
-        uintptr_t best_unlock = 0;
-        for (auto& nt : nt_targets) {
-            if (nt == active_lock) continue;
-            for (auto& rs : rs_targets) {
-                if (rs != nt) continue;
-                // Shared target that isn't lock — candidate for unlock
-                if (!is_valid_func_start(nt)) {
-                    LOG_DEBUG("[direct-hook] shared target 0x{:X} not a valid "
-                              "function start — skipping", nt);
-                    continue;
-                }
-                best_unlock = nt;
-                break;
-            }
-            if (best_unlock) break;
-        }
-
-        if (best_unlock) {
-            if (out.unlock_fn && out.unlock_fn != best_unlock) {
-                LOG_WARN("[direct-hook] AUTHORITATIVE: overriding unlock_fn 0x{:X} → "
-                         "0x{:X} (cross-validated: newthread∩resume, not lock)",
-                         out.unlock_fn, best_unlock);
-            }
-            out.unlock_fn = best_unlock;
-            LOG_INFO("[direct-hook] AUTHORITATIVE: unlock_fn=0x{:X} "
-                     "(cross-validated between lua_newthread and lua_resume)",
-                     out.unlock_fn);
-        } else {
-            LOG_WARN("[direct-hook] cross-validation found no shared non-lock "
-                     "target between newthread and resume");
-        }
-    }
-
-    // Layer 2: Instruction-decoded lua_newthread (last non-lock CALL)
-    if (!out.unlock_fn && out.newthread && active_lock) {
-        auto nt_targets = collect_call_targets(out.newthread, 128);
-        // Last target that isn't active_lock
-        for (auto it = nt_targets.rbegin(); it != nt_targets.rend(); ++it) {
-            if (*it == active_lock) continue;
-            if (!is_valid_func_start(*it)) continue;
-            out.unlock_fn = *it;
-            LOG_INFO("[direct-hook] FALLBACK: unlock_fn=0x{:X} "
-                     "(last non-lock CALL in decoded lua_newthread)",
-                     out.unlock_fn);
-            break;
-        }
-    }
-
-    // Layer 3: If lua_settop CHUNK 1 already found it, it's already set.
-    // Just log the final state.
-    if (out.unlock_fn) {
-        // Final validation: the unlock function should be callable (starts
-        // with valid prologue) and relatively close to active_lock
-        uint8_t ul_probe[4] = {};
-        proc_mem_read(pid, out.unlock_fn, ul_probe, sizeof(ul_probe));
-        int64_t lock_unlock_dist = static_cast<int64_t>(out.unlock_fn) -
-                                   static_cast<int64_t>(active_lock);
-        if (lock_unlock_dist < 0) lock_unlock_dist = -lock_unlock_dist;
-        LOG_INFO("[direct-hook] final unlock_fn=0x{:X} (starts with 0x{:02X}, "
-                 "{:.1f}MB from lock)", out.unlock_fn, ul_probe[0],
-                 lock_unlock_dist / (1024.0 * 1024.0));
-
-        // Sanity: reject if unlock starts with data-like bytes
-        if (ul_probe[0] == 0x00 || ul_probe[0] == 0xCC ||
-            ul_probe[0] == 0x8A || ul_probe[0] == 0x8B ||
-            ul_probe[0] == 0x0F) {
-            LOG_ERROR("[direct-hook] unlock_fn 0x{:X} starts with 0x{:02X} — "
-                      "not a function prologue, clearing", out.unlock_fn, ul_probe[0]);
-            out.unlock_fn = 0;
-        }
-    }
-
-    if (!out.unlock_fn) {
-        LOG_ERROR("[direct-hook] CRITICAL: active_unlock could not be found via "
-                  "cross-validation or instruction decoding — lock hook WILL "
-                  "deadlock at step 2");
-    }
+// ═══════════════════════════════════════════════════════════════
+    // Unlock extraction removed — no longer needed.
+    // The trampoline's guard path now executes the real lua_lock
+    // for re-entrant calls. Each API function handles its own
+    // lock/unlock pair correctly, whether lua_unlock is a function
+    // call or compiler-inlined.
+    // ═══════════════════════════════════════════════════════════════
 
     if (!out.resume || !out.load || !out.settop) {
         LOG_ERROR("[direct-hook] missing required functions: resume={:#x} load={:#x} settop={:#x}",
@@ -5562,6 +5365,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
