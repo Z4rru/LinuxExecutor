@@ -4019,6 +4019,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         return false;
     }
     return true;
+} 
 
 // ═══════════════════════════════════════════════════════════════════
 // Phase 1: Fires inside lua_resume prologue (lua_lock HELD).
@@ -5349,6 +5350,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
