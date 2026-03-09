@@ -3827,35 +3827,49 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
             std::vector<uint8_t> buf(scan_size);
             if (!proc_mem_read(pid, fn_addr, buf.data(), scan_size)) return;
 
+                        // Permissive lock function detector: accepts any readable target
+            // that is a short function (contains RET within 300 bytes).
+            // PLT stubs (FF 25) immediately accepted.  Only rejects self-calls,
+            // unreadable targets, and obvious garbage (null bytes, INT3, NOP, bare RET).
             auto is_lock_like = [&](uintptr_t addr) -> bool {
                 if (addr >= fn_addr && addr < fn_addr + scan_size) return false;
-                uint8_t fb[200] = {};
+                uint8_t fb[300] = {};
                 if (!proc_mem_read(pid, addr, fb, sizeof(fb))) return false;
                 size_t s = 0;
                 if (fb[0]==0xF3&&fb[1]==0x0F&&fb[2]==0x1E&&fb[3]==0xFA) s=4;
                 uint8_t b0 = fb[s];
                 if (b0==0x00||b0==0xCC||b0==0x90||b0==0xC3) return false;
-                bool ok = (b0>=0x50&&b0<=0x57) ||
-                    (b0==0x41&&s+1<sizeof(fb)&&fb[s+1]>=0x50&&fb[s+1]<=0x57) ||
-                    (b0==0x48&&s+2<sizeof(fb)&&
-                     (fb[s+1]==0x83||fb[s+1]==0x81||
-                      fb[s+1]==0x89||fb[s+1]==0x8B));
-                if (!ok) return false;
-                for (size_t j = s+1; j < sizeof(fb); j++)
+                // PLT stub: jmp qword ptr [rip+disp32]
+                if (b0==0xFF && s+1<sizeof(fb) && fb[s+1]==0x25) return true;
+                // Accept ANY prologue style (push, mov, xor, lock prefix, sub, etc.)
+                // as long as the function contains RET within 300 bytes
+                for (size_t j = s; j < sizeof(fb); j++)
                     if (fb[j] == 0xC3) return true;
                 return false;
             };
 
+            // For small scan sizes (e.g. lua_settop ~65B scanned as 100),
+            // estimate function boundary to avoid scanning into adjacent functions.
+            // Uses first RET after offset 20 as the boundary.
+            size_t effective_end = scan_size;
+            if (scan_size <= 300) {
+                for (size_t i = 20; i < scan_size; i++) {
+                    if (buf[i] == 0xC3) { effective_end = i + 1; break; }
+                }
+                LOG_DEBUG("[direct-hook] {} effective boundary: {}/{} bytes",
+                          name, effective_end, scan_size);
+            }
+
             uintptr_t lock_a = 0, unlock_a = 0;
             int lock_off = -1, unlock_off = -1;
-            for (size_t i = 0; i+5 <= scan_size; i++) {
+            for (size_t i = 0; i+5 <= effective_end; i++) {
                 if (buf[i] != 0xE8) continue;
                 int32_t d; memcpy(&d, &buf[i+1], 4);
                 uintptr_t t = fn_addr+i+5+static_cast<int64_t>(d);
                 if (!is_lock_like(t)) continue;
                 lock_a = t; lock_off = static_cast<int>(i); break;
             }
-            for (int i = static_cast<int>(scan_size)-5; i >= 20; i--) {
+            for (int i = static_cast<int>(effective_end)-5; i >= 20; i--) {
                 if (buf[i] != 0xE8) continue;
                 int32_t d; memcpy(&d, &buf[i+1], 4);
                 uintptr_t t = fn_addr+i+5+static_cast<int64_t>(d);
@@ -3863,9 +3877,11 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                 unlock_a = t; unlock_off = i; break;
             }
             if (!lock_a || !unlock_a || lock_a == unlock_a) {
-                LOG_WARN("[direct-hook] {} deep scan: lock={}@{} unlock={}@{}",
+                LOG_WARN("[direct-hook] {} deep scan: lock={}@{} unlock={}@{} "
+                         "(scanned {}/{} bytes)",
                          name, lock_a?"found":"miss", lock_off,
-                         unlock_a?"found":"miss", unlock_off);
+                         unlock_a?"found":"miss", unlock_off,
+                         effective_end, scan_size);
                 return;
             }
             uintptr_t ta[2] = {lock_a, unlock_a};
@@ -4497,6 +4513,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
