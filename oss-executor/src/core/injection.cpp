@@ -2990,26 +2990,10 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     break;
                 }
             }
-            // Last CALL = lua_unlock — only if boundary was found
-            if (nt_boundary_found && out.lock_fn) {
-                uintptr_t nt_unlock = 0;
-                for (int i = static_cast<int>(nt_fend) - 5; i >= 10; i--) {
-                    if (ntb[i] != 0xE8) continue;
-                    int32_t d; memcpy(&d, &ntb[i+1], 4);
-                    uintptr_t target = out.newthread + i + 5 + static_cast<int64_t>(d);
-                    if (target == out.lock_fn) continue;
-                    nt_unlock = target;
-                    break;
-                }
-                if (nt_unlock) {
-                    out.unlock_fn = nt_unlock;
-                    LOG_INFO("[direct-hook] lua_unlock at 0x{:X} (from newthread+boundary={})",
-                             out.unlock_fn, nt_fend);
-                }
-            } else if (!nt_boundary_found) {
-                LOG_DEBUG("[direct-hook] newthread boundary not found in {} bytes — "
-                          "skipping unlock extraction", nt_read);
-            }
+                        // Do NOT extract unlock from pre-validation newthread.
+            // This address may be from a dead Luau copy — the FINAL GATE
+            // frequently rejects the initial newthread. Unlock extraction
+            // is deferred to the authoritative cross-validation block.
         }
     }
 
@@ -3154,23 +3138,11 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     break;
                 }
             }
-            // NOTE: This newthread may be from a DEAD copy. If the FINAL GATE
-            // rejects it later, unlock_fn extracted here will be wrong.
-            // Mark it as provisional — will be overridden by CHUNK 6
-            // (post-validation authoritative extraction from lua_resume).
-            if (nt2_boundary && out.lock_fn) {
-                for (int i = static_cast<int>(nt2_fend) - 5; i >= 10; i--) {
-                    if (ntb2[i] != 0xE8) continue;
-                    int32_t d; memcpy(&d, &ntb2[i+1], 4);
-                    uintptr_t target = out.newthread + i + 5 + static_cast<int64_t>(d);
-                    if (target == out.lock_fn) continue;
-                    out.unlock_fn = target;
-                    LOG_INFO("[direct-hook] lua_unlock at 0x{:X} (from newthread+{}, "
-                             "post-global-scan, boundary={}, PROVISIONAL)",
-                             out.unlock_fn, i, nt2_fend);
-                    break;
-                }
-            }
+                        // Do NOT extract unlock here. This newthread may be from a DEAD
+            // copy that the FINAL GATE will reject later. Setting unlock_fn
+            // from a dead copy caused previous failures where the wrong
+            // function was patched. Unlock is extracted post-validation by
+            // the authoritative cross-validation block.
         }
     }
 
@@ -3565,99 +3537,150 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     }
 
     
-    // ═══════════════════════════════════════════════════════════════
-    // Extract active lua_lock from the confirmed-active lua_settop.
-    // lua_settop's first CALL is always lua_lock (Luau API contract).
-    // ═══════════════════════════════════════════════════════════════
     uintptr_t active_lock = 0;
     if (out.settop) {
-        // Read enough bytes to cover lua_settop's full body (typically 40-120B).
-        uint8_t stbuf[160];
+        uint8_t stbuf[256];
         struct iovec stl = {stbuf, sizeof(stbuf)};
         struct iovec str = {reinterpret_cast<void*>(out.settop), sizeof(stbuf)};
         ssize_t strd = process_vm_readv(pid, &stl, 1, &str, 1, 0);
         if (strd >= 40) {
             size_t st_read = static_cast<size_t>(strd);
 
-            // Detect function boundary: RET followed by boundary marker.
-            // Extended marker set covers more prologue styles to avoid
-            // missing boundaries (previous set missed sub rsp/push rdi/rsi).
-            size_t st_fend = st_read;
-            for (size_t si = 20; si + 1 < st_read; si++) {
-                if (stbuf[si] != 0xC3) continue;
-                uint8_t nx = stbuf[si + 1];
-                // Standard markers: INT3, NOP, push rbp, push rbx, ENDBR64, null
-                if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
-                    nx == 0xF3 || nx == 0x00 ||
-                    // push r12-r15
-                    (nx == 0x41 && si + 2 < st_read &&
-                     stbuf[si + 2] >= 0x54 && stbuf[si + 2] <= 0x57) ||
-                    // push r8-r11
-                    (nx == 0x41 && si + 2 < st_read &&
-                     stbuf[si + 2] >= 0x50 && stbuf[si + 2] <= 0x53) ||
-                    // sub rsp, imm8 (frameless function)
-                    (nx == 0x48 && si + 2 < st_read && stbuf[si + 2] == 0x83 &&
-                     si + 3 < st_read && stbuf[si + 3] == 0xEC) ||
-                    // push rdi (0x57), push rsi (0x56)
-                    nx == 0x56 || nx == 0x57) {
-                    st_fend = si + 1;
-                    break;
+            // ═══════════════════════════════════════════════════════════
+            // Instruction-decoded boundary detection.
+            //
+            // Previous approach: scan for C3 followed by a known prologue
+            // byte (0x55, 0x53, 0xCC, etc.). This FAILS when the next
+            // function starts with an unrecognized byte (e.g., 0x48 8B,
+            // 0x8A, mov instructions) — giving boundary=buffer_size.
+            //
+            // New approach: decode instructions with dh_insn_len from
+            // the function start until we hit a RET (0xC3). This finds
+            // the EXACT function end regardless of what follows.
+            // lua_settop is a simple ~65B function with one exit point.
+            // ═══════════════════════════════════════════════════════════
+            size_t st_fend = 0;
+            {
+                size_t pos = 0;
+                while (pos + 15 < st_read && pos < 250) {
+                    size_t il = dh_insn_len(stbuf + pos);
+                    if (il == 0) {
+                        LOG_DEBUG("[direct-hook] lua_settop decode failed at offset {}", pos);
+                        break;
+                    }
+                    if (stbuf[pos] == 0xC3) {
+                        st_fend = pos + 1;
+                        break;
+                    }
+                    pos += il;
                 }
             }
 
-            bool boundary_found = (st_fend < st_read);
-            LOG_DEBUG("[direct-hook] lua_settop body: {}/{} bytes (boundary {}{})",
-                      st_fend, st_read,
-                      boundary_found ? "found at " : "NOT FOUND, using ",
-                      st_fend);
-
-            // First CALL = lua_lock (Luau API contract: lock before work)
-            for (size_t i = 0; i + 5 <= st_fend; i++) {
-                if (stbuf[i] == 0xE8) {
-                    int32_t d; memcpy(&d, &stbuf[i + 1], 4);
-                    active_lock = out.settop + i + 5 + static_cast<int64_t>(d);
-                    LOG_INFO("[direct-hook] active_lock extracted from lua_settop+{}: 0x{:X}",
-                             i, active_lock);
-                    break;
+            if (st_fend == 0) {
+                // Fallback: byte-pattern boundary detection
+                st_fend = st_read;
+                for (size_t si = 20; si + 1 < st_read; si++) {
+                    if (stbuf[si] != 0xC3) continue;
+                    uint8_t nx = stbuf[si + 1];
+                    if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
+                        nx == 0x56 || nx == 0x57 || nx == 0xF3 || nx == 0x00 ||
+                        (nx == 0x41 && si + 2 < st_read &&
+                         stbuf[si + 2] >= 0x50 && stbuf[si + 2] <= 0x57) ||
+                        (nx == 0x48 && si + 2 < st_read && stbuf[si + 2] == 0x83 &&
+                         si + 3 < st_read && stbuf[si + 3] == 0xEC)) {
+                        st_fend = si + 1;
+                        break;
+                    }
                 }
+                LOG_DEBUG("[direct-hook] lua_settop body: {}/{} bytes (byte-pattern fallback)",
+                          st_fend, st_read);
+            } else {
+                LOG_DEBUG("[direct-hook] lua_settop body: {}/{} bytes (instruction-decoded)",
+                          st_fend, st_read);
             }
 
-            // Last CALL = lua_unlock — only extract if boundary was actually found.
-            // When boundary_found==false, st_fend==buffer_size and the "last CALL"
-            // would be from an ADJACENT function, giving a wrong unlock address.
-            // This caused the previous deadlock: lua_settop is 65B but we scanned
-            // 160B and found an unlock at +139 from the next function.
-            if (boundary_found && active_lock) {
-                uintptr_t active_unlock = 0;
-                for (int i = static_cast<int>(st_fend) - 5; i >= 10; i--) {
+            bool boundary_found = (st_fend > 0 && st_fend < st_read);
+
+            // Collect ALL E8 CALL targets within the decoded function body.
+            // lua_settop (simple Luau API) calls exactly: lua_lock, body
+            // helpers, lua_unlock. We identify lock (first) and unlock
+            // (last non-lock) from a reliable set.
+            std::vector<std::pair<size_t, uintptr_t>> st_calls;
+            if (boundary_found) {
+                for (size_t i = 0; i + 5 <= st_fend; i++) {
                     if (stbuf[i] != 0xE8) continue;
                     int32_t d; memcpy(&d, &stbuf[i + 1], 4);
                     uintptr_t target = out.settop + i + 5 + static_cast<int64_t>(d);
-                    if (target == active_lock) continue;
-                    active_unlock = target;
-                    LOG_INFO("[direct-hook] active_unlock extracted from lua_settop+{}: 0x{:X}",
-                             i, active_unlock);
+                    st_calls.push_back({i, target});
+                }
+                LOG_DEBUG("[direct-hook] lua_settop has {} CALL instructions in {} bytes",
+                          st_calls.size(), st_fend);
+            }
+
+            // First CALL = lua_lock
+            if (!st_calls.empty()) {
+                active_lock = st_calls.front().second;
+                LOG_INFO("[direct-hook] active_lock extracted from lua_settop+{}: 0x{:X}",
+                         st_calls.front().first, active_lock);
+            }
+
+            // Last CALL that targets a DIFFERENT address = lua_unlock.
+            // Validate: unlock must start with a valid prologue byte.
+            if (boundary_found && active_lock && st_calls.size() >= 2) {
+                uintptr_t active_unlock = 0;
+                size_t unlock_off = 0;
+                for (auto it = st_calls.rbegin(); it != st_calls.rend(); ++it) {
+                    if (it->second == active_lock) continue;
+                    // Validate the target looks like a function start
+                    uint8_t probe[4] = {};
+                    proc_mem_read(pid, it->second, probe, sizeof(probe));
+                    // Skip ENDBR64 prefix if present
+                    size_t ps = 0;
+                    if (probe[0]==0xF3 && probe[1]==0x0F && probe[2]==0x1E && probe[3]==0xFA)
+                        ps = 4;
+                    // Accept: push rbp(55), push rbx(53), push r12-15(41 54-57),
+                    // sub rsp(48 83 EC), push rdi(57), push rsi(56), mov(48 89/8B)
+                    bool valid_start = false;
+                    if (ps < 4) {
+                        uint8_t b = probe[ps];
+                        valid_start = (b==0x55 || b==0x53 || b==0x56 || b==0x57 ||
+                                       b==0x41 || b==0x48 || b==0x50 || b==0x51);
+                    } else {
+                        // Had ENDBR64, need to read more
+                        uint8_t probe2[8] = {};
+                        proc_mem_read(pid, it->second + 4, probe2, sizeof(probe2));
+                        valid_start = (probe2[0]==0x55 || probe2[0]==0x53 ||
+                                       probe2[0]==0x41 || probe2[0]==0x48);
+                    }
+                    if (!valid_start) {
+                        LOG_DEBUG("[direct-hook] lua_settop CALL+{} → 0x{:X} starts with "
+                                  "0x{:02X} — not a function prologue, skipping",
+                                  it->first, it->second, probe[0]);
+                        continue;
+                    }
+                    active_unlock = it->second;
+                    unlock_off = it->first;
                     break;
                 }
 
-                // Always override: lua_settop's lock/unlock pair is authoritative
-                // because active_lock is used for all subsequent validation.
-                // Previous value may be from a dead Luau copy.
                 if (active_unlock) {
                     if (out.unlock_fn && out.unlock_fn != active_unlock) {
                         LOG_WARN("[direct-hook] overriding stale unlock_fn 0x{:X} → 0x{:X} "
-                                 "(lua_settop authoritative)", out.unlock_fn, active_unlock);
+                                 "(lua_settop instruction-decoded)", out.unlock_fn, active_unlock);
                     }
                     out.unlock_fn = active_unlock;
+                    LOG_INFO("[direct-hook] active_unlock extracted from lua_settop+{}: 0x{:X} "
+                             "(instruction-decoded boundary={})", unlock_off, active_unlock, st_fend);
+                } else {
+                    LOG_WARN("[direct-hook] no valid unlock target found in lua_settop "
+                             "({} calls, boundary={})", st_calls.size(), st_fend);
                 }
             } else if (!boundary_found) {
-                LOG_WARN("[direct-hook] lua_settop boundary not found in {} bytes — "
-                         "skipping unlock extraction (would scan into adjacent function)",
-                         st_read);
+                LOG_WARN("[direct-hook] lua_settop boundary not found — "
+                         "skipping unlock extraction");
             }
         }
     }
-
         if (active_lock) {
         if (out.lock_fn && out.lock_fn != active_lock) {
             LOG_WARN("[direct-hook] overriding stale lock_fn 0x{:X} → 0x{:X} "
@@ -4283,49 +4306,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (best_addr) {
                     out.newthread = best_addr;
                     out.lock_fn = active_lock;
-                    // Extract lua_unlock from rescue newthread — always override.
-                    // Previous unlock_fn may be from the dead-copy newthread that
-                    // the FINAL GATE just rejected.
-                    {
-                        uint8_t rnt[128];
-                        struct iovec rnl = {rnt, sizeof(rnt)};
-                        struct iovec rnr = {reinterpret_cast<void*>(best_addr), sizeof(rnt)};
-                        ssize_t rnrd = process_vm_readv(pid, &rnl, 1, &rnr, 1, 0);
-                        if (rnrd >= 30) {
-                            size_t rn_fend = static_cast<size_t>(rnrd);
-                            bool rn_boundary = false;
-                            for (size_t ri = 20; ri + 1 < rn_fend; ri++) {
-                                if (rnt[ri] != 0xC3) continue;
-                                uint8_t nx = rnt[ri + 1];
-                                if (nx==0xCC||nx==0x90||nx==0x55||nx==0x53||
-                                    nx==0x56||nx==0x57||nx==0xF3||nx==0x00||
-                                    (nx==0x41&&ri+2<rn_fend&&
-                                     rnt[ri+2]>=0x50&&rnt[ri+2]<=0x57)||
-                                    (nx==0x48&&ri+2<rn_fend&&rnt[ri+2]==0x83&&
-                                     ri+3<rn_fend&&rnt[ri+3]==0xEC)) {
-                                    rn_fend = ri + 1;
-                                    rn_boundary = true;
-                                    break;
-                                }
-                            }
-                            if (rn_boundary) {
-                                for (int ri = static_cast<int>(rn_fend)-5; ri >= 10; ri--) {
-                                    if (rnt[ri] != 0xE8) continue;
-                                    int32_t rd; memcpy(&rd, &rnt[ri+1], 4);
-                                    uintptr_t rt = best_addr + ri + 5 + static_cast<int64_t>(rd);
-                                    if (rt == active_lock) continue;
-                                    if (out.unlock_fn && out.unlock_fn != rt) {
-                                        LOG_WARN("[direct-hook] rescue: overriding stale "
-                                                 "unlock_fn 0x{:X} → 0x{:X}", out.unlock_fn, rt);
-                                    }
-                                    out.unlock_fn = rt;
-                                    LOG_INFO("[direct-hook] rescue: lua_unlock at 0x{:X} "
-                                             "(from newthread+{}, boundary={})", rt, ri, rn_fend);
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                                        // Unlock extraction deferred to authoritative cross-validation block.
+                    // The rescue newthread is now validated (calls active_lock), so the
+                    // cross-validation between it and lua_resume will find the correct unlock.
                     LOG_INFO("[direct-hook] rescue: lua_newthread=0x{:X} "
                              "({:.1f}MB from lua_resume, prologue+lock verified)",
                              best_addr, best_dist / (1024.0 * 1024.0));
@@ -4337,121 +4320,174 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
 
-       // ═══════════════════════════════════════════════════════════════
-    // AUTHORITATIVE UNLOCK EXTRACTION from validated lua_resume.
+        // ═══════════════════════════════════════════════════════════════
+    // AUTHORITATIVE UNLOCK EXTRACTION via cross-validation.
     //
-    // All previous unlock extractions are PROVISIONAL — they may come
-    // from dead Luau copies (e.g. post-global-scan newthread that was
-    // later rejected by the FINAL GATE). The only reliable source for
-    // active_unlock is a function that was VERIFIED to call active_lock.
+    // Previous approach (last CALL in lua_resume) FAILED because
+    // lua_resume is 577 bytes with dozens of internal CALL instructions
+    // — the last by offset is a helper function, not lua_unlock.
     //
-    // lua_resume was verified by lock-anchored validation. Its last
-    // CALL before RET is lua_unlock — the exact pair of active_lock.
-    // This overrides all provisional values unconditionally.
+    // New approach: find the CALL target that appears in MULTIPLE
+    // validated Luau API functions (lua_resume, lua_newthread, etc.),
+    // is NOT active_lock, and starts with a valid function prologue.
+    // lua_unlock is the only function (besides lua_lock) that ALL
+    // Luau API functions call — it's the universal pair.
+    //
+    // Strategy layers:
+    // 1. Cross-validate between lua_newthread (small, simple) and
+    //    lua_resume: shared target that isn't active_lock = unlock
+    // 2. Instruction-decoded lua_newthread: last CALL before RET
+    // 3. Instruction-decoded lua_settop (if CHUNK 1 found it)
     // ═══════════════════════════════════════════════════════════════
-    if (out.resume && active_lock) {
-        uint8_t resume_buf[800];
-        struct iovec rbl = {resume_buf, sizeof(resume_buf)};
-        struct iovec rbr = {reinterpret_cast<void*>(out.resume), sizeof(resume_buf)};
-        ssize_t rbrd = process_vm_readv(pid, &rbl, 1, &rbr, 1, 0);
-        if (rbrd >= 50) {
-            size_t rb_read = static_cast<size_t>(rbrd);
 
-            // Detect lua_resume's function boundary
-            size_t rb_fend = rb_read;
-            for (size_t ri = 25; ri + 1 < rb_read; ri++) {
-                if (resume_buf[ri] != 0xC3) continue;
-                uint8_t nx = resume_buf[ri + 1];
-                if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
-                    nx == 0x56 || nx == 0x57 || nx == 0xF3 || nx == 0x00 ||
-                    (nx == 0x41 && ri + 2 < rb_read &&
-                     nx == 0x41 && resume_buf[ri + 2] >= 0x50 &&
-                     resume_buf[ri + 2] <= 0x57) ||
-                    (nx == 0x48 && ri + 2 < rb_read &&
-                     resume_buf[ri + 2] == 0x83 &&
-                     ri + 3 < rb_read && resume_buf[ri + 3] == 0xEC)) {
-                    rb_fend = ri + 1;
-                    break;
+    // Helper: collect unique CALL targets from a function's first N bytes
+    auto collect_call_targets = [&](uintptr_t fn_addr, size_t max_bytes)
+        -> std::vector<uintptr_t> {
+        std::vector<uintptr_t> targets;
+        if (!fn_addr) return targets;
+        std::vector<uint8_t> buf(max_bytes);
+        struct iovec cl = {buf.data(), max_bytes};
+        struct iovec cr = {reinterpret_cast<void*>(fn_addr), max_bytes};
+        ssize_t rd = process_vm_readv(pid, &cl, 1, &cr, 1, 0);
+        if (rd < 20) return targets;
+        size_t avail = static_cast<size_t>(rd);
+
+        // Instruction-decode to find actual function end
+        size_t fend = 0;
+        {
+            size_t pos = 0;
+            while (pos + 15 < avail && pos < max_bytes) {
+                size_t il = dh_insn_len(buf.data() + pos);
+                if (il == 0) break;
+                if (buf[pos] == 0xC3) { fend = pos + 1; break; }
+                pos += il;
+            }
+        }
+        // Fallback: byte-pattern boundary
+        if (fend == 0) {
+            fend = avail;
+            for (size_t i = 25; i + 1 < avail; i++) {
+                if (buf[i] != 0xC3) continue;
+                uint8_t nx = buf[i + 1];
+                if (nx==0xCC||nx==0x90||nx==0x55||nx==0x53||
+                    nx==0x56||nx==0x57||nx==0xF3||nx==0x00||
+                    (nx==0x41 && i+2<avail && buf[i+2]>=0x50 && buf[i+2]<=0x57)||
+                    (nx==0x48 && i+2<avail && buf[i+2]==0x83 &&
+                     i+3<avail && buf[i+3]==0xEC)) {
+                    fend = i + 1; break;
                 }
             }
+        }
 
-            bool rb_boundary = (rb_fend < rb_read);
-            if (rb_boundary) {
-                // Last CALL in lua_resume = lua_unlock (authoritative)
-                uintptr_t auth_unlock = 0;
-                for (int ri = static_cast<int>(rb_fend) - 5; ri >= 20; ri--) {
-                    if (resume_buf[ri] != 0xE8) continue;
-                    int32_t d; memcpy(&d, &resume_buf[ri + 1], 4);
-                    uintptr_t target = out.resume + ri + 5 + static_cast<int64_t>(d);
-                    if (target == active_lock) continue; // skip lock, want unlock
-                    auth_unlock = target;
-                    break;
-                }
+        for (size_t i = 0; i + 5 <= fend; i++) {
+            if (buf[i] != 0xE8) continue;
+            int32_t d; memcpy(&d, &buf[i + 1], 4);
+            uintptr_t t = fn_addr + i + 5 + static_cast<int64_t>(d);
+            bool dup = false;
+            for (auto& ex : targets) if (ex == t) { dup = true; break; }
+            if (!dup) targets.push_back(t);
+        }
+        return targets;
+    };
 
-                if (auth_unlock) {
-                    if (out.unlock_fn && out.unlock_fn != auth_unlock) {
-                        LOG_WARN("[direct-hook] AUTHORITATIVE: overriding provisional "
-                                 "unlock_fn 0x{:X} → 0x{:X} (from validated lua_resume, "
-                                 "paired with active_lock 0x{:X})",
-                                 out.unlock_fn, auth_unlock, active_lock);
-                    }
-                    out.unlock_fn = auth_unlock;
-                    LOG_INFO("[direct-hook] AUTHORITATIVE: unlock_fn=0x{:X} "
-                             "(from lua_resume last CALL, boundary={})",
-                             out.unlock_fn, rb_fend);
-                } else {
-                    LOG_WARN("[direct-hook] could not extract unlock from lua_resume "
-                             "(boundary={}, read={})", rb_fend, rb_read);
+    // Helper: check if address looks like a function start
+    auto is_valid_func_start = [&](uintptr_t addr) -> bool {
+        uint8_t probe[8] = {};
+        if (!proc_mem_read(pid, addr, probe, sizeof(probe))) return false;
+        size_t ps = 0;
+        if (probe[0]==0xF3 && probe[1]==0x0F && probe[2]==0x1E && probe[3]==0xFA)
+            ps = 4; // skip ENDBR64
+        uint8_t b = probe[ps];
+        return (b==0x55 || b==0x53 || b==0x56 || b==0x57 ||
+                b==0x41 || b==0x48 || b==0x50 || b==0x51);
+    };
+
+    // Layer 1: Cross-validate between lua_newthread and lua_resume.
+    // lua_newthread is small (~60-80B) so its CALL targets are reliable.
+    // Find targets shared with lua_resume that aren't active_lock.
+    if (out.newthread && out.resume && active_lock) {
+        auto nt_targets = collect_call_targets(out.newthread, 128);
+        auto rs_targets = collect_call_targets(out.resume, 800);
+
+        LOG_DEBUG("[direct-hook] unlock cross-validate: newthread has {} targets, "
+                  "resume has {} targets", nt_targets.size(), rs_targets.size());
+
+        uintptr_t best_unlock = 0;
+        for (auto& nt : nt_targets) {
+            if (nt == active_lock) continue;
+            for (auto& rs : rs_targets) {
+                if (rs != nt) continue;
+                // Shared target that isn't lock — candidate for unlock
+                if (!is_valid_func_start(nt)) {
+                    LOG_DEBUG("[direct-hook] shared target 0x{:X} not a valid "
+                              "function start — skipping", nt);
+                    continue;
                 }
-            } else {
-                LOG_WARN("[direct-hook] lua_resume boundary not found in {} bytes "
-                         "— cannot extract authoritative unlock", rb_read);
+                best_unlock = nt;
+                break;
             }
+            if (best_unlock) break;
+        }
+
+        if (best_unlock) {
+            if (out.unlock_fn && out.unlock_fn != best_unlock) {
+                LOG_WARN("[direct-hook] AUTHORITATIVE: overriding unlock_fn 0x{:X} → "
+                         "0x{:X} (cross-validated: newthread∩resume, not lock)",
+                         out.unlock_fn, best_unlock);
+            }
+            out.unlock_fn = best_unlock;
+            LOG_INFO("[direct-hook] AUTHORITATIVE: unlock_fn=0x{:X} "
+                     "(cross-validated between lua_newthread and lua_resume)",
+                     out.unlock_fn);
+        } else {
+            LOG_WARN("[direct-hook] cross-validation found no shared non-lock "
+                     "target between newthread and resume");
         }
     }
 
-    // Fallback: extract from validated lua_newthread if lua_resume failed
+    // Layer 2: Instruction-decoded lua_newthread (last non-lock CALL)
     if (!out.unlock_fn && out.newthread && active_lock) {
-        uint8_t ntfb[128];
-        struct iovec nfl = {ntfb, sizeof(ntfb)};
-        struct iovec nfr = {reinterpret_cast<void*>(out.newthread), sizeof(ntfb)};
-        ssize_t nfrd = process_vm_readv(pid, &nfl, 1, &nfr, 1, 0);
-        if (nfrd >= 30) {
-            size_t nf_fend = static_cast<size_t>(nfrd);
-            bool nf_boundary = false;
-            for (size_t ni = 20; ni + 1 < nf_fend; ni++) {
-                if (ntfb[ni] != 0xC3) continue;
-                uint8_t nx = ntfb[ni + 1];
-                if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
-                    nx == 0x56 || nx == 0x57 || nx == 0xF3 || nx == 0x00 ||
-                    (nx == 0x41 && ni + 2 < nf_fend &&
-                     ntfb[ni + 2] >= 0x50 && ntfb[ni + 2] <= 0x57) ||
-                    (nx == 0x48 && ni + 2 < nf_fend && ntfb[ni + 2] == 0x83 &&
-                     ni + 3 < nf_fend && ntfb[ni + 3] == 0xEC)) {
-                    nf_fend = ni + 1;
-                    nf_boundary = true;
-                    break;
-                }
-            }
-            if (nf_boundary) {
-                for (int ni = static_cast<int>(nf_fend) - 5; ni >= 10; ni--) {
-                    if (ntfb[ni] != 0xE8) continue;
-                    int32_t d; memcpy(&d, &ntfb[ni + 1], 4);
-                    uintptr_t target = out.newthread + ni + 5 + static_cast<int64_t>(d);
-                    if (target == active_lock) continue;
-                    out.unlock_fn = target;
-                    LOG_INFO("[direct-hook] FALLBACK: unlock_fn=0x{:X} "
-                             "(from validated newthread, boundary={})",
-                             out.unlock_fn, nf_fend);
-                    break;
-                }
-            }
+        auto nt_targets = collect_call_targets(out.newthread, 128);
+        // Last target that isn't active_lock
+        for (auto it = nt_targets.rbegin(); it != nt_targets.rend(); ++it) {
+            if (*it == active_lock) continue;
+            if (!is_valid_func_start(*it)) continue;
+            out.unlock_fn = *it;
+            LOG_INFO("[direct-hook] FALLBACK: unlock_fn=0x{:X} "
+                     "(last non-lock CALL in decoded lua_newthread)",
+                     out.unlock_fn);
+            break;
+        }
+    }
+
+    // Layer 3: If lua_settop CHUNK 1 already found it, it's already set.
+    // Just log the final state.
+    if (out.unlock_fn) {
+        // Final validation: the unlock function should be callable (starts
+        // with valid prologue) and relatively close to active_lock
+        uint8_t ul_probe[4] = {};
+        proc_mem_read(pid, out.unlock_fn, ul_probe, sizeof(ul_probe));
+        int64_t lock_unlock_dist = static_cast<int64_t>(out.unlock_fn) -
+                                   static_cast<int64_t>(active_lock);
+        if (lock_unlock_dist < 0) lock_unlock_dist = -lock_unlock_dist;
+        LOG_INFO("[direct-hook] final unlock_fn=0x{:X} (starts with 0x{:02X}, "
+                 "{:.1f}MB from lock)", out.unlock_fn, ul_probe[0],
+                 lock_unlock_dist / (1024.0 * 1024.0));
+
+        // Sanity: reject if unlock starts with data-like bytes
+        if (ul_probe[0] == 0x00 || ul_probe[0] == 0xCC ||
+            ul_probe[0] == 0x8A || ul_probe[0] == 0x8B ||
+            ul_probe[0] == 0x0F) {
+            LOG_ERROR("[direct-hook] unlock_fn 0x{:X} starts with 0x{:02X} — "
+                      "not a function prologue, clearing", out.unlock_fn, ul_probe[0]);
+            out.unlock_fn = 0;
         }
     }
 
     if (!out.unlock_fn) {
-        LOG_ERROR("[direct-hook] CRITICAL: active_unlock could not be extracted from "
-                  "any validated function — lock hook WILL deadlock at step 2");
+        LOG_ERROR("[direct-hook] CRITICAL: active_unlock could not be found via "
+                  "cross-validation or instruction decoding — lock hook WILL "
+                  "deadlock at step 2");
     }
 
     if (!out.resume || !out.load || !out.settop) {
@@ -5443,6 +5479,9 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                 LOG_INFO("[direct-hook] no unlock redirects needed — "
                          "functions may not call active_unlock directly");
         } else if (nop && !aul) {
+            LOG_ERROR("[direct-hook] CRITICAL: active_unlock=0x0 and NOP stub=0x{:X} — "
+                      "find_remote_luau_functions failed to extract unlock. "
+                      "luau_load WILL deadlock at step 2.", nop);
             // ═══════════════════════════════════════════════════════════
             // Dynamic lua_unlock discovery: extract from real_settop or
             // other known Luau API functions at execution time.
@@ -6165,6 +6204,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
