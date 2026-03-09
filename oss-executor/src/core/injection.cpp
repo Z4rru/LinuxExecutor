@@ -6436,6 +6436,11 @@ bool Injection::verify_payload_alive() {
             mapped = true;
             break;
         }
+        if (!payload_mapped_name_.empty() &&
+            r.path.find(payload_mapped_name_) != std::string::npos) {
+            mapped = true;
+            break;
+        }
     }
     if (!mapped && (proc_info_.via_flatpak || proc_info_.via_sober)) {
         mapped = true;
@@ -6809,6 +6814,7 @@ void Injection::start_auto_scan() {
                 vm_scan_         = {};
                 proc_info_       = {};
                 payload_loaded_  = false;
+                payload_mapped_name_.clear();
                 memory_.set_pid(0);
                 set_state(InjectionState::Idle, "Process exited \u2014 rescanning...");
             }
@@ -6828,6 +6834,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
