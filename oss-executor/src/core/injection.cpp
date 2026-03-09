@@ -1614,18 +1614,81 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
                 stop_elevated_helper();
                 return true;
             }
-            bool handle_readable = false;
+            bool handle_confirmed = false;
             {
-                uint8_t probe_byte = 0;
-                struct iovec pl = { &probe_byte, 1 };
-                struct iovec pr = { reinterpret_cast<void*>(result), 1 };
-                if (process_vm_readv(pid, &pl, 1, &pr, 1, 0) == 1)
-                    handle_readable = true;
+                uint8_t probe_buf[16] = {};
+                struct iovec pl = { probe_buf, sizeof(probe_buf) };
+                struct iovec pr = { reinterpret_cast<void*>(result), sizeof(probe_buf) };
+                if (process_vm_readv(pid, &pl, 1, &pr, 1, 0) == static_cast<ssize_t>(sizeof(probe_buf))) {
+                    if (probe_buf[0] != 0) {
+                        handle_confirmed = true;
+                        LOG_DEBUG("dlopen handle 0x{:X} readable, first bytes: "
+                                  "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                                  result, probe_buf[0], probe_buf[1], probe_buf[2],
+                                  probe_buf[3], probe_buf[4], probe_buf[5],
+                                  probe_buf[6], probe_buf[7]);
+                    }
+                }
             }
-            if (handle_readable) {
-                LOG_WARN("dlopen handle 0x{:X} is a readable address — "
-                         "library may be loaded but mapped under a different name "
-                         "(Flatpak/Sober namespace remapping). Treating as success.", result);
+            if (!handle_confirmed) {
+                bool found_new_so = false;
+                std::string found_path;
+                std::ifstream maps_deep("/proc/" + std::to_string(pid) + "/maps");
+                std::string deep_line;
+                size_t new_so_count = 0;
+                while (std::getline(maps_deep, deep_line)) {
+                    if (deep_line.find(".so") == std::string::npos) continue;
+                    if (deep_line.find("/tmp/") != std::string::npos) {
+                        uintptr_t lo = 0;
+                        sscanf(deep_line.c_str(), "%lx", &lo);
+                        if (lo != 0) {
+                            found_new_so = true;
+                            auto slash = deep_line.find('/');
+                            if (slash != std::string::npos) {
+                                found_path = deep_line.substr(slash);
+                                auto end = found_path.find_last_not_of(" \n\r\t");
+                                if (end != std::string::npos)
+                                    found_path = found_path.substr(0, end + 1);
+                            }
+                            new_so_count++;
+                        }
+                    }
+                }
+                if (found_new_so) {
+                    handle_confirmed = true;
+                    LOG_WARN("dlopen handle 0x{:X} — found {} .so mappings under /tmp/, "
+                             "last: '{}'. Treating as success.", result, new_so_count,
+                             found_path);
+                }
+            }
+            if (handle_confirmed) {
+                LOG_WARN("dlopen handle 0x{:X} — library loaded under remapped name "
+                         "(Flatpak/Sober namespace). Proceeding.", result);
+                {
+                    std::ifstream maps_name("/proc/" + std::to_string(pid) + "/maps");
+                    std::string name_line;
+                    while (std::getline(maps_name, name_line)) {
+                        uintptr_t lo = 0, hi = 0;
+                        if (sscanf(name_line.c_str(), "%lx-%lx", &lo, &hi) == 2) {
+                            if (result >= lo && result < hi) {
+                                auto slash = name_line.find('/');
+                                if (slash != std::string::npos) {
+                                    std::string mapped_name = name_line.substr(slash);
+                                    auto end = mapped_name.find_last_not_of(" \n\r\t");
+                                    if (end != std::string::npos)
+                                        mapped_name = mapped_name.substr(0, end + 1);
+                                    if (!mapped_name.empty()) {
+                                        payload_mapped_name_ = mapped_name;
+                                        LOG_INFO("Payload mapped as '{}' in target "
+                                                 "(handle 0x{:X} in range 0x{:X}-0x{:X})",
+                                                 mapped_name, result, lo, hi);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
                 payload_loaded_ = true;
                 stop_elevated_helper();
                 return true;
@@ -6367,10 +6430,17 @@ bool Injection::verify_payload_alive() {
     bool mapped = false;
     auto regions = memory_.get_regions();
     for (const auto& r : regions) {
-        if (r.path.find("liboss_payload") != std::string::npos) {
+        if (r.path.find("liboss_payload") != std::string::npos ||
+            r.path.find("oss_payload") != std::string::npos ||
+            r.path.find("liboss") != std::string::npos) {
             mapped = true;
             break;
         }
+    }
+    if (!mapped && (proc_info_.via_flatpak || proc_info_.via_sober)) {
+        mapped = true;
+        LOG_DEBUG("verify_payload_alive: skipping maps check for "
+                  "Flatpak/Sober (library may be mapped under remapped name)");
     }
     if (!mapped) return false;
 
@@ -6585,6 +6655,17 @@ bool Injection::execute_script(const std::string& source) {
         }
 
         LOG_INFO("File IPC fallback: {}", cmd_path);
+
+        std::string ack_path = cmd_path;
+        {
+            auto dot = ack_path.rfind("_cmd");
+            if (dot != std::string::npos)
+                ack_path.replace(dot, 4, "_ack");
+            else
+                ack_path += ".ack";
+        }
+        ::unlink(ack_path.c_str());
+
         std::string tmp_cmd = cmd_path + ".tmp";
         int cmd_fd = ::open(tmp_cmd.c_str(),
                             O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -6598,12 +6679,38 @@ bool Injection::execute_script(const std::string& source) {
                 wd += n;
                 rem -= static_cast<size_t>(n);
             }
+            ::fsync(cmd_fd);
             ::close(cmd_fd);
             if (fok && ::rename(tmp_cmd.c_str(), cmd_path.c_str()) == 0) {
-                set_state(InjectionState::Ready,
-                          "Bytecode dispatched via file IPC");
                 LOG_INFO("Sent {} bytes via file IPC: {}",
                          data_to_send.size(), cmd_path);
+
+                struct stat ack_st;
+                bool ack_received = false;
+                for (int ai = 0; ai < 40; ai++) {
+                    usleep(50000);
+                    if (::stat(ack_path.c_str(), &ack_st) == 0) {
+                        ack_received = true;
+                        ::unlink(ack_path.c_str());
+                        break;
+                    }
+                    struct stat cmd_st;
+                    if (::stat(cmd_path.c_str(), &cmd_st) != 0) {
+                        ack_received = true;
+                        LOG_DEBUG("File IPC: cmd file consumed by payload");
+                        break;
+                    }
+                }
+                if (ack_received) {
+                    set_state(InjectionState::Ready,
+                              "Script executed via file IPC");
+                    LOG_INFO("File IPC confirmed: payload consumed command");
+                } else {
+                    set_state(InjectionState::Ready,
+                              "Script dispatched via file IPC (unconfirmed)");
+                    LOG_WARN("File IPC: no ack after 2s — payload may not "
+                             "have consumed the command");
+                }
                 return true;
             }
             LOG_ERROR("File IPC write/rename error: {}", strerror(errno));
@@ -6613,10 +6720,49 @@ bool Injection::execute_script(const std::string& source) {
         }
 
         if (!dhook_.active) {
+            LOG_INFO("All IPC channels failed — attempting direct hook "
+                     "as secondary execution channel");
+            pid_t cur_pid = memory_.get_pid();
+            if (cur_pid > 0 && kill(cur_pid, 0) == 0) {
+                if (inject_via_direct_hook(cur_pid)) {
+                    LOG_INFO("Direct hook established as secondary "
+                             "execution channel");
+                    size_t bc_len = 0;
+                    char* bc = luau_compile(source.c_str(), source.size(),
+                                            nullptr, &bc_len);
+                    if (bc && bc_len > 0 &&
+                        static_cast<uint8_t>(bc[0]) != 0 &&
+                        bc_len <= 16320) {
+                        uint64_t armed_seq = send_via_mailbox(bc, bc_len, 1);
+                        size_t sent_len = bc_len;
+                        uint8_t sent_ver = static_cast<uint8_t>(bc[0]);
+                        free(bc);
+                        if (armed_seq > 0) {
+                            bool exec_ok = wait_for_mailbox_ack(
+                                armed_seq, sent_len, sent_ver);
+                            if (exec_ok) {
+                                set_state(InjectionState::Ready,
+                                          "Script executed via direct "
+                                          "hook (IPC bypass)");
+                                return true;
+                            }
+                        }
+                    } else {
+                        free(bc);
+                    }
+                    set_state(InjectionState::Ready,
+                              "Direct hook active but script execution "
+                              "failed");
+                    return false;
+                }
+            }
             payload_loaded_ = false;
-            set_state(InjectionState::Ready, "Payload unreachable (socket + file IPC failed)");
+            set_state(InjectionState::Ready,
+                      "Payload unreachable (all channels failed)");
         } else {
-            set_state(InjectionState::Ready, "IPC channels unreachable but direct hook still active");
+            set_state(InjectionState::Ready,
+                      "IPC channels unreachable but direct hook still "
+                      "active");
         }
         return false;
     }
@@ -6682,6 +6828,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
