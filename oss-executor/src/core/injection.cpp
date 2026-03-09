@@ -4883,11 +4883,28 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                      "lock/unlock calls (active_lock=0x{:X} active_unlock=0x{:X})",
                      al, aul);
 
+            // Read prologues of active lock/unlock to identify copies
+            uint8_t lock_prologue[8] = {};
+            uint8_t unlock_prologue[8] = {};
+            proc_mem_read(pid, al, lock_prologue, 8);
+            proc_mem_read(pid, aul, unlock_prologue, 8);
+            LOG_DEBUG("[direct-hook] lock prologue: {:02X}{:02X}{:02X}{:02X}"
+                      "{:02X}{:02X}{:02X}{:02X}",
+                      lock_prologue[0], lock_prologue[1], lock_prologue[2],
+                      lock_prologue[3], lock_prologue[4], lock_prologue[5],
+                      lock_prologue[6], lock_prologue[7]);
+            LOG_DEBUG("[direct-hook] unlock prologue: {:02X}{:02X}{:02X}{:02X}"
+                      "{:02X}{:02X}{:02X}{:02X}",
+                      unlock_prologue[0], unlock_prologue[1], unlock_prologue[2],
+                      unlock_prologue[3], unlock_prologue[4], unlock_prologue[5],
+                      unlock_prologue[6], unlock_prologue[7]);
+
             auto redirect_fn_locks = [&](uintptr_t fn_addr, size_t scan_size,
                                          const char* name) {
                 if (!fn_addr || fn_addr == dhook_.settop_addr) return;
                 std::vector<uint8_t> buf(scan_size);
-                if (!proc_mem_read(pid, fn_addr, buf.data(), scan_size)) return;
+                if (!proc_mem_read(pid, fn_addr, buf.data(), scan_size))
+                    return;
 
                 // Function boundary
                 size_t fend = scan_size;
@@ -4903,96 +4920,109 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                     }
                 }
 
-                // First CALL (E8) or JMP-after-prologue (E9) → lock
+                // Prologue-matching redirect: scan ALL E8/E9 in the
+                // function body. For each, read target's first 8 bytes.
+                // If prologue matches active_lock → redirect to al.
+                // If prologue matches active_unlock → redirect to aul.
+                // This avoids the "first CALL = lock" assumption.
+                int lock_count = 0, unlock_count = 0;
                 for (size_t i = 0; i + 5 <= fend; i++) {
-                    if (buf[i] != 0xE8 && !(buf[i] == 0xE9 && i >= 8))
-                        continue;
-                    int32_t d; memcpy(&d, &buf[i+1], 4);
+                    uint8_t op = buf[i];
+                    if (op != 0xE8 && op != 0xE9) continue;
+                    // Skip E9 in first 8 bytes (prologue setup, not a call)
+                    if (op == 0xE9 && i < 8) continue;
+
+                    int32_t d; memcpy(&d, &buf[i + 1], 4);
                     uintptr_t tgt = fn_addr + i + 5 +
                                     static_cast<int64_t>(d);
-                    if (tgt == al) {
-                        LOG_DEBUG("[direct-hook]   {} lock already active",
-                                  name);
-                        // This function uses active_lock, so its unlock
-                        // is also correct — derive active_unlock from it
-                        for (int ui = static_cast<int>(fend) - 1;
-                             ui >= 20; ui--) {
-                            if (buf[ui] != 0xE8 && buf[ui] != 0xE9)
-                                continue;
-                            if (ui + 5 > static_cast<int>(scan_size))
-                                continue;
-                            int32_t ud;
-                            memcpy(&ud, &buf[ui + 1], 4);
-                            uintptr_t ut = fn_addr + ui + 5 +
-                                static_cast<int64_t>(ud);
-                            if (ut == al || ut == fn_addr) continue;
-                            if (aul != ut) {
-                                LOG_INFO("[direct-hook]   derived "
-                                    "active_unlock=0x{:X} from {} "
-                                    "(at +{}, {:02X})", ut, name,
-                                    ui, buf[ui]);
-                                aul = ut;
-                            }
-                            break;
+
+                    // Skip if already points to active lock/unlock
+                    if (tgt == al) { lock_count++; continue; }
+                    if (tgt == aul) { unlock_count++; continue; }
+                    // Skip self-calls
+                    if (tgt == fn_addr) continue;
+
+                    // Read target prologue
+                    uint8_t tgt_pro[8] = {};
+                    if (!proc_mem_read(pid, tgt, tgt_pro, 8)) continue;
+
+                    // Check if target matches lock prologue
+                    bool is_lock = (memcmp(tgt_pro, lock_prologue, 8) == 0);
+                    // Check if target matches unlock prologue
+                    bool is_unlock = (!is_lock &&
+                        memcmp(tgt_pro, unlock_prologue, 8) == 0);
+
+                    if (!is_lock && !is_unlock) continue;
+
+                    uintptr_t redirect_to = is_lock ? al : aul;
+                    const char* which = is_lock ? "lock" : "unlock";
+
+                    int64_t nd = static_cast<int64_t>(redirect_to) -
+                                 static_cast<int64_t>(fn_addr + i + 5);
+                    if (nd < INT32_MIN || nd > INT32_MAX) {
+                        LOG_WARN("[direct-hook]   {} {} redirect out of "
+                                 "rel32 range (at +{}, {:02X})",
+                                 name, which, i, op);
+                        continue;
+                    }
+                    int32_t nd32 = static_cast<int32_t>(nd);
+                    uintptr_t pa = fn_addr + i + 1;
+                    if (proc_mem_write(pid, pa, &nd32, 4)) {
+                        call_redirects.push_back({pa, d});
+                        lock_bypassed = true;
+                        LOG_INFO("[direct-hook]   {} {}: 0x{:X}→0x{:X} "
+                                 "(at +{}, {:02X})",
+                                 name, which, tgt, redirect_to, i, op);
+                        if (is_lock) lock_count++;
+                        else unlock_count++;
+                    }
+                }
+
+                // Derive active_unlock if this function already uses
+                // active_lock but we haven't found unlock yet
+                if (lock_count > 0 && unlock_count == 0) {
+                    for (int ui = static_cast<int>(fend) - 1;
+                         ui >= 20; ui--) {
+                        if (buf[ui] != 0xE8 && buf[ui] != 0xE9)
+                            continue;
+                        if (ui + 5 > static_cast<int>(scan_size))
+                            continue;
+                        int32_t ud;
+                        memcpy(&ud, &buf[ui + 1], 4);
+                        uintptr_t ut = fn_addr + ui + 5 +
+                            static_cast<int64_t>(ud);
+                        if (ut == al || ut == fn_addr) continue;
+                        if (aul != ut) {
+                            LOG_INFO("[direct-hook]   derived "
+                                "active_unlock=0x{:X} from {} "
+                                "(at +{}, {:02X})", ut, name,
+                                ui, buf[ui]);
+                            aul = ut;
+                            // Re-read unlock prologue for future matches
+                            proc_mem_read(pid, aul, unlock_prologue, 8);
+                            LOG_DEBUG("[direct-hook]   updated unlock "
+                                "prologue: {:02X}{:02X}{:02X}{:02X}"
+                                "{:02X}{:02X}{:02X}{:02X}",
+                                unlock_prologue[0], unlock_prologue[1],
+                                unlock_prologue[2], unlock_prologue[3],
+                                unlock_prologue[4], unlock_prologue[5],
+                                unlock_prologue[6], unlock_prologue[7]);
                         }
                         break;
                     }
-                    int64_t nd = static_cast<int64_t>(al) -
-                                 static_cast<int64_t>(fn_addr + i + 5);
-                    if (nd < INT32_MIN || nd > INT32_MAX) {
-                        LOG_WARN("[direct-hook]   {} lock redirect out of "
-                                 "rel32 range", name);
-                        break;
-                    }
-                    int32_t nd32 = static_cast<int32_t>(nd);
-                    uintptr_t pa = fn_addr + i + 1;
-                    if (proc_mem_write(pid, pa, &nd32, 4)) {
-                        call_redirects.push_back({pa, d});
-                        lock_bypassed = true;
-                        LOG_INFO("[direct-hook]   {} lock: 0x{:X}→0x{:X} "
-                                 "(at +{})", name, tgt, al, i);
-                    }
-                    break;
                 }
 
-                               // Last CALL (E8) or JMP (E9) → unlock
-                // lua_unlock is often a tail-call (E9 jmp) in small functions
-                for (int i = static_cast<int>(fend) - 1; i >= 20; i--) {
-                    if (buf[i] != 0xE8 && buf[i] != 0xE9) continue;
-                    if (i + 5 > static_cast<int>(scan_size)) continue;
-                    int32_t d; memcpy(&d, &buf[i+1], 4);
-                    uintptr_t tgt = fn_addr + i + 5 +
-                                    static_cast<int64_t>(d);
-                    if (tgt == aul) {
-                        LOG_DEBUG("[direct-hook]   {} unlock already active",
-                                  name);
-                        break;
-                    }
-                    if (tgt == al) continue; // skip lock refs, keep searching
-                    if (tgt == fn_addr) continue; // skip self-call
-                    int64_t nd = static_cast<int64_t>(aul) -
-                                 static_cast<int64_t>(fn_addr + i + 5);
-                    if (nd < INT32_MIN || nd > INT32_MAX) {
-                        LOG_WARN("[direct-hook]   {} unlock redirect out of "
-                                 "rel32 range (at +{}, {:02X})", name, i,
-                                 buf[i]);
-                        break;
-                    }
-                    int32_t nd32 = static_cast<int32_t>(nd);
-                    uintptr_t pa = fn_addr + i + 1;
-                    if (proc_mem_write(pid, pa, &nd32, 4)) {
-                        call_redirects.push_back({pa, d});
-                        lock_bypassed = true;
-                        LOG_INFO("[direct-hook]   {} unlock: 0x{:X}→0x{:X} "
-                                 "(at +{}, {:02X})", name, tgt, aul, i,
-                                 buf[i]);
-                    }
-                    break;
-                }
+                if (lock_count == 0 && unlock_count == 0)
+                    LOG_DEBUG("[direct-hook]   {} no lock/unlock calls "
+                              "found by prologue match (scanned {} bytes)",
+                              name, fend);
+                else
+                    LOG_INFO("[direct-hook]   {} total: {} lock, {} unlock",
+                             name, lock_count, unlock_count);
             };
 
             redirect_fn_locks(dhook_.newthread_addr, 200, "lua_newthread");
-            redirect_fn_locks(dhook_.load_addr, 800, "luau_load");
+            redirect_fn_locks(dhook_.load_addr, 1000, "luau_load");
             redirect_fn_locks(dhook_.resume_addr, 500, "lua_resume");
             if (dhook_.real_settop_addr &&
                 dhook_.real_settop_addr != dhook_.settop_addr)
@@ -5592,6 +5622,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
