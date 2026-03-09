@@ -5758,7 +5758,8 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // Stack growth is bounded: Roblox creates fresh lua_States regularly,
     // and one extra slot per script execution is negligible vs LUAI_MAXSTACK.
     size_t settop_label = c.size();
-    e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00});
+    size_t step4_settop_movabs = 0;
+    e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00}); // step 4 skipped
   
 
        // === Re-acquire Lua global lock after API calls ===
@@ -8019,6 +8020,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
