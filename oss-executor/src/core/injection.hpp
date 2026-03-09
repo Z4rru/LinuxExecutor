@@ -189,6 +189,7 @@ private:
         uintptr_t settop    = 0;
         uintptr_t sandbox   = 0;
         uintptr_t compile   = 0;
+        uintptr_t unlock_fn = 0;
         uintptr_t free_fn   = 0;
         uintptr_t lock_fn   = 0;
     };
@@ -219,6 +220,7 @@ private:
 };
 
 }
+
 
 
 
