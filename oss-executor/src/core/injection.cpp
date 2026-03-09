@@ -5447,7 +5447,12 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                  "probe", captured_L);
                     }
 
-                    addrs.settop = best_live_settop;
+                                        // Keep addrs.settop as the lock-anchored (dead) settop
+                    // for step 4 cleanup — it's the VERIFIED real lua_settop.
+                    // The live settop is only used as the hook target; it may
+                    // not actually be lua_settop (just matches heuristics).
+                    // Calling the dead settop directly avoids recursive hook
+                    // re-entry and ensures correct settop(L, -2) behavior.
                     hook_addr = best_live_settop;
                     is_lock_hook = false;
                     memcpy(prologue, cand_pro, cand_steal);
@@ -6801,6 +6806,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
