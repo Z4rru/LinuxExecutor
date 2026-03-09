@@ -3236,9 +3236,12 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
 
-    // Proximity string-ref re-scan for luau_load near lua_resume (±80MB)
+        // Proximity string-ref re-scan for luau_load near lua_resume
+    // Strings (.rodata) can be mapped far from code (.text), so search
+    // ALL readable regions for strings but only nearby exec regions for xrefs.
     if (!out.load && out.resume) {
-        LOG_INFO("[direct-hook] luau_load: proximity string-ref scan near lua_resume");
+        LOG_INFO("[direct-hook] luau_load: proximity string-ref scan "
+                 "(strings=all regions, xrefs=±80MB of lua_resume)");
         const char* load_needles[] = {
             "bytecode version mismatch", "truncated", nullptr
         };
@@ -3248,9 +3251,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             for (const auto& r : regions) {
                 if (out.load) break;
                 if (!r.readable() || r.size() < nlen) continue;
-                int64_t rdist = static_cast<int64_t>(r.start) -
-                                static_cast<int64_t>(out.resume);
-                if (rdist < -0x5000000LL || rdist > 0x5000000LL) continue;
+                // No distance filter here — .rodata can be anywhere
                 size_t scan_len = std::min(r.size(), static_cast<size_t>(0x4000000));
                 std::vector<uint8_t> pat(needle, needle + nlen);
                 std::string mask_s(nlen, 'x');
@@ -4644,6 +4645,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
