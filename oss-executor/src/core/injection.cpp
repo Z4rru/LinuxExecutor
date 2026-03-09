@@ -2722,16 +2722,26 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if (process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0) != static_cast<ssize_t>(rd)) continue;
                         for (size_t i = 0; i + 7 <= rd; i++) {
                             bool found_xref = false;
-                            if (buf[i] == 0x8D && (buf[i+1] & 0xC7) == 0x05) {
+                            // LEA reg,[rip+disp32] (0x8D) or MOV reg,[rip+disp32] (0x8B)
+                            // Both use ModRM mod=00 rm=101 for RIP-relative addressing
+                            if ((buf[i] == 0x8D || buf[i] == 0x8B) && (buf[i+1] & 0xC7) == 0x05) {
                                 int32_t disp; memcpy(&disp, &buf[i+2], 4);
                                 uintptr_t target = xr.start + off + i + 6 + (int64_t)disp;
                                 if (target == str_addr) found_xref = true;
                             }
+                            // REX + LEA/MOV reg,[rip+disp32]
                             if (!found_xref && buf[i] >= 0x40 && buf[i] <= 0x4F &&
-                                buf[i+1] == 0x8D && (buf[i+2] & 0xC7) == 0x05) {
+                                (buf[i+1] == 0x8D || buf[i+1] == 0x8B) && (buf[i+2] & 0xC7) == 0x05) {
                                 int32_t disp; memcpy(&disp, &buf[i+3], 4);
                                 uintptr_t target = xr.start + off + i + 7 + (int64_t)disp;
                                 if (target == str_addr) found_xref = true;
+                            }
+                            // MOVABS reg, imm64 — absolute address in immediate (non-PIC / JIT code)
+                            if (!found_xref && i + 10 <= rd &&
+                                buf[i] >= 0x48 && buf[i] <= 0x4F &&
+                                buf[i+1] >= 0xB8 && buf[i+1] <= 0xBF) {
+                                uintptr_t imm; memcpy(&imm, &buf[i+2], 8);
+                                if (imm == str_addr) found_xref = true;
                             }
                             if (!found_xref) continue;
                             uintptr_t xref_addr = xr.start + off + i;
@@ -4762,6 +4772,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
