@@ -2955,17 +2955,47 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         }
     }
     
-        // Extract lua_lock address from lua_newthread's first CALL instruction
+             // Extract lua_lock AND lua_unlock from lua_newthread.
+    // lua_newthread is ~60-80 bytes; first CALL = lock, last CALL = unlock.
     if (out.newthread && !out.lock_fn) {
-        uint8_t ntb[20];
-        struct iovec ntl = {ntb, 20};
-        struct iovec ntr = {reinterpret_cast<void*>(out.newthread), 20};
-        if (process_vm_readv(pid, &ntl, 1, &ntr, 1, 0) == 20) {
-            for (int i = 0; i < 16; i++) {
+        uint8_t ntb[128];
+        struct iovec ntl = {ntb, sizeof(ntb)};
+        struct iovec ntr = {reinterpret_cast<void*>(out.newthread), sizeof(ntb)};
+        ssize_t ntrd = process_vm_readv(pid, &ntl, 1, &ntr, 1, 0);
+        if (ntrd >= 20) {
+            size_t nt_read = static_cast<size_t>(ntrd);
+            // Detect function boundary
+            size_t nt_fend = nt_read;
+            for (size_t ni = 25; ni + 1 < nt_read; ni++) {
+                if (ntb[ni] != 0xC3) continue;
+                uint8_t nx = ntb[ni + 1];
+                if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
+                    nx == 0xF3 || nx == 0x00 ||
+                    (nx == 0x41 && ni + 2 < nt_read &&
+                     ntb[ni + 2] >= 0x54 && ntb[ni + 2] <= 0x57)) {
+                    nt_fend = ni + 1;
+                    break;
+                }
+            }
+            // First CALL = lua_lock
+            for (int i = 0; i < static_cast<int>(std::min(nt_fend, static_cast<size_t>(30))); i++) {
                 if (ntb[i] == 0xE8) {
                     int32_t d; memcpy(&d, &ntb[i+1], 4);
                     out.lock_fn = out.newthread + i + 5 + (int64_t)d;
                     LOG_INFO("[direct-hook] lua_lock at 0x{:X} (from newthread+{})", out.lock_fn, i);
+                    break;
+                }
+            }
+            // Last CALL = lua_unlock (fallback if lua_settop extraction missed it)
+            if (!out.unlock_fn && out.lock_fn) {
+                for (int i = static_cast<int>(nt_fend) - 5; i >= 10; i--) {
+                    if (ntb[i] != 0xE8) continue;
+                    int32_t d; memcpy(&d, &ntb[i+1], 4);
+                    uintptr_t target = out.newthread + i + 5 + static_cast<int64_t>(d);
+                    if (target == out.lock_fn) continue;
+                    out.unlock_fn = target;
+                    LOG_INFO("[direct-hook] lua_unlock at 0x{:X} (from newthread+{}, boundary={})",
+                             out.unlock_fn, i, nt_fend);
                     break;
                 }
             }
@@ -3085,15 +3115,41 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         // Validate lua_settop: must be a 2-arg function (saves rdi + rsi, NOT rdx)
         // Re-extract lua_lock if lua_newthread was found by global scan but lua_lock wasn't set
     if (out.newthread && !out.lock_fn) {
-        uint8_t ntb2[20];
-        struct iovec ntl2 = {ntb2, 20};
-        struct iovec ntr2 = {reinterpret_cast<void*>(out.newthread), 20};
-        if (process_vm_readv(pid, &ntl2, 1, &ntr2, 1, 0) == 20) {
-            for (int i = 0; i < 16; i++) {
+        uint8_t ntb2[128];
+        struct iovec ntl2 = {ntb2, sizeof(ntb2)};
+        struct iovec ntr2 = {reinterpret_cast<void*>(out.newthread), sizeof(ntb2)};
+        ssize_t nt2rd = process_vm_readv(pid, &ntl2, 1, &ntr2, 1, 0);
+        if (nt2rd >= 20) {
+            size_t nt2_read = static_cast<size_t>(nt2rd);
+            size_t nt2_fend = nt2_read;
+            for (size_t ni = 25; ni + 1 < nt2_read; ni++) {
+                if (ntb2[ni] != 0xC3) continue;
+                uint8_t nx = ntb2[ni + 1];
+                if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
+                    nx == 0xF3 || nx == 0x00 ||
+                    (nx == 0x41 && ni + 2 < nt2_read &&
+                     ntb2[ni + 2] >= 0x54 && ntb2[ni + 2] <= 0x57)) {
+                    nt2_fend = ni + 1;
+                    break;
+                }
+            }
+            for (int i = 0; i < static_cast<int>(std::min(nt2_fend, static_cast<size_t>(30))); i++) {
                 if (ntb2[i] == 0xE8) {
                     int32_t d; memcpy(&d, &ntb2[i+1], 4);
                     out.lock_fn = out.newthread + i + 5 + (int64_t)d;
                     LOG_INFO("[direct-hook] lua_lock at 0x{:X} (from newthread+{}, post-global-scan)", out.lock_fn, i);
+                    break;
+                }
+            }
+            if (!out.unlock_fn && out.lock_fn) {
+                for (int i = static_cast<int>(nt2_fend) - 5; i >= 10; i--) {
+                    if (ntb2[i] != 0xE8) continue;
+                    int32_t d; memcpy(&d, &ntb2[i+1], 4);
+                    uintptr_t target = out.newthread + i + 5 + static_cast<int64_t>(d);
+                    if (target == out.lock_fn) continue;
+                    out.unlock_fn = target;
+                    LOG_INFO("[direct-hook] lua_unlock at 0x{:X} (from newthread+{}, post-global-scan, boundary={})",
+                             out.unlock_fn, i, nt2_fend);
                     break;
                 }
             }
@@ -3497,17 +3553,68 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     // ═══════════════════════════════════════════════════════════════
     uintptr_t active_lock = 0;
     if (out.settop) {
-        uint8_t stbuf[40];
-        struct iovec stl = {stbuf, 40};
-        struct iovec str = {reinterpret_cast<void*>(out.settop), 40};
-        if (process_vm_readv(pid, &stl, 1, &str, 1, 0) == 40) {
-            for (int i = 0; i < 35; i++) {
-                if (stbuf[i] == 0xE8) {
-                    int32_t d; memcpy(&d, &stbuf[i+1], 4);
-                    active_lock = out.settop + i + 5 + static_cast<int64_t>(d);
-                    LOG_INFO("[direct-hook] active_lock extracted from lua_settop: 0x{:X}", active_lock);
+        // Read enough bytes to cover lua_settop's full body (typically 40-120B).
+        // Previous 40-byte read was too short for a 65B function — missed the
+        // last CALL (lua_unlock) which lives near the RET at the function end.
+        uint8_t stbuf[160];
+        struct iovec stl = {stbuf, sizeof(stbuf)};
+        struct iovec str = {reinterpret_cast<void*>(out.settop), sizeof(stbuf)};
+        ssize_t strd = process_vm_readv(pid, &stl, 1, &str, 1, 0);
+        if (strd >= 40) {
+            size_t st_read = static_cast<size_t>(strd);
+
+            // Detect function boundary: RET followed by boundary marker
+            // (padding, new prologue, etc.) to avoid scanning into adjacent
+            // functions. Without this, the "last CALL" found could belong
+            // to the next function, giving a wrong lua_unlock address.
+            size_t st_fend = st_read;
+            for (size_t si = 25; si + 1 < st_read; si++) {
+                if (stbuf[si] != 0xC3) continue;
+                uint8_t nx = stbuf[si + 1];
+                if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
+                    nx == 0xF3 || nx == 0x00 ||
+                    (nx == 0x41 && si + 2 < st_read &&
+                     stbuf[si + 2] >= 0x54 && stbuf[si + 2] <= 0x57)) {
+                    st_fend = si + 1;
                     break;
                 }
+            }
+            LOG_DEBUG("[direct-hook] lua_settop body: {}/{} bytes (boundary at {})",
+                      st_fend, st_read, st_fend);
+
+            // First CALL = lua_lock (Luau API contract: lock before work)
+            for (size_t i = 0; i + 5 <= st_fend; i++) {
+                if (stbuf[i] == 0xE8) {
+                    int32_t d; memcpy(&d, &stbuf[i + 1], 4);
+                    active_lock = out.settop + i + 5 + static_cast<int64_t>(d);
+                    LOG_INFO("[direct-hook] active_lock extracted from lua_settop+{}: 0x{:X}",
+                             i, active_lock);
+                    break;
+                }
+            }
+
+            // Last CALL = lua_unlock (Luau API contract: unlock after work)
+            // Scan backwards from function end to find the final E8 CALL.
+            // This MUST be a different target than active_lock.
+            uintptr_t active_unlock = 0;
+            for (int i = static_cast<int>(st_fend) - 5; i >= 10; i--) {
+                if (stbuf[i] != 0xE8) continue;
+                int32_t d; memcpy(&d, &stbuf[i + 1], 4);
+                uintptr_t target = out.settop + i + 5 + static_cast<int64_t>(d);
+                if (target == active_lock) continue; // same as lock — keep scanning
+                active_unlock = target;
+                LOG_INFO("[direct-hook] active_unlock extracted from lua_settop+{}: 0x{:X}",
+                         i, active_unlock);
+                break;
+            }
+
+            if (active_unlock && !out.unlock_fn) {
+                out.unlock_fn = active_unlock;
+                LOG_INFO("[direct-hook] unlock_fn set to 0x{:X} (from lua_settop last CALL)",
+                         out.unlock_fn);
+            } else if (!active_unlock) {
+                LOG_WARN("[direct-hook] could not extract lua_unlock from lua_settop "
+                         "(scanned {} bytes, boundary at {})", st_read, st_fend);
             }
         }
     }
@@ -4134,6 +4241,36 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (best_addr) {
                     out.newthread = best_addr;
                     out.lock_fn = active_lock;
+                    // Extract lua_unlock from rescue newthread's last CALL
+                    if (!out.unlock_fn) {
+                        uint8_t rnt[128];
+                        struct iovec rnl = {rnt, sizeof(rnt)};
+                        struct iovec rnr = {reinterpret_cast<void*>(best_addr), sizeof(rnt)};
+                        ssize_t rnrd = process_vm_readv(pid, &rnl, 1, &rnr, 1, 0);
+                        if (rnrd >= 30) {
+                            size_t rn_fend = static_cast<size_t>(rnrd);
+                            for (size_t ri = 25; ri + 1 < rn_fend; ri++) {
+                                if (rnt[ri] != 0xC3) continue;
+                                uint8_t nx = rnt[ri + 1];
+                                if (nx==0xCC||nx==0x90||nx==0x55||nx==0x53||
+                                    nx==0xF3||nx==0x00||
+                                    (nx==0x41&&ri+2<rn_fend&&
+                                     rnt[ri+2]>=0x54&&rnt[ri+2]<=0x57)) {
+                                    rn_fend = ri + 1; break;
+                                }
+                            }
+                            for (int ri = static_cast<int>(rn_fend)-5; ri >= 10; ri--) {
+                                if (rnt[ri] != 0xE8) continue;
+                                int32_t rd; memcpy(&rd, &rnt[ri+1], 4);
+                                uintptr_t rt = best_addr + ri + 5 + static_cast<int64_t>(rd);
+                                if (rt == active_lock) continue;
+                                out.unlock_fn = rt;
+                                LOG_INFO("[direct-hook] rescue: lua_unlock at 0x{:X} "
+                                         "(from newthread+{})", rt, ri);
+                                break;
+                            }
+                        }
+                    }
                     LOG_INFO("[direct-hook] rescue: lua_newthread=0x{:X} "
                              "({:.1f}MB from lua_resume, prologue+lock verified)",
                              best_addr, best_dist / (1024.0 * 1024.0));
@@ -5131,12 +5268,133 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
             if (!lock_bypassed)
                 LOG_INFO("[direct-hook] no unlock redirects needed — "
                          "functions may not call active_unlock directly");
-        } else {
-            LOG_WARN("[direct-hook] lua_lock hook but missing "
-                     "active_unlock (0x{:X}) or nop_stub (0x{:X}) "
-                     "— guard-RET handles lock, unlock may cause issues",
-                     aul, nop);
-        }
+        } else if (nop && !aul) {
+            // ═══════════════════════════════════════════════════════════
+            // Dynamic lua_unlock discovery: extract from real_settop or
+            // other known Luau API functions at execution time.
+            // This fires when find_remote_luau_functions failed to
+            // populate unlock_fn (e.g., lua_settop body too short for
+            // boundary detection, or global-scan newthread had no unlock).
+            // ═══════════════════════════════════════════════════════════
+            LOG_WARN("[direct-hook] active_unlock=0x0 — attempting dynamic extraction");
+
+            // Try extracting from real_settop (lua_settop before hooking)
+            uintptr_t dyn_sources[] = {
+                dhook_.real_settop_addr,
+                dhook_.newthread_addr,
+                dhook_.resume_addr
+            };
+            const char* dyn_names[] = {"real_settop", "newthread", "resume"};
+            uintptr_t lock_addr = dhook_.active_lock_addr;
+
+            for (int di = 0; di < 3 && !aul; di++) {
+                uintptr_t src = dyn_sources[di];
+                if (!src || src == dhook_.settop_addr) continue;  // skip hook target
+
+                uint8_t dbuf[160];
+                if (!proc_mem_read(pid, src, dbuf, sizeof(dbuf))) continue;
+
+                // Detect function boundary
+                size_t dfend = sizeof(dbuf);
+                for (size_t fi = 25; fi + 1 < sizeof(dbuf); fi++) {
+                    if (dbuf[fi] != 0xC3) continue;
+                    uint8_t nx = dbuf[fi + 1];
+                    if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
+                        nx == 0xF3 || nx == 0x00 ||
+                        (nx == 0x41 && fi + 2 < sizeof(dbuf) &&
+                         dbuf[fi + 2] >= 0x54 && dbuf[fi + 2] <= 0x57)) {
+                        dfend = fi + 1;
+                        break;
+                    }
+                }
+
+                // Last CALL that isn't lua_lock = lua_unlock
+                for (int ci = static_cast<int>(dfend) - 5; ci >= 10; ci--) {
+                    if (dbuf[ci] != 0xE8) continue;
+                    int32_t d; memcpy(&d, &dbuf[ci + 1], 4);
+                    uintptr_t target = src + ci + 5 + static_cast<int64_t>(d);
+                    if (target == lock_addr) continue;
+                    aul = target;
+                    dhook_.active_unlock_addr = aul;
+                    LOG_INFO("[direct-hook] dynamic: active_unlock=0x{:X} "
+                             "(from {}+{}, boundary={})",
+                             aul, dyn_names[di], ci, dfend);
+                    break;
+                }
+            }
+
+            if (aul) {
+                // Apply the same global bypass that the normal path uses
+                LOG_INFO("[direct-hook] applying global unlock bypass with "
+                         "dynamically discovered active_unlock 0x{:X}", aul);
+
+                // Global RET patch on active_unlock
+                {
+                    LockPatch ul_global{aul, 0};
+                    if (proc_mem_read(pid, aul, &ul_global.saved, 1)) {
+                        uint8_t ret_byte = 0xC3;
+                        if (proc_mem_write(pid, aul, &ret_byte, 1)) {
+                            lock_patches.push_back(ul_global);
+                            lock_bypassed = true;
+                            LOG_INFO("[direct-hook] GLOBAL: active_unlock 0x{:X} "
+                                     "patched to RET (saved 0x{:02X})", aul,
+                                     ul_global.saved);
+                        }
+                    }
+                }
+
+                // Redirect unlock calls in trampoline-called functions
+                auto dyn_redirect_unlock = [&](uintptr_t fn_addr,
+                                                size_t scan_size,
+                                                const char* name) {
+                    if (!fn_addr || fn_addr == dhook_.settop_addr) return;
+                    std::vector<uint8_t> buf(scan_size);
+                    if (!proc_mem_read(pid, fn_addr, buf.data(), scan_size)) return;
+                    size_t fend = scan_size;
+                    for (size_t i = 25; i + 1 < scan_size; i++) {
+                        if (buf[i] != 0xC3) continue;
+                        uint8_t nx = buf[i + 1];
+                        if (nx == 0xCC || nx == 0x90 || nx == 0x55 ||
+                            nx == 0x53 || nx == 0xF3 || nx == 0x00 ||
+                            (nx == 0x41 && i + 2 < scan_size &&
+                             buf[i + 2] >= 0x54 && buf[i + 2] <= 0x57)) {
+                            fend = i + 1;
+                            break;
+                        }
+                    }
+                    int redirected = 0;
+                    for (size_t i = 0; i + 5 <= fend; i++) {
+                        if (buf[i] != 0xE8) continue;
+                        int32_t d; memcpy(&d, &buf[i + 1], 4);
+                        uintptr_t tgt = fn_addr + i + 5 + static_cast<int64_t>(d);
+                        if (tgt != aul) continue;
+                        int64_t nd = static_cast<int64_t>(nop) -
+                                     static_cast<int64_t>(fn_addr + i + 5);
+                        if (nd < INT32_MIN || nd > INT32_MAX) continue;
+                        int32_t nd32 = static_cast<int32_t>(nd);
+                        uintptr_t patch_addr = fn_addr + i + 1;
+                        if (proc_mem_write(pid, patch_addr, &nd32, 4)) {
+                            call_redirects.push_back({patch_addr, d});
+                            lock_bypassed = true;
+                            redirected++;
+                        }
+                    }
+                    if (redirected > 0)
+                        LOG_INFO("[direct-hook] dynamic redirect: {} unlock "
+                                 "calls in {} → NOP stub", redirected, name);
+                };
+
+                dyn_redirect_unlock(dhook_.newthread_addr, 200, "lua_newthread");
+                dyn_redirect_unlock(dhook_.load_addr, 1500, "luau_load");
+                dyn_redirect_unlock(dhook_.resume_addr, 600, "lua_resume");
+                if (dhook_.real_settop_addr &&
+                    dhook_.real_settop_addr != dhook_.settop_addr)
+                    dyn_redirect_unlock(dhook_.real_settop_addr, 100, "lua_settop");
+            } else {
+                LOG_ERROR("[direct-hook] CRITICAL: cannot find active_unlock from any "
+                          "known Luau function — luau_load WILL deadlock at step 2. "
+                          "Lock hook requires paired unlock bypass.");
+            }
     } else {
         LOG_INFO("[direct-hook] lock bypass skipped — hook target 0x{:X} is outside lock scope "
                  "(API calls handle own locking, bypass would corrupt internal state)",
@@ -5732,6 +5990,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
