@@ -3862,10 +3862,21 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if (process_vm_readv(pid, &ul_l, 1, &ul_r, 1, 0) !=
             static_cast<ssize_t>(buf_size)) return 0;
 
-        // Find function boundary: C3 after offset 20
+                // Find function boundary: C3 followed by boundary marker
+        // (padding, next function prologue, or null bytes)
+        // Simple first-C3 is wrong — functions have early-return C3
         size_t ul_fend = buf_size;
-        for (size_t ui = 20; ui < buf_size; ui++) {
-            if (ul_buf[ui] == 0xC3) { ul_fend = ui; break; }
+        for (size_t ui = 25; ui + 1 < buf_size; ui++) {
+            if (ul_buf[ui] != 0xC3) continue;
+            uint8_t nx = ul_buf[ui + 1];
+            if (nx == 0xCC || nx == 0x90 || nx == 0x55 ||
+                nx == 0x53 || nx == 0xF3 || nx == 0x00 ||
+                (nx == 0x41 && ui + 2 < buf_size &&
+                 ul_buf[ui + 2] >= 0x54 &&
+                 ul_buf[ui + 2] <= 0x57)) {
+                ul_fend = ui + 1;
+                break;
+            }
         }
 
         // Scan backward for E9 (jmp rel32 tail-call) or E8 (call)
