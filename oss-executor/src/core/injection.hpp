@@ -200,7 +200,6 @@ private:
         uintptr_t pthread_mutex_lock_addr = 0;
         int32_t lock_global_state_offset = 0;
         int32_t lock_mutex_offset = 0;
-        int32_t lock_arg_from_L_offset = -1;
         bool lock_internals_valid = false;
     };
 
@@ -234,5 +233,6 @@ private:
 };
 
 }
+
 
 
