@@ -126,14 +126,27 @@ bool Executor::send_to_payload(const std::string& source) {
         if (bc_ver < 3 || bc_ver > 6) {
             LOG_WARN("Bytecode version {} outside expected range [3..6]", static_cast<int>(bc_ver));
         }
+
         bool ok = inj.send_via_mailbox(bc, bc_len, 1);
         free(bc);
+
         if (ok) {
-            LOG_INFO("Sent {} bytes bytecode (v{}) via direct hook mailbox", bc_len, static_cast<int>(bc_ver));
+            // FIX 4: Wait for the payload to consume/acknowledge the mailbox
+            // data instead of returning immediately.
+            bool ack = inj.wait_for_mailbox_ack(bc_len, bc_ver);
+            if (!ack) {
+                LOG_WARN("Mailbox send succeeded but execution was not "
+                         "confirmed within timeout ({} bytes, v{})",
+                         bc_len, static_cast<int>(bc_ver));
+            }
+            LOG_INFO("Sent {} bytes bytecode (v{}) via direct hook mailbox{}",
+                     bc_len, static_cast<int>(bc_ver),
+                     ack ? "" : " (unconfirmed)");
             return true;
         }
         LOG_WARN("Direct hook mailbox failed, trying IPC fallback");
     }
+
     std::string prefix;
     if ((pinfo.via_flatpak || pinfo.via_sober) && pid > 0)
         prefix = "/proc/" + std::to_string(pid) + "/root";
@@ -141,21 +154,23 @@ bool Executor::send_to_payload(const std::string& source) {
     auto write_all = [](int fd, const char* d, size_t rem) -> bool {
         while (rem > 0) {
             ssize_t n = ::write(fd, d, rem);
-            if (n <= 0) return false;
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) continue;
+                return false;
+            }
             d += n;
             rem -= static_cast<size_t>(n);
         }
         return true;
     };
 
-    // ── 1. Abstract socket (primary — works across Flatpak mount namespaces ──
-    //    when Sober shares the network namespace via --share=network)
+    // ── 1. Abstract socket ──────────────────────────────────────────────────
     {
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd >= 0) {
             struct sockaddr_un addr{};
             addr.sun_family  = AF_UNIX;
-            addr.sun_path[0] = '\0'; // abstract namespace
+            addr.sun_path[0] = '\0';
             memcpy(addr.sun_path + 1, ABSTRACT_SOCK_NAME,
                    sizeof(ABSTRACT_SOCK_NAME) - 1);
             auto alen = static_cast<socklen_t>(
@@ -183,7 +198,7 @@ bool Executor::send_to_payload(const std::string& source) {
         }
     }
 
-    // ── 2. Filesystem socket (same namespace or via /proc/PID/root) ──────────
+    // ── 2. Filesystem socket ────────────────────────────────────────────────
     {
         std::string sock_path = prefix + PAYLOAD_SOCK_PATH;
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -214,7 +229,7 @@ bool Executor::send_to_payload(const std::string& source) {
         }
     }
 
-    // ── 3. File IPC (atomic write via tmp + rename) ──────────────────────────
+    // ── 3. File IPC (atomic write via tmp + rename) ─────────────────────────
     {
         std::string cmd_path = prefix + "/tmp/oss_payload_cmd";
         std::string tmp_path = cmd_path + ".tmp";
@@ -267,13 +282,13 @@ ExecutionResult Executor::execute_internal(const std::string& script,
             LOG_INFO("Script '{}' dispatched to Roblox payload", name);
         }
 
-        // Read payload status/log regardless of send method
+        // Read payload status/log after delivery
         if (result.success) {
             usleep(500000);
             std::string prefix;
-            const auto& pinfo = Injection::instance().process_info();
+            const auto& pinfo = inj.process_info();
             if (pinfo.via_flatpak || pinfo.via_sober) {
-                pid_t tpid = Injection::instance().target_pid();
+                pid_t tpid = inj.target_pid();
                 if (tpid > 0) prefix = "/proc/" + std::to_string(tpid) + "/root";
             }
             std::ifstream sf(prefix + "/tmp/oss_payload_status");
@@ -520,9 +535,3 @@ void Executor::set_status_callback(StatusCallback cb) { status_cb_ = std::move(c
 void Executor::set_result_callback(ResultCallback cb) { result_cb_ = std::move(cb); }
 
 } // namespace oss
-
-
-
-
-
-
