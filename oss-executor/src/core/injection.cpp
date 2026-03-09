@@ -5395,6 +5395,7 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                           "known Luau function — luau_load WILL deadlock at step 2. "
                           "Lock hook requires paired unlock bypass.");
             }
+        }
     } else {
         LOG_INFO("[direct-hook] lock bypass skipped — hook target 0x{:X} is outside lock scope "
                  "(API calls handle own locking, bypass would corrupt internal state)",
@@ -5990,6 +5991,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
