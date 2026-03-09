@@ -3918,9 +3918,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         // Try lua_settop first (small, clean API function)
         if (!ul && out.settop)
             ul = extract_unlock(out.settop, 80, "lua_settop");
-        // Try lua_resume (larger, less likely to tail-call)
+        // Try lua_resume (579+ bytes, needs large buffer)
         if (!ul && out.resume)
-            ul = extract_unlock(out.resume, 200, "lua_resume");
+            ul = extract_unlock(out.resume, 600, "lua_resume");
         // Try lua_newthread
         if (!ul && out.newthread)
             ul = extract_unlock(out.newthread, 200, "lua_newthread");
@@ -4902,6 +4902,28 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
                     if (tgt == al) {
                         LOG_DEBUG("[direct-hook]   {} lock already active",
                                   name);
+                        // This function uses active_lock, so its unlock
+                        // is also correct — derive active_unlock from it
+                        for (int ui = static_cast<int>(fend) - 1;
+                             ui >= 20; ui--) {
+                            if (buf[ui] != 0xE8 && buf[ui] != 0xE9)
+                                continue;
+                            if (ui + 5 > static_cast<int>(scan_size))
+                                continue;
+                            int32_t ud;
+                            memcpy(&ud, &buf[ui + 1], 4);
+                            uintptr_t ut = fn_addr + ui + 5 +
+                                static_cast<int64_t>(ud);
+                            if (ut == al || ut == fn_addr) continue;
+                            if (aul != ut) {
+                                LOG_INFO("[direct-hook]   derived "
+                                    "active_unlock=0x{:X} from {} "
+                                    "(at +{}, {:02X})", ut, name,
+                                    ui, buf[ui]);
+                                aul = ut;
+                            }
+                            break;
+                        }
                         break;
                     }
                     int64_t nd = static_cast<int64_t>(al) -
@@ -5559,6 +5581,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
