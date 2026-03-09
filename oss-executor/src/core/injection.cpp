@@ -5700,13 +5700,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                     }
 
                     if (!addrs.unlock_fn) {
-                        LOG_WARN("[direct-hook] lua_unlock not found (likely compiler-inlined) — "
-                                 "held-lock settop hook would deadlock. "
-                                 "Skipping live settop, falling back to lua_resume hook.");
-                        proc_mem_write(pid, best_live_settop,
-                                       prologue, steal);
-                        settop_probe_live = false;
-                        break;
+                        LOG_INFO("[direct-hook] lua_unlock not found (compiler-inlined) — "
+                                 "lock-free mode: hook on prologue fires BEFORE lua_lock, "
+                                 "each API call acquires/releases lock independently");
                     }
 
                     auto held_tramp = gen_entry_trampoline(
@@ -6795,6 +6791,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
