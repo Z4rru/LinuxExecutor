@@ -5471,8 +5471,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                  "lua_resume=0x{:X} (dead settop was 0x{:X})",
                  addrs.resume, dead_settop_addr);
         addrs.settop = 0;
-        uintptr_t best_live_settop = 0;
-        int best_live_hits = 0;
+        best_live_settop = 0;
+        best_live_hits = 0;
 
         // ═══════════════════════════════════════════════════════════
         // CRITICAL: unhook lua_lock before probing.
@@ -5494,14 +5494,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             usleep(50000);
         }
 
-        int total_probes = 0;
-        constexpr int MAX_PROBES = 10;
+        total_probes = 0;
+        constexpr int MAX_PROBES_2 = 10;
 
         for (const auto& r : regions) {
             if (best_live_settop) break;
-            if (total_probes >= MAX_PROBES) {
+            if (total_probes >= MAX_PROBES_2) {
                 LOG_WARN("[direct-hook] hit probe limit ({}) — stopping "
-                         "live-settop search", MAX_PROBES);
+                         "live-settop search", MAX_PROBES_2);
                 break;
             }
             if (!r.readable() || !r.executable()) continue;
@@ -5612,7 +5612,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 total_probes++;
                 LOG_DEBUG("[direct-hook] live-settop candidate 0x{:X} "
                           "({}B, {} calls) — probing 200ms... [{}/{}]",
-                          cand, fsz, calls, total_probes, MAX_PROBES);
+                          cand, fsz, calls, total_probes, MAX_PROBES_2);
 
                 uint8_t cand_pro[32];
                 if (!proc_mem_read(pid, cand, cand_pro, sizeof(cand_pro)))
@@ -6767,6 +6767,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
