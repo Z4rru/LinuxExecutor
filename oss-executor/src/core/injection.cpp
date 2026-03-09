@@ -4164,136 +4164,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     }
                 }
             } else if (best_raddr) {
-
-                // Lock-anchored re-scan for lua_settop if invalidated
-                if (!out.settop) {
-                    LOG_INFO("[direct-hook] lua_settop: lock-anchored "
-                             "re-scan (active_lock=0x{:X})", active_lock);
-                    int best_st_score = -1;
-                    uintptr_t best_st_addr = 0;
-                    size_t best_st_fsz = 0;
-                    for (const auto& r : regions) {
-                        if (best_st_addr && best_st_score >= 20) break;
-                        if (!r.readable() || !r.executable()) continue;
-                        if (r.size() < 256) continue;
-                        int64_t rd0 = static_cast<int64_t>(r.start) -
-                                      static_cast<int64_t>(active_lock);
-                        if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
-                        size_t scan_sz = std::min(r.size(),
-                                                  static_cast<size_t>(0x4000000));
-                        std::vector<uint8_t> code(scan_sz);
-                        struct iovec sli = {code.data(), scan_sz};
-                        struct iovec sri = {reinterpret_cast<void*>(r.start),
-                                            scan_sz};
-                        if (process_vm_readv(pid, &sli, 1, &sri, 1, 0) !=
-                            static_cast<ssize_t>(scan_sz)) continue;
-                        for (size_t off = 1; off + 260 < scan_sz; off++) {
-                            if (code[off-1] != 0xC3 && code[off-1] != 0xCC &&
-                                code[off-1] != 0x90) continue;
-                            uintptr_t addr = r.start + off;
-                            if (addr == best_raddr || addr == out.newthread ||
-                                addr == out.load) continue;
-                            size_t p = off;
-                            if (p+3<scan_sz && code[p]==0xF3 && code[p+1]==0x0F &&
-                                code[p+2]==0x1E && code[p+3]==0xFA) p+=4;
-                            if (p >= scan_sz) continue;
-                            if (!(code[p]==0x55 || code[p]==0x53 ||
-                                  (code[p]==0x41 && p+1<scan_sz &&
-                                   code[p+1]>=0x54 && code[p+1]<=0x57)))
-                                continue;
-                            // Must call active_lock in first 60 bytes
-                            bool has_alock = false;
-                            for (size_t fi=0; fi<60 && off+fi+5<=scan_sz; fi++) {
-                                if (code[off+fi] != 0xE8) continue;
-                                int32_t fd; memcpy(&fd, &code[off+fi+1], 4);
-                                uintptr_t ft = r.start+off+fi+5+
-                                               static_cast<int64_t>(fd);
-                                if (ft == active_lock) { has_alock=true; break; }
-                                // One-hop
-                                uint8_t hb[25];
-                                struct iovec hbl={hb,25};
-                                struct iovec hbr={reinterpret_cast<void*>(ft),25};
-                                if (process_vm_readv(pid,&hbl,1,&hbr,1,0)==25) {
-                                    for (int hi=0; hi<20; hi++) {
-                                        if (hb[hi]!=0xE8) continue;
-                                        int32_t hd; memcpy(&hd,&hb[hi+1],4);
-                                        uintptr_t ht=ft+hi+5+
-                                                     static_cast<int64_t>(hd);
-                                        if (ht==active_lock) has_alock=true;
-                                        break;
-                                    }
-                                }
-                                break;
-                            }
-                            if (!has_alock) continue;
-                            // Must be 2-arg (saves rdi+rsi, not rdx)
-                            bool sr_di=false, sr_si=false, sr_dx=false;
-                            int calls=0; size_t fsz=0;
-                            for (size_t j=0; j<250 && off+j+8<scan_sz; j++) {
-                                size_t i=off+j;
-                                if (code[i]==0xE8) calls++;
-                                if (j<20 && i+2<scan_sz) {
-                                    if (code[i]==0x89&&(code[i+1]&0x38)==0x38) sr_di=true;
-                                    if ((code[i]==0x48||code[i]==0x49)&&code[i+1]==0x89&&(code[i+2]&0x38)==0x38) sr_di=true;
-                                    if (code[i]==0x89&&(code[i+1]&0x38)==0x30) sr_si=true;
-                                    if ((code[i]==0x48||code[i]==0x49)&&code[i+1]==0x89&&(code[i+2]&0x38)==0x30) sr_si=true;
-                                    if (code[i]==0x48&&code[i+1]==0x63&&(code[i+2]&0xC7)==0xC6) sr_si=true;
-                                    if (code[i]==0x89&&(code[i+1]&0x38)==0x10) sr_dx=true;
-                                    if ((code[i]==0x48||code[i]==0x49)&&code[i+1]==0x89&&(code[i+2]&0x38)==0x10) sr_dx=true;
-                                }
-                                if (code[i]==0xC3 && j>=20) { fsz=j+1; break; }
-                            }
-                            if (!sr_di || !sr_si || sr_dx) continue;
-                            if (fsz<30 || fsz>250 || calls<1 || calls>8) continue;
-                            int score = 10; // calls active_lock
-                            if (calls>=1 && calls<=4) score+=2;
-                            if (fsz>=40 && fsz<=150) score+=2;
-                            // Cross-validate with new lua_resume
-                            if (best_raddr) {
-                                uint8_t rc[1024];
-                                struct iovec rcl={rc,1024};
-                                struct iovec rcr={reinterpret_cast<void*>(best_raddr),1024};
-                                ssize_t rrd=process_vm_readv(pid,&rcl,1,&rcr,1,0);
-                                if (rrd>=64) {
-                                    for (size_t cj=0; cj<fsz && off+cj+5<scan_sz; cj++) {
-                                        if (code[off+cj]!=0xE8) continue;
-                                        int32_t cd; memcpy(&cd,&code[off+cj+1],4);
-                                        uintptr_t ct=r.start+off+cj+5+static_cast<int64_t>(cd);
-                                        for (size_t rj=0; rj+5<=(size_t)rrd; rj++) {
-                                            if (rc[rj]!=0xE8) continue;
-                                            int32_t rd; memcpy(&rd,&rc[rj+1],4);
-                                            uintptr_t rt=best_raddr+rj+5+static_cast<int64_t>(rd);
-                                            if (ct==rt) { score+=10; goto st_xv_done; }
-                                        }
-                                    }
-                                    st_xv_done:;
-                                }
-                            }
-                            if (score>best_st_score) {
-                                best_st_score=score; best_st_addr=addr; best_st_fsz=fsz;
-                            }
-                        }
-                    }
-                    if (best_st_addr && best_st_score>=15) {
-                        out.settop = best_st_addr;
-                        int64_t sd = static_cast<int64_t>(best_st_addr) -
-                                     static_cast<int64_t>(best_raddr);
-                        if (sd<0) sd=-sd;
-                        LOG_INFO("[direct-hook] lock-anchored: lua_settop="
-                                 "0x{:X} ({}B, score={}, {:.1f}MB from "
-                                 "lua_resume, VERIFIED)",
-                                 best_st_addr, best_st_fsz, best_st_score,
-                                 sd/(1024.0*1024.0));
-                    } else if (best_st_addr) {
-                        LOG_WARN("[direct-hook] lock-anchored lua_settop "
-                                 "candidate 0x{:X} rejected (score={})",
-                                 best_st_addr, best_st_score);
-                    } else {
-                        LOG_WARN("[direct-hook] lock-anchored re-scan found "
-                                 "no lua_settop calling active_lock");
-                    }
-                }
-            } else if (best_raddr) {
                 LOG_WARN("[direct-hook] lock-anchored lua_resume candidate "
                          "0x{:X} rejected (score={}, need >=25)",
                          best_raddr, best_rscore);
@@ -4760,8 +4630,10 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // rbx = mailbox base address
     e({0x48,0xBB}); e64(mailbox_addr);
 
-    // --- Unconditional hit counter (fires every hook entry, even re-entrant) ---
-    e({0xFE,0x43,0x29});          // inc byte [rbx+0x29]  (_pad1 as hit counter)
+        // --- Unconditional hit counter (fires every hook entry, even re-entrant) ---
+    // Uses 16-bit at offset 0x2A (mailbox bytes 42-43) to avoid uint8_t
+    // overflow at high call rates (lua_lock can exceed 256 hits/s).
+    e({0x66,0xFF,0x43,0x2A});     // inc word [rbx+0x2A]  (uint16_t hit counter)
 
     // --- Guard check: if guard != 0, skip (re-entrant call) ---
     e({0x80,0x7B,0x28,0x00});     // cmp byte [rbx+0x28], 0
@@ -5070,15 +4942,16 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         }
         LOG_INFO("[direct-hook] {} patch verified at 0x{:X}", name, target);
 
-                // Probe: wait and check hit counter.
+                            // Probe: wait and check hit counter.
         // Require ≥10 hits in 1000ms to distinguish live functions
         // (~400+ hits/s for lua_resume) from stale/dead copies that
         // get sporadic hits (~3 in 500ms) then go completely silent.
-        uint8_t zh = 0;
-        proc_mem_write(pid, mb_addr + 41, &zh, 1);
+        // Uses uint16_t at offset 42 to avoid overflow at high call rates.
+        uint16_t zh = 0;
+        proc_mem_write(pid, mb_addr + 42, &zh, 2);
         usleep(1000000);
-        uint8_t hits = 0;
-        proc_mem_read(pid, mb_addr + 41, &hits, 1);
+        uint16_t hits = 0;
+        proc_mem_read(pid, mb_addr + 42, &hits, 2);
         if (hits < 10) {
             LOG_WARN("[direct-hook] {} at 0x{:X} has only {} hits in 1000ms "
                      "(need ≥10) — likely dead/stale code", name, target, hits);
@@ -5413,11 +5286,11 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                     continue;
                 }
 
-                uint8_t zh = 0;
-                proc_mem_write(pid, mb_addr + 41, &zh, 1);
+                uint16_t zh = 0;
+                proc_mem_write(pid, mb_addr + 42, &zh, 2);
                 usleep(200000);
-                uint8_t probe_hits = 0;
-                proc_mem_read(pid, mb_addr + 41, &probe_hits, 1);
+                uint16_t probe_hits = 0;
+                proc_mem_read(pid, mb_addr + 42, &probe_hits, 2);
 
                 proc_mem_write(pid, cand, cand_pro, cand_steal);
 
@@ -5447,12 +5320,157 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                      "(thread stays on stack, GC collects)");
         }
 
-        // Re-hook lua_lock now that probing is done.
-        // The final trampoline (with the correct settop address)
-        // will be written below in the "Re-generate trampoline"
-        // block. We just need to re-apply the JMP patch here so
-        // the hook_addr/prologue/steal/patch state is consistent.
-        if (lock_was_hooked) {
+        // ═══════════════════════════════════════════════════════════
+        // CRITICAL FIX: Switch hook from lua_lock to live settop.
+        //
+        // When the hook is on lua_lock, rdi is NOT lua_State* L.
+        // The compiler transforms lua_lock(L) calls in lua_settop,
+        // lua_resume, etc. into: rdi = L->global (or &L->global->mutex)
+        // before calling the lock implementation. So the trampoline
+        // captures a global_State* and passes it to lua_newthread,
+        // causing an immediate deadlock.
+        //
+        // Fix: if we found a live lua_settop, switch the hook to it.
+        // lua_settop takes (lua_State* L, int idx) — rdi IS L.
+        // ═══════════════════════════════════════════════════════════
+        bool switched_to_live_settop = false;
+        if (best_live_settop && lock_was_hooked) {
+            LOG_INFO("[direct-hook] lua_lock hook passes wrong rdi "
+                     "(global_State*, not lua_State*) — switching "
+                     "hook to live settop at 0x{:X}", best_live_settop);
+
+            uint8_t live_st_pro[32];
+            bool switch_ok = false;
+            if (proc_mem_read(pid, best_live_settop, live_st_pro,
+                              sizeof(live_st_pro))) {
+                size_t live_st_steal = 0;
+                while (live_st_steal < 5) {
+                    size_t il = dh_insn_len(live_st_pro + live_st_steal);
+                    if (il == 0 || live_st_steal + il > sizeof(live_st_pro))
+                        break;
+                    live_st_steal += il;
+                }
+                if (live_st_steal >= 5) {
+                    int64_t cave_dist = static_cast<int64_t>(
+                        cave.padding_start) -
+                        static_cast<int64_t>(best_live_settop + 5);
+                    bool cave_reachable =
+                        (cave_dist >= INT32_MIN && cave_dist <= INT32_MAX) ||
+                        live_st_steal >= 14;
+
+                    if (!cave_reachable) {
+                        LOG_INFO("[direct-hook] code cave unreachable from "
+                                 "live settop — searching nearby");
+                        std::vector<MemoryRegion> st_nearby;
+                        for (const auto& r : regions) {
+                            int64_t d = static_cast<int64_t>(r.start) -
+                                        static_cast<int64_t>(best_live_settop);
+                            if (d > INT32_MIN && d < INT32_MAX) {
+                                st_nearby.push_back(r);
+                                continue;
+                            }
+                            d = static_cast<int64_t>(r.end) -
+                                static_cast<int64_t>(best_live_settop);
+                            if (d > INT32_MIN && d < INT32_MAX)
+                                st_nearby.push_back(r);
+                        }
+                        ExeRegionInfo st_cave;
+                        if (find_code_cave(pid, st_nearby, 400, st_cave)) {
+                            cave = st_cave;
+                            cave_dist = static_cast<int64_t>(
+                                cave.padding_start) -
+                                static_cast<int64_t>(best_live_settop + 5);
+                            cave_reachable =
+                                (cave_dist >= INT32_MIN &&
+                                 cave_dist <= INT32_MAX) ||
+                                live_st_steal >= 14;
+                            LOG_INFO("[direct-hook] new code cave at 0x{:X} "
+                                     "for live settop", cave.padding_start);
+                        }
+                    }
+
+                    if (cave_reachable) {
+                        auto live_tramp = gen_entry_trampoline(
+                            addrs, mb_addr, cave.padding_start,
+                            best_live_settop, live_st_pro, live_st_steal);
+
+                        if (live_tramp.size() <= 400 &&
+                            proc_mem_write(pid, cave.padding_start,
+                                           live_tramp.data(),
+                                           live_tramp.size())) {
+                            uint8_t live_patch[16];
+                            size_t live_pl;
+                            if (cave_dist >= INT32_MIN &&
+                                cave_dist <= INT32_MAX &&
+                                live_st_steal >= 5) {
+                                live_patch[0] = 0xE9;
+                                int32_t r32 =
+                                    static_cast<int32_t>(cave_dist);
+                                memcpy(live_patch + 1, &r32, 4);
+                                for (size_t i = 5; i < live_st_steal; i++)
+                                    live_patch[i] = 0x90;
+                                live_pl = live_st_steal;
+                            } else {
+                                live_patch[0] = 0xFF;
+                                live_patch[1] = 0x25;
+                                memset(live_patch + 2, 0, 4);
+                                uintptr_t ca = cave.padding_start;
+                                memcpy(live_patch + 6, &ca, 8);
+                                live_pl = 14;
+                            }
+
+                            if (proc_mem_write(pid, best_live_settop,
+                                               live_patch, live_pl)) {
+                                uint8_t vf[16] = {};
+                                if (proc_mem_read(pid, best_live_settop,
+                                                  vf, live_pl) &&
+                                    memcmp(vf, live_patch, live_pl) == 0) {
+                                    hook_addr = best_live_settop;
+                                    is_lock_hook = false;
+                                    memcpy(prologue, live_st_pro,
+                                           live_st_steal);
+                                    steal = live_st_steal;
+                                    patch_len = live_pl;
+                                    memcpy(patch, live_patch, live_pl);
+                                    lock_was_hooked = false;
+                                    switched_to_live_settop = true;
+                                    LOG_INFO("[direct-hook] SWITCHED hook "
+                                             "from lua_lock to live settop "
+                                             "at 0x{:X} (steal={}, "
+                                             "cave=0x{:X})",
+                                             best_live_settop,
+                                             live_st_steal,
+                                             cave.padding_start);
+                                } else {
+                                    LOG_WARN("[direct-hook] live settop "
+                                             "patch did not persist");
+                                    proc_mem_write(pid, best_live_settop,
+                                                   live_st_pro,
+                                                   live_st_steal);
+                                }
+                            }
+                        }
+                    } else {
+                        LOG_WARN("[direct-hook] no reachable code cave for "
+                                 "live settop at 0x{:X}", best_live_settop);
+                    }
+                } else {
+                    LOG_WARN("[direct-hook] live settop prologue too short "
+                             "({} bytes)", live_st_steal);
+                }
+            }
+
+            if (!switched_to_live_settop) {
+                LOG_WARN("[direct-hook] could not switch to live settop — "
+                         "keeping lua_lock hook (may deadlock due to wrong "
+                         "rdi type)");
+            }
+        }
+
+        // Re-hook lua_lock only if we did NOT switch to live settop.
+        // If we switched, lua_lock stays unhooked (correct behavior:
+        // each Luau API call handles its own locking internally).
+        if (lock_was_hooked && !switched_to_live_settop) {
             auto t_rehook = gen_entry_trampoline(
                 addrs, mb_addr, cave.padding_start,
                 hook_addr, prologue, steal);
@@ -5546,6 +5564,128 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
              cave.padding_start, mb_addr,
              is_lock_hook ? " (guard handles reentrancy, no lock bypass needed)" : "",
              addrs.settop == 0 ? " [step4-cleanup DISABLED: no live settop]" : "");
+
+    // ═══════════════════════════════════════════════════════════════
+    // DRY-RUN VALIDATION: Send minimal bytecode through the mailbox
+    // and verify the trampoline completes all steps. This catches:
+    // - lua_lock hook where rdi ≠ lua_State* (deadlock at step 1)
+    // - Wrong lua_newthread/luau_load/lua_resume (crash/deadlock)
+    // - Mutex corruption from hooking the wrong function
+    //
+    // The test bytecode is "return" compiled to Luau bytecode.
+    // If step stalls at 1, the hook target is fundamentally broken
+    // and we must fail immediately rather than let the user discover
+    // it at script-execution time.
+    // ═══════════════════════════════════════════════════════════════
+    {
+        LOG_INFO("[direct-hook] dry-run validation — sending test bytecode");
+
+        size_t test_bc_len = 0;
+        const char* test_src = "return";
+        char* test_bc = luau_compile(test_src, strlen(test_src),
+                                      nullptr, &test_bc_len);
+        bool dryrun_pass = false;
+
+        if (test_bc && test_bc_len > 0 &&
+            static_cast<uint8_t>(test_bc[0]) != 0 &&
+            test_bc_len <= 16320) {
+
+            uint64_t test_seq = 0, test_ack = 0;
+            proc_mem_read(pid, dhook_.mailbox_addr + 16, &test_seq, 8);
+            proc_mem_read(pid, dhook_.mailbox_addr + 24, &test_ack, 8);
+
+            if (test_seq <= test_ack) {
+                proc_mem_write(pid, dhook_.mailbox_addr + 64,
+                               test_bc, test_bc_len);
+                uint32_t tsz = static_cast<uint32_t>(test_bc_len);
+                uint32_t tflags = 1;
+                proc_mem_write(pid, dhook_.mailbox_addr + 32, &tsz, 4);
+                proc_mem_write(pid, dhook_.mailbox_addr + 36, &tflags, 4);
+                uint32_t zero32 = 0;
+                proc_mem_write(pid, dhook_.mailbox_addr + 44, &zero32, 4);
+                uint8_t zero8 = 0;
+                proc_mem_write(pid, dhook_.mailbox_addr + 40, &zero8, 1);
+                uint16_t zero16 = 0;
+                proc_mem_write(pid, dhook_.mailbox_addr + 42, &zero16, 2);
+
+                uint64_t arm_seq = test_seq + 1;
+                proc_mem_write(pid, dhook_.mailbox_addr + 16, &arm_seq, 8);
+
+                LOG_DEBUG("[direct-hook] dry-run armed: seq={}", arm_seq);
+
+                for (int di = 0; di < 60; di++) {
+                    usleep(50000);
+                    if (kill(pid, 0) != 0) {
+                        LOG_ERROR("[direct-hook] dry-run: process died");
+                        break;
+                    }
+                    uint64_t dr_ack = 0;
+                    proc_mem_read(pid, dhook_.mailbox_addr + 24,
+                                  &dr_ack, 8);
+                    if (dr_ack >= arm_seq) {
+                        dryrun_pass = true;
+                        LOG_INFO("[direct-hook] dry-run PASSED — "
+                                 "trampoline completed successfully "
+                                 "in {}ms", (di + 1) * 50);
+                        break;
+                    }
+                    if (di == 40) {
+                        uint32_t dr_step = 0;
+                        proc_mem_read(pid, dhook_.mailbox_addr + 44,
+                                      &dr_step, 4);
+                        uint8_t dr_guard = 0;
+                        proc_mem_read(pid, dhook_.mailbox_addr + 40,
+                                      &dr_guard, 1);
+                        if (dr_step == 1 && dr_guard == 1) {
+                            LOG_ERROR("[direct-hook] dry-run FAILED — "
+                                      "deadlock at step 1 "
+                                      "(lua_newthread). Hook target "
+                                      "passes wrong rdi type. "
+                                      "Unhooking immediately.");
+                            break;
+                        }
+                    }
+                }
+            } else {
+                LOG_WARN("[direct-hook] dry-run skipped: mailbox busy "
+                         "(seq={} ack={})", test_seq, test_ack);
+                dryrun_pass = true;
+            }
+        } else {
+            LOG_WARN("[direct-hook] dry-run skipped: test compile failed");
+            dryrun_pass = true;
+        }
+        free(test_bc);
+
+        if (!dryrun_pass) {
+            LOG_ERROR("[direct-hook] dry-run validation FAILED — "
+                      "cleaning up hook and reporting failure");
+
+            proc_mem_write(pid, hook_addr, prologue, steal);
+            usleep(50000);
+
+            uint32_t reset_step = 0;
+            uint8_t reset_guard = 0;
+            proc_mem_write(pid, dhook_.mailbox_addr + 44,
+                           &reset_step, 4);
+            proc_mem_write(pid, dhook_.mailbox_addr + 40,
+                           &reset_guard, 1);
+
+            DirectMailbox empty_mb{};
+            proc_mem_write(pid, dhook_.mailbox_addr, &empty_mb,
+                           sizeof(DirectMailbox));
+
+            dhook_ = {};
+
+            error_ = "Direct hook dry-run failed — trampoline "
+                     "deadlocked at lua_newthread (step 1). "
+                     "The hook target likely passes "
+                     "global_State* instead of lua_State* in rdi.";
+            set_state(InjectionState::Failed, error_);
+            return false;
+        }
+    }
+
     set_state(InjectionState::Ready, "Direct hook active — ready for scripts");
     return true;
 }
@@ -5554,13 +5694,41 @@ void Injection::cleanup_direct_hook() {
     if (!dhook_.active) return;
     pid_t pid = memory_.get_pid();
     if (pid > 0 && kill(pid, 0) == 0) {
-        uintptr_t hook_addr = dhook_.settop_addr ? dhook_.settop_addr : dhook_.resume_addr;
-        if (hook_addr && dhook_.stolen_len > 0) {
-            proc_mem_write(pid, hook_addr,
-                           dhook_.stolen_bytes, dhook_.stolen_len);
+        // dhook_.settop_addr stores whichever function was actually
+        // patched with the JMP — this may be lua_settop, lua_lock,
+        // lua_resume, or whichever target was selected by the hook
+        // cascade. We must restore THAT function's prologue.
+        uintptr_t hooked_addr = dhook_.settop_addr;
+        if (!hooked_addr) {
+            // Fallback: if settop_addr is 0 (shouldn't happen when
+            // active), try the lock address or resume address.
+            if (dhook_.hook_is_lock_fn && dhook_.active_lock_addr)
+                hooked_addr = dhook_.active_lock_addr;
+            else if (dhook_.resume_addr)
+                hooked_addr = dhook_.resume_addr;
         }
+        if (hooked_addr && dhook_.stolen_len > 0) {
+            if (!proc_mem_write(pid, hooked_addr,
+                                dhook_.stolen_bytes, dhook_.stolen_len)) {
+                LOG_ERROR("[direct-hook] cleanup: failed to restore "
+                          "prologue at 0x{:X} — target may crash",
+                          hooked_addr);
+            } else {
+                LOG_DEBUG("[direct-hook] cleanup: restored {} bytes at "
+                          "0x{:X}", dhook_.stolen_len, hooked_addr);
+            }
+        }
+        // Clear the mailbox to prevent stale data from triggering
+        // the trampoline if the cave memory is reused.
         DirectMailbox mb{};
         proc_mem_write(pid, dhook_.mailbox_addr, &mb, sizeof(DirectMailbox));
+
+        // Zero out the code cave to prevent dangling shellcode.
+        if (dhook_.cave_addr && dhook_.cave_size > 0) {
+            std::vector<uint8_t> zeros(dhook_.cave_size, 0xCC);
+            proc_mem_write(pid, dhook_.cave_addr, zeros.data(),
+                           zeros.size());
+        }
     }
     dhook_ = {};
     LOG_INFO("[direct-hook] cleaned up");
@@ -5596,8 +5764,8 @@ uint64_t Injection::send_via_mailbox(const void* data, size_t len, uint32_t flag
     proc_mem_write(pid, dhook_.mailbox_addr + 44, &zero_step, 4);
     uint8_t zero_guard = 0;
     proc_mem_write(pid, dhook_.mailbox_addr + 40, &zero_guard, 1);
-    uint8_t zero_hit = 0;
-    proc_mem_write(pid, dhook_.mailbox_addr + 41, &zero_hit, 1);
+    uint16_t zero_hit = 0;
+    proc_mem_write(pid, dhook_.mailbox_addr + 42, &zero_hit, 2);
 
     uint64_t new_seq = seq + 1;
     if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) {
@@ -5614,8 +5782,8 @@ bool Injection::wait_for_mailbox_ack(uint64_t armed_seq, size_t bc_len, uint8_t 
     pid_t mpid = memory_.get_pid();
     if (mpid <= 0) return false;
 
-    uint8_t pre_hits = 0;
-    proc_mem_read(mpid, dhook_.mailbox_addr + 41, &pre_hits, 1);
+    uint16_t pre_hits = 0;
+    proc_mem_read(mpid, dhook_.mailbox_addr + 42, &pre_hits, 2);
     LOG_INFO("[direct-hook] dispatch: armed_seq={} pre_hits={} "
              "— entering 5s wait loop", armed_seq, pre_hits);
 
@@ -5632,8 +5800,8 @@ bool Injection::wait_for_mailbox_ack(uint64_t armed_seq, size_t bc_len, uint8_t 
         proc_mem_read(mpid, dhook_.mailbox_addr + 44, &step, 4);
         uint8_t guard = 0;
         proc_mem_read(mpid, dhook_.mailbox_addr + 40, &guard, 1);
-        uint8_t hits = 0;
-        proc_mem_read(mpid, dhook_.mailbox_addr + 41, &hits, 1);
+        uint16_t hits = 0;
+        proc_mem_read(mpid, dhook_.mailbox_addr + 42, &hits, 2);
 
         if (cur_ack >= armed_seq) {
             LOG_INFO("[direct-hook] execution confirmed: ack={} "
@@ -5661,11 +5829,11 @@ bool Injection::wait_for_mailbox_ack(uint64_t armed_seq, size_t bc_len, uint8_t 
 
     uint32_t final_step = 0;
     uint8_t final_guard = 0;
-    uint8_t final_hits = 0;
+    uint16_t final_hits = 0;
     uint64_t final_ack = 0;
     proc_mem_read(mpid, dhook_.mailbox_addr + 44, &final_step, 4);
     proc_mem_read(mpid, dhook_.mailbox_addr + 40, &final_guard, 1);
-    proc_mem_read(mpid, dhook_.mailbox_addr + 41, &final_hits, 1);
+    proc_mem_read(mpid, dhook_.mailbox_addr + 42, &final_hits, 2);
     proc_mem_read(mpid, dhook_.mailbox_addr + 24, &final_ack, 8);
 
     uint64_t verify_seq = 0;
@@ -6198,6 +6366,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
