@@ -89,6 +89,7 @@ public:
 
     Memory& memory() { return memory_; }
     uint64_t send_via_mailbox(const void* data, size_t len, uint32_t flags);
+    bool wait_for_mailbox_ack(uint64_t armed_seq, size_t bc_len, uint8_t bc_ver);
     bool is_direct_hook() const { return dhook_.active; }
 
 private:
@@ -224,6 +225,7 @@ private:
 };
 
 }
+
 
 
 
