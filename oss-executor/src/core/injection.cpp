@@ -4837,8 +4837,10 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         proc_mem_write(pid, mb_addr + 41, &zh, 1);
         usleep(1000000);
         uint8_t hits = 0;
-        proc_mem_read(pid, mb_addr + 41, &hits, 1);
-
+        proc_mem_read(mpid, dhook_.mailbox_addr + 41, &hits, 1);
+        // ...
+        // after loop failure:
+    proc_mem_read(mpid, dhook_.mailbox_addr + 24, &post_ack, 8); // fresh read
         if (hits < 10) {
             LOG_WARN("[direct-hook] {} at 0x{:X} has only {} hits in 1000ms "
                      "(need ≥10) — likely dead/stale code", name, target, hits);
@@ -5006,9 +5008,20 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     if (is_lock_hook) {
         dhook_.active_lock_addr = hook_addr;
         dhook_.real_settop_addr = addrs.settop;
+        int64_t st_resume_dist = static_cast<int64_t>(addrs.settop) -
+                                 static_cast<int64_t>(addrs.resume);
+        if (st_resume_dist < 0) st_resume_dist = -st_resume_dist;
         LOG_INFO("[direct-hook] lock hook: active_lock=0x{:X} real_settop=0x{:X} "
+                 "({:.1f}MB from lua_resume) "
                  "(re-entrant calls execute real lua_lock — no unlock bypass needed)",
-                 hook_addr, addrs.settop);
+                 hook_addr, addrs.settop,
+                 st_resume_dist / (1024.0 * 1024.0));
+        if (static_cast<uint64_t>(st_resume_dist) > 0x5000000ULL) {
+            LOG_ERROR("[direct-hook] WARNING: lua_settop is {:.0f}MB from "
+                      "lua_resume — likely dead copy! Step 4 cleanup may "
+                      "deadlock or crash. The trampoline will still attempt "
+                      "steps 1-3.", st_resume_dist / (1024.0 * 1024.0));
+        }
     }
 
     LOG_INFO("[direct-hook] ENTRY HOOK ARMED — {} at 0x{:X}, cave at 0x{:X}, mailbox at 0x{:X}{}",
@@ -5399,15 +5412,16 @@ bool Injection::execute_script(const std::string& source) {
                     executed = true;
                     break;
                 }
-                if (step > 0 && i % 10 == 0) {
-                    LOG_DEBUG("[direct-hook] in progress: step={} guard={} "
-                              "ack={} seq={}", step, guard, post_ack, post_seq);
+                if (i % 10 == 0) {
+                    LOG_DEBUG("[direct-hook] waiting: step={} guard={} hits={} "
+                              "ack={} seq={}", step, guard, hits, post_ack, post_seq);
                 }
             }
 
             if (executed) {
                 set_state(InjectionState::Ready, "Script executed in Roblox");
-            } else {
+                return true;   // ← EXPLICIT early return
+            }
                 uint32_t final_step = 0;
                 uint8_t final_guard = 0;
                 uint8_t final_hits = 0;
@@ -5629,6 +5643,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
