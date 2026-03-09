@@ -3489,6 +3489,33 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             }
         }
     }
+
+    
+    // ═══════════════════════════════════════════════════════════════
+    // Extract active lua_lock from the confirmed-active lua_settop.
+    // lua_settop's first CALL is always lua_lock (Luau API contract).
+    // ═══════════════════════════════════════════════════════════════
+    uintptr_t active_lock = 0;
+    if (out.settop) {
+        uint8_t stbuf[40];
+        struct iovec stl = {stbuf, 40};
+        struct iovec str = {reinterpret_cast<void*>(out.settop), 40};
+        if (process_vm_readv(pid, &stl, 1, &str, 1, 0) == 40) {
+            for (int i = 0; i < 35; i++) {
+                if (stbuf[i] == 0xE8) {
+                    int32_t d; memcpy(&d, &stbuf[i+1], 4);
+                    active_lock = out.settop + i + 5 + static_cast<int64_t>(d);
+                    LOG_INFO("[direct-hook] active_lock extracted from lua_settop: 0x{:X}", active_lock);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (active_lock && !out.lock_fn) {
+        out.lock_fn = active_lock;
+        LOG_INFO("[direct-hook] lock_fn set to active_lock 0x{:X} (safety net)", active_lock);
+    }
         // ═══════════════════════════════════════════════════════════════
     // Validate luau_load calls active_lock.
     // luau_load is a Lua C API function — it MUST call lua_lock.
@@ -5469,6 +5496,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
