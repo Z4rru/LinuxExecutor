@@ -5060,11 +5060,11 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
             if (buf[i] != 0xC3) continue;
             uint8_t next = buf[i + 1];
                 if (next == 0xCC || next == 0x90 || next == 0x55 || next == 0x53 ||
-                    next == 0x56 || next == 0x57 || next == 0xF3 || next == 0x00 ||
-                    (next == 0x41 && i + 2 < scan_size &&
-                     buf[i+2] >= 0x50 && buf[i+2] <= 0x57) ||
-                    (next == 0x48 && i + 2 < scan_size && buf[i+2] == 0x83 &&
-                     i + 3 < scan_size && buf[i+3] == 0xEC)) {
+                        next == 0x56 || next == 0x57 || next == 0xF3 || next == 0x00 ||
+                        (next == 0x41 && i + 2 < scan_range &&
+                         buf[i+2] >= 0x50 && buf[i+2] <= 0x57) ||
+                        (next == 0x48 && i + 2 < scan_range && buf[i+2] == 0x83 &&
+                         i + 3 < scan_range && buf[i+3] == 0xEC)) {
                 func_end = i + 1;
                 break;
             }
@@ -6165,6 +6165,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
