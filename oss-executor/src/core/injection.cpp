@@ -5759,9 +5759,7 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // and one extra slot per script execution is negligible vs LUAI_MAXSTACK.
     size_t settop_label = c.size();
     e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00});
-    } else {
-        e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00}); // step 4 skipped
-    }
+  
 
        // === Re-acquire Lua global lock after API calls ===
     // The hooked function's caller expects the lock to be held.
@@ -8021,6 +8019,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
