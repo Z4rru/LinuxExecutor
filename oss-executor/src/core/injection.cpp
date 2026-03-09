@@ -4516,8 +4516,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 template<typename AddrsType>
 static std::vector<uint8_t> gen_entry_trampoline(
     const AddrsType& a, uintptr_t mailbox_addr, uintptr_t cave_addr,
-    uintptr_t hook_target, const uint8_t* stolen, size_t stolen_len,
-    bool is_lock_hook = false)
+    uintptr_t hook_target, const uint8_t* stolen, size_t stolen_len)
 {
     std::vector<uint8_t> c;
     c.reserve(512);
@@ -4655,27 +4654,30 @@ static std::vector<uint8_t> gen_entry_trampoline(
     uintptr_t chunk_abs = cave_addr + chunk_name_label;
     memcpy(&c[chunk_movabs + 2], &chunk_abs, 8);
 
-    // === Reentrant-RET path for lua_lock hooks ===
-    // When hooked on lua_lock and guard != 0 (re-entrant call from
-    // inside the payload), we must NOT execute the real lua_lock —
-    // the mutex is non-recursive and would deadlock.  Just restore
-    // registers and RET, making the re-entrant lua_lock a no-op.
-    // The paired lua_unlock calls are redirected to a NOP stub by
-    // send_via_mailbox, so lock/unlock are both no-ops during payload.
-    if (is_lock_hook) {
-        size_t reentrant_label = c.size();
-        // Restore stack and all registers (same sequence as skip_label)
-        e({0x48,0x89,0xEC}); e8(0x5D); // mov rsp, rbp; pop rbp
-        e({0x41,0x5F}); e({0x41,0x5E}); e8(0x5B);       // pop r15, r14, rbx
-        e({0x41,0x5B}); e({0x41,0x5A}); e({0x41,0x59}); e({0x41,0x58}); // pop r11-r8
-        e8(0x5F); e8(0x5E); e8(0x5A); e8(0x59); e8(0x58); // pop rdi,rsi,rdx,rcx,rax
-        e8(0x9D); // popfq
-        e8(0xC3); // RET — skip lua_lock entirely, return to caller
-
-        patch_j(j_guard + 2, reentrant_label);
-    } else {
-        patch_j(j_guard + 2, skip_label);
-    }
+        // === Re-entrant path for ALL hooks (including lua_lock) ===
+    //
+    // Previous design: when hooked on lua_lock and guard != 0,
+    // the re-entrant lua_lock call was made a no-op via RET.
+    // This FAILS when lua_unlock is inlined by the compiler —
+    // the inline unlock still executes, releasing a mutex that
+    // was never acquired, causing deadlock at step 2.
+    //
+    // Fixed design: re-entrant lua_lock calls execute NORMALLY.
+    // The trampoline intercepted lua_lock BEFORE the mutex was
+    // acquired. Each internal API call (lua_newthread, luau_load,
+    // lua_resume, lua_settop) acquires the lock via its own
+    // lua_lock call, does work, then releases via inline unlock.
+    // This works correctly even with non-recursive mutexes:
+    //
+    //   trampoline entry: lock NOT held (intercepted at prologue)
+    //   lua_newthread → lua_lock(acquire) → work → unlock(release)
+    //   luau_load     → lua_lock(acquire) → work → unlock(release)
+    //   lua_resume    → lua_lock(acquire) → work → unlock(release)
+    //   lua_settop    → lua_lock(acquire) → work → unlock(release)
+    //   stolen bytes  → real lua_lock body → acquire for original caller
+    //
+    // No unlock bypass is needed AT ALL.
+    patch_j(j_guard + 2, skip_label);
 
     // NOP stub — single RET used as CALL redirect target by
     // send_via_mailbox to no-op lua_unlock during payload execution.
@@ -4801,15 +4803,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
              cave.padding_start, cave.padding_size);
 
     uintptr_t hook_addr = addrs.settop;
-    bool is_lock_hook = false;
+    bool is_lock_hook = false;  // tracks which function is hooked (for cleanup)
     size_t patch_len = 0;
     uint8_t patch[16] = {};
 
     auto try_hook_target = [&](uintptr_t target, const char* name,
-                                uint8_t* pro, size_t st,
-                                bool lock_hook = false) -> bool {
+                                uint8_t* pro, size_t st) -> bool {
         auto t = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
-                                       target, pro, st, lock_hook);
+                                       target, pro, st);
         LOG_INFO("[direct-hook] {} trampoline: {} bytes", name, t.size());
         if (t.size() > 400) return false;
         if (!proc_mem_write(pid, cave.padding_start, t.data(), t.size())) return false;
@@ -4884,7 +4885,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                     LOG_INFO("[direct-hook] lua_lock prologue: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} (steal={})",
                              lock_pro[0], lock_pro[1], lock_pro[2], lock_pro[3],
                              lock_pro[4], lock_pro[5], lock_pro[6], lock_pro[7], lock_steal);
-                    if (try_hook_target(addrs.lock_fn, "lua_lock", lock_pro, lock_steal, true)) {
+                    if (try_hook_target(addrs.lock_fn, "lua_lock", lock_pro, lock_steal)) {
 
                         hook_addr = addrs.lock_fn;
                         is_lock_hook = true;
@@ -4990,7 +4991,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
      // Compute NOP stub address: always the last byte of the trampoline
     {
         auto t_measure = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
-                                               hook_addr, prologue, steal, is_lock_hook);
+                                               hook_addr, prologue, steal);
         dhook_.nop_stub_addr = cave.padding_start + t_measure.size() - 1;
     }
     dhook_.active = true;
@@ -4998,15 +4999,10 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     dhook_.hook_is_lock_fn = is_lock_hook;
     if (is_lock_hook) {
         dhook_.active_lock_addr = hook_addr;
-        dhook_.active_unlock_addr = addrs.unlock_fn;
         dhook_.real_settop_addr = addrs.settop;
-        if (!addrs.unlock_fn) {
-            LOG_WARN("[direct-hook] active_unlock not found during symbol "
-                     "resolution — lock redirects may fail");
-        }
-        LOG_INFO("[direct-hook] lock hook addrs: active_lock=0x{:X} "
-                 "active_unlock=0x{:X} real_settop=0x{:X}",
-                 hook_addr, addrs.unlock_fn, addrs.settop);
+        LOG_INFO("[direct-hook] lock hook: active_lock=0x{:X} real_settop=0x{:X} "
+                 "(re-entrant calls execute real lua_lock — no unlock bypass needed)",
+                 hook_addr, addrs.settop);
     }
 
     LOG_INFO("[direct-hook] ENTRY HOOK ARMED — {} at 0x{:X}, cave at 0x{:X}, mailbox at 0x{:X}{}",
@@ -5066,660 +5062,22 @@ bool Injection::send_via_mailbox(const void* data, size_t len, uint32_t flags) {
     uint8_t zero_hit = 0;
     proc_mem_write(pid, dhook_.mailbox_addr + 41, &zero_hit, 1);  // reset hit counter
 
-    struct LockPatch { uintptr_t addr; uint8_t saved; };
-    std::vector<LockPatch> lock_patches;
-    struct CallRedirect { uintptr_t addr; int32_t orig; };
-    std::vector<CallRedirect> call_redirects;
-    bool lock_bypassed = false;
-    // dhook_.settop_addr stores the actual hook target (may be lua_resume,
-    // lua_settop, or lua_lock depending on which succeeded). Its prologue
-    // is patched with a JMP — scanning it for CALL instructions finds garbage.
-    uintptr_t hook_target_addr = dhook_.settop_addr;
-
-    auto bypass_locks_in = [&](uintptr_t fn_addr, int first_range, int scan_range, const char* name) {
-        if (!fn_addr) return;
-        // Skip the hooked function — its prologue is overwritten with JMP,
-        // so CALL scanning would find false positives or miss the real lock
-        if (fn_addr == hook_target_addr) {
-            LOG_DEBUG("[direct-hook] skipping lock bypass for {} at 0x{:X} (hook target)", name, fn_addr);
-            return;
-        }
-        std::vector<uint8_t> buf(scan_range);
-        if (!proc_mem_read(pid, fn_addr, buf.data(), scan_range)) return;
-        // Detect function boundary to prevent scanning into adjacent functions.
-        // Without this, scan_range=800 for a 579-byte function finds the "unlock"
-        // CALL in a neighboring function, and patching it with RET corrupts that code.
-        // Looks for RET followed by boundary marker (padding, new prologue, etc.)
-        // to skip early-exit RETs within the function body.
-        int func_end = scan_range;
-        for (int i = 25; i < scan_range - 1; i++) {
-            if (buf[i] != 0xC3) continue;
-            uint8_t next = buf[i + 1];
-                if (next == 0xCC || next == 0x90 || next == 0x55 || next == 0x53 ||
-                        next == 0x56 || next == 0x57 || next == 0xF3 || next == 0x00 ||
-                        (next == 0x41 && i + 2 < scan_range &&
-                         buf[i+2] >= 0x50 && buf[i+2] <= 0x57) ||
-                        (next == 0x48 && i + 2 < scan_range && buf[i+2] == 0x83 &&
-                         i + 3 < scan_range && buf[i+3] == 0xEC)) {
-                func_end = i + 1;
-                break;
-            }
-        }
-        uintptr_t targets[2] = {0, 0};
-        for (int i = 0; i < std::min(first_range, func_end - 4); i++) {
-            if (buf[i] == 0xE8) {
-                int32_t d; memcpy(&d, &buf[i+1], 4);
-                targets[0] = fn_addr + i + 5 + (int64_t)d;
-                break;
-            }
-        }
-        for (int i = func_end - 5; i >= 20; i--) {
-            if (buf[i] == 0xE8) {
-                int32_t d; memcpy(&d, &buf[i+1], 4);
-                targets[1] = fn_addr + i + 5 + (int64_t)d;
-                break;
-            }
-        }
-        // Require BOTH lock and unlock found — partial bypass causes deadlock
-        // (lock acquired but never released → all threads freeze)
-        if (!targets[0] || !targets[1]) {
-            LOG_WARN("[direct-hook] {}: only found {} — skipping bypass to avoid deadlock",
-                     name, targets[0] ? "lock only" : (targets[1] ? "unlock only" : "neither"));
-            return;
-        }
-        if (targets[0] == targets[1]) {
-            LOG_WARN("[direct-hook] {} lock==unlock at 0x{:X} — false positive, skipping", name, targets[0]);
-            return;
-        }
-        for (int t = 0; t < 2; t++) {
-            bool dup = false;
-            for (auto& p : lock_patches) if (p.addr == targets[t]) { dup = true; break; }
-            if (dup) continue;
-            LockPatch lp{targets[t], 0};
-            proc_mem_read(pid, lp.addr, &lp.saved, 1);
-            uint8_t ret = 0xC3;
-            if (proc_mem_write(pid, lp.addr, &ret, 1)) {
-                lock_patches.push_back(lp);
-                lock_bypassed = true;
-                LOG_INFO("[direct-hook] bypassed {}:{} at 0x{:X} (saved 0x{:02X})",
-                         name, t == 0 ? "lock" : "unlock", lp.addr, lp.saved);
-            }
-        }
-    };
-
-        // Lock bypass is only needed when hook target is inside a lock scope.
-    // lua_settop is called by Roblox while the Lua mutex is held — without
-    // bypass, our internal API calls (newthread/load/resume) would deadlock.
-    // lua_resume/newthread/load are called from OUTSIDE the lock scope — each
-    // API call acquires/releases its own lock safely.  Bypassing locks when
-    // hooking these functions patches unrelated code with RET, corrupting
-    // internal state and causing luau_load to hang at step 2.
-        // Lock bypass is needed when hook target is inside a Lua lock scope.
-    // lua_settop: called by Roblox while Lua mutex is held → bypass needed.
-    // lua_lock: the hook IS on the lock itself → handled by guard-RET +
-    //           global unlock patch (Cluster 1), no legacy bypass needed.
-    // lua_resume/newthread/load: called from OUTSIDE the lock scope → each
-    //           API call acquires/releases its own lock safely.
-    // Compare against all known function addresses to detect the hook target.
-    bool hook_is_api_entry = (dhook_.settop_addr == dhook_.resume_addr ||
-                              dhook_.settop_addr == dhook_.newthread_addr ||
-                              dhook_.settop_addr == dhook_.load_addr);
-    bool hook_needs_lock_bypass = !dhook_.hook_is_lock_fn &&
-                                  !hook_is_api_entry;
-
-    if (hook_needs_lock_bypass) {
-        // Bypass locks in functions the trampoline calls internally.
-        // The hook target itself is skipped by the lambda (prologue is patched).
-        bypass_locks_in(dhook_.newthread_addr, 18, 200, "newthread");
-        bypass_locks_in(dhook_.load_addr, 300, 800, "luau_load");
-        bypass_locks_in(dhook_.resume_addr, 80, 500, "lua_resume");
-
-              // Deep lock bypass: scan function bodies for CALL instructions
-        // targeting lock-like functions. Rejects self-calls and calls
-        // within the scanned function body to prevent false positives
-        // (e.g. recursive calls that pass is_lock_like because the
-        // function itself starts with push rbp and contains RET).
-        auto deep_bypass_fn = [&](uintptr_t fn_addr, size_t scan_size,
-                                   const char* name) {
-            if (!fn_addr || fn_addr == hook_target_addr) return;
-            for (auto& p : lock_patches) {
-                int64_t dist = static_cast<int64_t>(p.addr) -
-                               static_cast<int64_t>(fn_addr);
-                if (dist > -0x100000 && dist < 0x100000) return;
-            }
-            LOG_INFO("[direct-hook] deep-scanning {} at 0x{:X} ({} bytes)...",
-                     name, fn_addr, scan_size);
-            std::vector<uint8_t> buf(scan_size);
-            if (!proc_mem_read(pid, fn_addr, buf.data(), scan_size)) return;
-
-                        // Permissive lock function detector: accepts any readable target
-            // that is a short function (contains RET within 300 bytes).
-            // PLT stubs (FF 25) immediately accepted.  Only rejects self-calls,
-            // unreadable targets, and obvious garbage (null bytes, INT3, NOP, bare RET).
-            auto is_lock_like = [&](uintptr_t addr) -> bool {
-                if (addr >= fn_addr && addr < fn_addr + scan_size) return false;
-                uint8_t fb[300] = {};
-                if (!proc_mem_read(pid, addr, fb, sizeof(fb))) return false;
-                size_t s = 0;
-                if (fb[0]==0xF3&&fb[1]==0x0F&&fb[2]==0x1E&&fb[3]==0xFA) s=4;
-                uint8_t b0 = fb[s];
-                if (b0==0x00||b0==0xCC||b0==0x90||b0==0xC3) return false;
-                // PLT stub: jmp qword ptr [rip+disp32]
-                if (b0==0xFF && s+1<sizeof(fb) && fb[s+1]==0x25) return true;
-                // Accept ANY prologue style (push, mov, xor, lock prefix, sub, etc.)
-                // as long as the function contains RET within 300 bytes
-                for (size_t j = s; j < sizeof(fb); j++)
-                    if (fb[j] == 0xC3) return true;
-                return false;
-            };
-
-            // For small scan sizes (e.g. lua_settop ~65B scanned as 100),
-            // estimate function boundary to avoid scanning into adjacent functions.
-            // Uses first RET after offset 20 as the boundary.
-                        // Detect function boundary for ALL scan sizes.
-            // Without this, deep scans of 1500 bytes for a 579-byte function
-            // find lock/unlock calls in adjacent functions, causing false RET patches.
-            // Uses RET+boundary-marker to skip early-exit RETs within the function.
-            size_t effective_end = scan_size;
-            for (size_t i = 25; i < scan_size - 1; i++) {
-                if (buf[i] != 0xC3) continue;
-                uint8_t next = buf[i + 1];
-                if (next == 0xCC || next == 0x90 || next == 0x55 || next == 0x53 ||
-                    next == 0xF3 || next == 0x00 ||
-                    (next == 0x41 && i + 2 < scan_size &&
-                     buf[i+2] >= 0x54 && buf[i+2] <= 0x57)) {
-                    effective_end = i + 1;
-                    break;
-                }
-            }
-            if (effective_end < scan_size) {
-                LOG_DEBUG("[direct-hook] {} effective boundary: {}/{} bytes",
-                          name, effective_end, scan_size);
-            }
-
-            uintptr_t lock_a = 0, unlock_a = 0;
-            int lock_off = -1, unlock_off = -1;
-            for (size_t i = 0; i+5 <= effective_end; i++) {
-                if (buf[i] != 0xE8) continue;
-                int32_t d; memcpy(&d, &buf[i+1], 4);
-                uintptr_t t = fn_addr+i+5+static_cast<int64_t>(d);
-                if (!is_lock_like(t)) continue;
-                lock_a = t; lock_off = static_cast<int>(i); break;
-            }
-            for (int i = static_cast<int>(effective_end)-5; i >= 20; i--) {
-                if (buf[i] != 0xE8) continue;
-                int32_t d; memcpy(&d, &buf[i+1], 4);
-                uintptr_t t = fn_addr+i+5+static_cast<int64_t>(d);
-                if (!is_lock_like(t)) continue;
-                unlock_a = t; unlock_off = i; break;
-            }
-            if (!lock_a || !unlock_a || lock_a == unlock_a) {
-                LOG_WARN("[direct-hook] {} deep scan: lock={}@{} unlock={}@{} "
-                         "(scanned {}/{} bytes)",
-                         name, lock_a?"found":"miss", lock_off,
-                         unlock_a?"found":"miss", unlock_off,
-                         effective_end, scan_size);
-                return;
-            }
-            uintptr_t ta[2] = {lock_a, unlock_a};
-            int to[2] = {lock_off, unlock_off};
-            for (int ti = 0; ti < 2; ti++) {
-                bool dup = false;
-                for (auto& p : lock_patches)
-                    if (p.addr == ta[ti]) { dup = true; break; }
-                if (dup) continue;
-                LockPatch lp{ta[ti], 0};
-                proc_mem_read(pid, lp.addr, &lp.saved, 1);
-                uint8_t rb = 0xC3;
-                if (proc_mem_write(pid, lp.addr, &rb, 1)) {
-                    lock_patches.push_back(lp);
-                    lock_bypassed = true;
-                    LOG_INFO("[direct-hook] bypassed {}:{} at 0x{:X} (deep, off={})",
-                             name, ti==0?"lock":"unlock", ta[ti], to[ti]);
-                }
-            }
-        };
-
-        deep_bypass_fn(dhook_.load_addr, 1500, "luau_load");
-
-        // Also bypass lua_settop's lock — the trampoline calls it at step 4.
-        // Extract the real settop address from the cave trampoline by scanning
-        // for: BE FE FF FF FF 48 B8 <8 bytes> (mov esi,-2; mov rax,<settop>)
-        {
-            uintptr_t real_settop = 0;
-            uint8_t cave_buf[400] = {};
-            if (dhook_.cave_addr &&
-                proc_mem_read(pid, dhook_.cave_addr, cave_buf, sizeof(cave_buf))) {
-                for (size_t ci = 0; ci+15 < sizeof(cave_buf); ci++) {
-                    if (cave_buf[ci]==0xBE && cave_buf[ci+1]==0xFE &&
-                        cave_buf[ci+2]==0xFF && cave_buf[ci+3]==0xFF &&
-                        cave_buf[ci+4]==0xFF && cave_buf[ci+5]==0x48 &&
-                        cave_buf[ci+6]==0xB8) {
-                        memcpy(&real_settop, &cave_buf[ci+7], 8);
-                        LOG_INFO("[direct-hook] extracted real lua_settop=0x{:X} "
-                                 "from cave", real_settop);
-                        break;
-                    }
-                }
-            }
-            if (real_settop && real_settop != hook_target_addr) {
-                bypass_locks_in(real_settop, 30, 80, "lua_settop");
-                deep_bypass_fn(real_settop, 100, "lua_settop");
-            }
-        }
-    } else if (dhook_.hook_is_lock_fn) {
-        // ═══════════════════════════════════════════════════════════
-        // lua_lock hook: the trampoline's guard-skip path now RETs
-        // immediately for re-entrant lua_lock calls (Cluster 2 fix),
-        // making every re-entrant lua_lock a no-op.  We must ALSO
-        // no-op the paired lua_unlock calls — otherwise lua_unlock
-        // tries to release a mutex never acquired, corrupting state.
-        //
-        // Strategy: redirect E8/E9 CALL instructions targeting
-        // active_unlock inside called functions to a NOP stub (C3)
-        // in the code cave.  lua_lock is handled by the guard;
-        // only lua_unlock needs CALL displacement patching.
-        // ═══════════════════════════════════════════════════════════
-        uintptr_t aul = dhook_.active_unlock_addr;
-        uintptr_t nop = dhook_.nop_stub_addr;
-
-        if (aul && nop) {
-            LOG_INFO("[direct-hook] lua_lock hook: globally bypassing "
-                     "active_unlock 0x{:X} + redirecting calls to NOP "
-                     "stub 0x{:X}", aul, nop);
-
-            // ═══════════════════════════════════════════════════════════
-            // GLOBAL BYPASS: patch active_unlock's first byte to RET.
-            //
-            // The CALL displacement redirect approach (below) only patches
-            // direct E8/E9 instructions found inside scanned top-level
-            // function bodies.  Sub-functions called by luau_load, etc.
-            // also call lua_unlock — those calls are MISSED, causing
-            // unlock to execute on a mutex never acquired (lua_lock is
-            // no-op'd by the trampoline guard-RET), which corrupts the
-            // mutex and hangs luau_load at step 2.
-            //
-            // Patching active_unlock itself to RET globally disables ALL
-            // unlock calls from ALL callers — matching the guard-RET
-            // behavior that lua_lock already has in the trampoline.
-            // ═══════════════════════════════════════════════════════════
-            {
-                LockPatch ul_global{aul, 0};
-                if (proc_mem_read(pid, aul, &ul_global.saved, 1)) {
-                    uint8_t ret_byte = 0xC3;
-                    if (proc_mem_write(pid, aul, &ret_byte, 1)) {
-                        lock_patches.push_back(ul_global);
-                        lock_bypassed = true;
-                        LOG_INFO("[direct-hook] GLOBAL: active_unlock 0x{:X} "
-                                 "patched to RET (saved 0x{:02X}) — all "
-                                 "unlock calls globally disabled", aul,
-                                 ul_global.saved);
-                    } else {
-                        LOG_WARN("[direct-hook] GLOBAL: failed to patch "
-                                 "active_unlock 0x{:X} — falling back to "
-                                 "CALL redirect only (may hang at step 2)",
-                                 aul);
-                    }
-                }
-            }
-
-            // Also patch active_lock itself with RET as a safety net.
-            // The trampoline guard-RET handles re-entrant calls, but
-            // sub-functions called from luau_load/lua_resume that call
-            // lua_lock through a DIFFERENT code path (PLT stub, GOT
-            // indirection, tail-call) may bypass the trampoline entirely.
-            // Direct RET patch ensures comprehensive lock neutralization.
-            {
-                uintptr_t alk = dhook_.active_lock_addr;
-                if (alk && alk == dhook_.settop_addr) {
-                    // active_lock IS the hook target — already intercepted
-                    // by the trampoline, no additional patch needed.
-                    LOG_DEBUG("[direct-hook] active_lock is hook target — "
-                              "trampoline guard-RET handles all calls");
-                } else if (alk) {
-                    // active_lock is NOT the hook target (e.g. hook is on
-                    // lua_settop and active_lock is a separate function).
-                    // This shouldn't happen when hook_is_lock_fn=true, but
-                    // guard against edge cases.
-                    LOG_DEBUG("[direct-hook] active_lock 0x{:X} is hook "
-                              "target — guard-RET path handles all calls",
-                              alk);
-                }
-            }
-
-            auto redirect_unlock_calls = [&](uintptr_t fn_addr,
-                                              size_t scan_size,
-                                              const char* name) {
-                if (!fn_addr || fn_addr == dhook_.settop_addr) return;
-                std::vector<uint8_t> buf(scan_size);
-                if (!proc_mem_read(pid, fn_addr, buf.data(), scan_size))
-                    return;
-
-                // Detect function boundary to avoid scanning into
-                // adjacent functions (RET + boundary marker pattern)
-                size_t fend = scan_size;
-                for (size_t i = 25; i + 1 < scan_size; i++) {
-                    if (buf[i] != 0xC3) continue;
-                    uint8_t nx = buf[i + 1];
-                    if (nx == 0xCC || nx == 0x90 || nx == 0x55 ||
-                        nx == 0x53 || nx == 0xF3 || nx == 0x00 ||
-                        (nx == 0x41 && i + 2 < scan_size &&
-                         buf[i + 2] >= 0x54 && buf[i + 2] <= 0x57)) {
-                        fend = i + 1;
-                        break;
-                    }
-                }
-
-                int redirected = 0, lock_seen = 0;
-                for (size_t i = 0; i + 5 <= fend; i++) {
-                    uint8_t op = buf[i];
-                    if (op != 0xE8 && op != 0xE9) continue;
-                    // Skip E9 in first 8 bytes (prologue JMP, not a call)
-                    if (op == 0xE9 && i < 8) continue;
-
-                    int32_t d;
-                    memcpy(&d, &buf[i + 1], 4);
-                    uintptr_t tgt = fn_addr + i + 5 +
-                                    static_cast<int64_t>(d);
-
-                    // Count lua_lock calls (handled by guard-RET, no
-                    // patching needed) for diagnostics
-                    if (tgt == dhook_.active_lock_addr) {
-                        lock_seen++;
-                        continue;
-                    }
-
-                    // Only redirect calls that target active_unlock
-                    if (tgt != aul) continue;
-
-                    // Compute new rel32 displacement to NOP stub
-                    int64_t nd = static_cast<int64_t>(nop) -
-                                 static_cast<int64_t>(fn_addr + i + 5);
-                    if (nd < INT32_MIN || nd > INT32_MAX) {
-                        LOG_WARN("[direct-hook]   {} unlock redirect out "
-                                 "of rel32 range (at +{}, {:02X})",
-                                 name, i, op);
-                        continue;
-                    }
-                    int32_t nd32 = static_cast<int32_t>(nd);
-                    uintptr_t patch_addr = fn_addr + i + 1;
-                    if (proc_mem_write(pid, patch_addr, &nd32, 4)) {
-                        call_redirects.push_back({patch_addr, d});
-                        lock_bypassed = true;
-                        redirected++;
-                        LOG_INFO("[direct-hook]   {} unlock: 0x{:X}→NOP "
-                                 "0x{:X} (at +{}, {:02X})",
-                                 name, tgt, nop, i, op);
-                    }
-                }
-
-                if (redirected == 0 && lock_seen == 0)
-                    LOG_DEBUG("[direct-hook]   {} no lock/unlock calls to "
-                              "active_lock/unlock (scanned {} bytes)",
-                              name, fend);
-                else
-                    LOG_INFO("[direct-hook]   {} done: {} lock calls "
-                             "(guard-RET'd), {} unlock calls redirected "
-                             "to NOP stub", name, lock_seen, redirected);
-            };
-
-            // Redirect unlock calls in every function the trampoline calls.
-            // lua_lock calls are NOT patched — the guard-RET path in the
-            // trampoline (Cluster 2) handles them transparently.
-            redirect_unlock_calls(dhook_.newthread_addr, 200,
-                                  "lua_newthread");
-            redirect_unlock_calls(dhook_.load_addr, 1500, "luau_load");
-            redirect_unlock_calls(dhook_.resume_addr, 600, "lua_resume");
-            if (dhook_.real_settop_addr &&
-                dhook_.real_settop_addr != dhook_.settop_addr)
-                redirect_unlock_calls(dhook_.real_settop_addr, 100,
-                                      "lua_settop");
-
-            if (!lock_bypassed)
-                LOG_INFO("[direct-hook] no unlock redirects needed — "
-                         "functions may not call active_unlock directly");
-        } else if (nop && !aul) {
-            LOG_ERROR("[direct-hook] CRITICAL: active_unlock=0x0 and NOP stub=0x{:X} — "
-                      "find_remote_luau_functions failed to extract unlock. "
-                      "luau_load WILL deadlock at step 2.", nop);
-            // ═══════════════════════════════════════════════════════════
-            // Dynamic lua_unlock discovery: extract from real_settop or
-            // other known Luau API functions at execution time.
-            // This fires when find_remote_luau_functions failed to
-            // populate unlock_fn (e.g., lua_settop body too short for
-            // boundary detection, or global-scan newthread had no unlock).
-            // ═══════════════════════════════════════════════════════════
-            LOG_WARN("[direct-hook] active_unlock=0x0 — attempting dynamic extraction");
-
-            // Try extracting from real_settop (lua_settop before hooking)
-            uintptr_t dyn_sources[] = {
-                dhook_.real_settop_addr,
-                dhook_.newthread_addr,
-                dhook_.resume_addr
-            };
-            const char* dyn_names[] = {"real_settop", "newthread", "resume"};
-            uintptr_t lock_addr = dhook_.active_lock_addr;
-
-            for (int di = 0; di < 3 && !aul; di++) {
-                uintptr_t src = dyn_sources[di];
-                if (!src || src == dhook_.settop_addr) continue;  // skip hook target
-
-                uint8_t dbuf[160];
-                if (!proc_mem_read(pid, src, dbuf, sizeof(dbuf))) continue;
-
-                // Detect function boundary
-                size_t dfend = sizeof(dbuf);
-                for (size_t fi = 25; fi + 1 < sizeof(dbuf); fi++) {
-                    if (dbuf[fi] != 0xC3) continue;
-                    uint8_t nx = dbuf[fi + 1];
-                    if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
-                        nx == 0xF3 || nx == 0x00 ||
-                        (nx == 0x41 && fi + 2 < sizeof(dbuf) &&
-                         dbuf[fi + 2] >= 0x54 && dbuf[fi + 2] <= 0x57)) {
-                        dfend = fi + 1;
-                        break;
-                    }
-                }
-
-                // Last CALL that isn't lua_lock = lua_unlock
-                for (int ci = static_cast<int>(dfend) - 5; ci >= 10; ci--) {
-                    if (dbuf[ci] != 0xE8) continue;
-                    int32_t d; memcpy(&d, &dbuf[ci + 1], 4);
-                    uintptr_t target = src + ci + 5 + static_cast<int64_t>(d);
-                    if (target == lock_addr) continue;
-                    aul = target;
-                    dhook_.active_unlock_addr = aul;
-                    LOG_INFO("[direct-hook] dynamic: active_unlock=0x{:X} "
-                             "(from {}+{}, boundary={})",
-                             aul, dyn_names[di], ci, dfend);
-                    break;
-                }
-            }
-
-            if (aul) {
-                // Apply the same global bypass that the normal path uses
-                LOG_INFO("[direct-hook] applying global unlock bypass with "
-                         "dynamically discovered active_unlock 0x{:X}", aul);
-
-                // Global RET patch on active_unlock
-                {
-                    LockPatch ul_global{aul, 0};
-                    if (proc_mem_read(pid, aul, &ul_global.saved, 1)) {
-                        uint8_t ret_byte = 0xC3;
-                        if (proc_mem_write(pid, aul, &ret_byte, 1)) {
-                            lock_patches.push_back(ul_global);
-                            lock_bypassed = true;
-                            LOG_INFO("[direct-hook] GLOBAL: active_unlock 0x{:X} "
-                                     "patched to RET (saved 0x{:02X})", aul,
-                                     ul_global.saved);
-                        }
-                    }
-                }
-
-                // Redirect unlock calls in trampoline-called functions
-                auto dyn_redirect_unlock = [&](uintptr_t fn_addr,
-                                                size_t scan_size,
-                                                const char* name) {
-                    if (!fn_addr || fn_addr == dhook_.settop_addr) return;
-                    std::vector<uint8_t> buf(scan_size);
-                    if (!proc_mem_read(pid, fn_addr, buf.data(), scan_size)) return;
-                    size_t fend = scan_size;
-                    for (size_t i = 25; i + 1 < scan_size; i++) {
-                        if (buf[i] != 0xC3) continue;
-                        uint8_t nx = buf[i + 1];
-                        if (nx == 0xCC || nx == 0x90 || nx == 0x55 ||
-                            nx == 0x53 || nx == 0xF3 || nx == 0x00 ||
-                            (nx == 0x41 && i + 2 < scan_size &&
-                             buf[i + 2] >= 0x54 && buf[i + 2] <= 0x57)) {
-                            fend = i + 1;
-                            break;
-                        }
-                    }
-                    int redirected = 0;
-                    for (size_t i = 0; i + 5 <= fend; i++) {
-                        if (buf[i] != 0xE8) continue;
-                        int32_t d; memcpy(&d, &buf[i + 1], 4);
-                        uintptr_t tgt = fn_addr + i + 5 + static_cast<int64_t>(d);
-                        if (tgt != aul) continue;
-                        int64_t nd = static_cast<int64_t>(nop) -
-                                     static_cast<int64_t>(fn_addr + i + 5);
-                        if (nd < INT32_MIN || nd > INT32_MAX) continue;
-                        int32_t nd32 = static_cast<int32_t>(nd);
-                        uintptr_t patch_addr = fn_addr + i + 1;
-                        if (proc_mem_write(pid, patch_addr, &nd32, 4)) {
-                            call_redirects.push_back({patch_addr, d});
-                            lock_bypassed = true;
-                            redirected++;
-                        }
-                    }
-                    if (redirected > 0)
-                        LOG_INFO("[direct-hook] dynamic redirect: {} unlock "
-                                 "calls in {} → NOP stub", redirected, name);
-                };
-
-                dyn_redirect_unlock(dhook_.newthread_addr, 200, "lua_newthread");
-                dyn_redirect_unlock(dhook_.load_addr, 1500, "luau_load");
-                dyn_redirect_unlock(dhook_.resume_addr, 600, "lua_resume");
-                if (dhook_.real_settop_addr &&
-                    dhook_.real_settop_addr != dhook_.settop_addr)
-                    dyn_redirect_unlock(dhook_.real_settop_addr, 100, "lua_settop");
-            } else {
-                LOG_ERROR("[direct-hook] CRITICAL: cannot find active_unlock from any "
-                          "known Luau function — luau_load WILL deadlock at step 2. "
-                          "Lock hook requires paired unlock bypass.");
-            }
-        }
-    } else {
-        LOG_INFO("[direct-hook] lock bypass skipped — hook target 0x{:X} is outside lock scope "
-                 "(API calls handle own locking, bypass would corrupt internal state)",
-                 dhook_.settop_addr);
-    }
-
-    uint64_t new_seq = seq + 1;
-    if (!proc_mem_write(pid, dhook_.mailbox_addr + 16, &new_seq, 8)) return false;
-
-    LOG_INFO("[direct-hook] sent {} bytes via mailbox (seq={} lock_bypass={})", len, new_seq, lock_bypassed);
-
-    bool consumed = false;
-    uint32_t last_step = 0;
-    for (int i = 0; i < 30; i++) {
-        usleep(100000);
-        uint32_t step = 0;
-        proc_mem_read(pid, dhook_.mailbox_addr + 44, &step, 4);
-        uint64_t cur_ack = 0;
-        proc_mem_read(pid, dhook_.mailbox_addr + 24, &cur_ack, 8);
-        uint8_t guard = 0;
-        proc_mem_read(pid, dhook_.mailbox_addr + 40, &guard, 1);
-        uint8_t hits = 0;
-        proc_mem_read(pid, dhook_.mailbox_addr + 41, &hits, 1);
-        last_step = step;
-        if (step > 0 || guard || hits > 0) {
-            LOG_INFO("[direct-hook] step={} guard={} ack={} hits={}", step, guard, cur_ack, hits);
-        }
-        // Verify patch every second
-        if (i > 0 && i % 10 == 0 && dhook_.settop_addr) {
-            uint8_t pc[2] = {};
-            if (proc_mem_read(pid, dhook_.settop_addr, pc, 2) && pc[0] != 0xE9 && pc[0] != 0xFF) {
-                LOG_ERROR("[direct-hook] PATCH OVERWRITTEN at 0x{:X}: {:02X}{:02X} (expected E9 jmp)",
-                          dhook_.settop_addr, pc[0], pc[1]);
-            }
-        }
-        if (cur_ack >= new_seq) {
-            LOG_INFO("[direct-hook] mailbox consumed (ack={} step={})", cur_ack, step);
-            consumed = true;
-            break;
-        }
-        if (kill(pid, 0) != 0) {
-            const char* desc =
-                step == 0 ? "entry hook never triggered (lua_settop not called?)" :
-                step == 1 ? "lua_newthread hung (lock contention or wrong function)" :
-                step == 2 ? "luau_load hung or crashed" :
-                step == 3 ? "lua_resume (inner) hung or crashed" :
-                step == 4 ? "lua_settop cleanup hung" :
-                step == 5 ? "execution complete — crashed after ack" :
-                "unknown step";
-            LOG_ERROR("[direct-hook] TARGET DIED at step {}: {}", step, desc);
-            break;
-        }
-    }
-
-    if (!consumed && kill(pid, 0) == 0) {
-        uint8_t final_guard = 0;
-        proc_mem_read(pid, dhook_.mailbox_addr + 40, &final_guard, 1);
-        uint8_t final_hits = 0;
-        proc_mem_read(pid, dhook_.mailbox_addr + 41, &final_hits, 1);
-        if (last_step == 0 && final_guard == 0) {
-            uint8_t pc[6] = {};
-            if (dhook_.settop_addr)
-                proc_mem_read(pid, dhook_.settop_addr, pc, 6);
-            if (final_hits > 0) {
-                LOG_WARN("[direct-hook] TIMEOUT: hook FIRED {} times but never consumed mailbox "
-                         "(seq/ack/guard logic bug) — patch@0x{:X}={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                         final_hits, dhook_.settop_addr,
-                         pc[0], pc[1], pc[2], pc[3], pc[4], pc[5]);
-            } else {
-                LOG_WARN("[direct-hook] TIMEOUT: hook never fired in 3s (hits=0) — "
-                         "patch@0x{:X}={:02X}{:02X}{:02X}{:02X}{:02X}{:02X} "
-                         "(E9=patch intact, 55=patch reverted/write failed)",
-                         dhook_.settop_addr, pc[0], pc[1], pc[2], pc[3], pc[4], pc[5]);
-            }
-        } else if (last_step == 1) {
-            if (lock_bypassed) {
-                LOG_WARN("[direct-hook] TIMEOUT at step 1: lock bypass "
-                         "applied ({} byte patches, {} call redirects) but "
-                         "lua_newthread at 0x{:X} STILL hung",
-                         lock_patches.size(), call_redirects.size(),
-                         dhook_.newthread_addr);
-            } else {
-                LOG_WARN("[direct-hook] TIMEOUT at step 1: lua_newthread "
-                         "at 0x{:X} hung (no lock bypass available)",
-                         dhook_.newthread_addr);
-            }
-        } else if (last_step == 2) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 2: lua_newthread OK — "
-                     "luau_load at 0x{:X} hung (lock bypass: {} byte "
-                     "patches, {} call redirects)",
-                     dhook_.load_addr, lock_patches.size(),
-                     call_redirects.size());
-        } else if (last_step == 3) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 3: luau_load OK — inner lua_resume hung");
-        } else if (last_step == 4) {
-            LOG_WARN("[direct-hook] TIMEOUT at step 4: lua_resume OK — lua_settop cleanup hung");
-        } else {
-            LOG_WARN("[direct-hook] TIMEOUT at step {} guard={} — hung during execution",
-                     last_step, final_guard);
-        }
-    }
-
-    if (lock_bypassed) {
-        for (auto& p : lock_patches)
-            proc_mem_write(pid, p.addr, &p.saved, 1);
-        for (auto& r : call_redirects)
-            proc_mem_write(pid, r.addr, &r.orig, 4);
-        LOG_INFO("[direct-hook] restored {} lock/unlock patches, {} call redirects",
-                 lock_patches.size(), call_redirects.size());
-    }
-
+        // ═══════════════════════════════════════════════════════════════
+    // Lock bypass is NO LONGER NEEDED.
+    //
+    // The trampoline's guard path now executes the real lua_lock
+    // (stolen bytes + jump to lua_lock+stolen_len) instead of
+    // doing a bare RET. Each API function (lua_newthread, luau_load,
+    // lua_resume, lua_settop) acquires and releases the lock
+    // normally via its own lua_lock call + inlined lua_unlock.
+    //
+    // Previous approach tried to globally disable lua_unlock, but
+    // this is impossible when lua_unlock is compiler-inlined
+    // (no function to patch). The new approach works regardless
+    // of whether lua_unlock is a function call or inlined.
+    // ═══════════════════════════════════════════════════════════════
+    LOG_DEBUG("[direct-hook] lock bypass disabled — re-entrant lua_lock "
+              "calls execute normally (each API call manages own locking)");
     return true;
 }
 
@@ -6204,6 +5562,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
