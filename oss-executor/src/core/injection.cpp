@@ -5222,15 +5222,43 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         uintptr_t best_live_settop = 0;
         int best_live_hits = 0;
 
+        // ═══════════════════════════════════════════════════════════
+        // CRITICAL: unhook lua_lock before probing.
+        //
+        // The probing loop writes probe trampolines to the code cave.
+        // If lua_lock is still hooked (JMP patch pointing to the cave),
+        // every lua_lock call by the target process would execute the
+        // probe trampoline instead of the real lua_lock — causing
+        // immediate crash or memory corruption.
+        //
+        // We restore lua_lock's original prologue before probing,
+        // then re-hook with the final trampoline after probing.
+        // ═══════════════════════════════════════════════════════════
+        bool lock_was_hooked = (hook_addr == addrs.lock_fn && is_lock_hook);
+        if (lock_was_hooked) {
+            LOG_INFO("[direct-hook] temporarily unhooking lua_lock at "
+                     "0x{:X} for safe settop probing", hook_addr);
+            proc_mem_write(pid, hook_addr, prologue, steal);
+            usleep(50000);
+        }
+
+        int total_probes = 0;
+        constexpr int MAX_PROBES = 10;
+
         for (const auto& r : regions) {
             if (best_live_settop) break;
+            if (total_probes >= MAX_PROBES) {
+                LOG_WARN("[direct-hook] hit probe limit ({}) — stopping "
+                         "live-settop search", MAX_PROBES);
+                break;
+            }
             if (!r.readable() || !r.executable()) continue;
             if (r.size() < 256) continue;
             int64_t rd = static_cast<int64_t>(r.start) -
                          static_cast<int64_t>(addrs.resume);
-            if (rd < -0x400000LL || rd > 0x400000LL) continue;
+            if (rd < -0x800000LL || rd > 0x800000LL) continue;
             size_t scan_sz = std::min(r.size(),
-                                      static_cast<size_t>(0x400000));
+                                      static_cast<size_t>(0x800000));
             std::vector<uint8_t> code(scan_sz);
             struct iovec sli = {code.data(), scan_sz};
             struct iovec sri = {reinterpret_cast<void*>(r.start), scan_sz};
@@ -5245,6 +5273,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if (cand == addrs.resume || cand == addrs.newthread ||
                     cand == addrs.load || cand == addrs.lock_fn ||
                     cand == dead_settop_addr) continue;
+
+                // Skip candidates within ±4KB of the dead settop —
+                // they are likely in the same dead code region and
+                // will waste 200ms each probing for 0 hits.
+                int64_t dead_dist = static_cast<int64_t>(cand) -
+                                    static_cast<int64_t>(dead_settop_addr);
+                if (dead_dist > -0x1000LL && dead_dist < 0x1000LL)
+                    continue;
 
                 size_t p = off;
                 if (p + 3 < scan_sz && code[p] == 0xF3 &&
@@ -5321,9 +5357,10 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if (fsz < 30 || fsz > 250 || calls < 1 || calls > 8)
                     continue;
 
+                total_probes++;
                 LOG_DEBUG("[direct-hook] live-settop candidate 0x{:X} "
-                          "({}B, {} calls) — probing 200ms...", cand,
-                          fsz, calls);
+                          "({}B, {} calls) — probing 200ms... [{}/{}]",
+                          cand, fsz, calls, total_probes, MAX_PROBES);
 
                 uint8_t cand_pro[32];
                 if (!proc_mem_read(pid, cand, cand_pro, sizeof(cand_pro)))
@@ -5408,6 +5445,40 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             LOG_WARN("[direct-hook] no live lua_settop found near "
                      "lua_resume — step 4 cleanup will be SKIPPED "
                      "(thread stays on stack, GC collects)");
+        }
+
+        // Re-hook lua_lock now that probing is done.
+        // The final trampoline (with the correct settop address)
+        // will be written below in the "Re-generate trampoline"
+        // block. We just need to re-apply the JMP patch here so
+        // the hook_addr/prologue/steal/patch state is consistent.
+        if (lock_was_hooked) {
+            auto t_rehook = gen_entry_trampoline(
+                addrs, mb_addr, cave.padding_start,
+                hook_addr, prologue, steal);
+            if (t_rehook.size() <= 400 &&
+                proc_mem_write(pid, cave.padding_start,
+                               t_rehook.data(), t_rehook.size()) &&
+                proc_mem_write(pid, hook_addr, patch, patch_len)) {
+                LOG_INFO("[direct-hook] lua_lock re-hooked after "
+                         "probing (cave={} bytes)", t_rehook.size());
+            } else {
+                LOG_ERROR("[direct-hook] failed to re-hook lua_lock "
+                          "after probing — attempting fresh hook");
+                uint8_t lock_pro_fresh[32];
+                if (proc_mem_read(pid, hook_addr, lock_pro_fresh,
+                                  sizeof(lock_pro_fresh))) {
+                    memcpy(prologue, lock_pro_fresh, steal);
+                    auto t_fresh = gen_entry_trampoline(
+                        addrs, mb_addr, cave.padding_start,
+                        hook_addr, prologue, steal);
+                    if (t_fresh.size() <= 400) {
+                        proc_mem_write(pid, cave.padding_start,
+                                       t_fresh.data(), t_fresh.size());
+                        proc_mem_write(pid, hook_addr, patch, patch_len);
+                    }
+                }
+            }
         }
     } else {
         settop_probe_live = true;
@@ -5832,7 +5903,8 @@ bool Injection::execute_script(const std::string& source) {
 
             uint8_t pre_hits = 0;
             proc_mem_read(mpid, dhook_.mailbox_addr + 41, &pre_hits, 1);
-            LOG_DEBUG("[direct-hook] dispatch: armed_seq={} pre_hits={}", armed_seq, pre_hits);
+            LOG_INFO("[direct-hook] dispatch: armed_seq={} pre_hits={} "
+                     "— entering 5s wait loop", armed_seq, pre_hits);
 
             bool executed = false;
             for (int i = 0; i < 100; i++) {
@@ -6122,6 +6194,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
