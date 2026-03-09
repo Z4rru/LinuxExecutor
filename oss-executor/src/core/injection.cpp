@@ -2681,7 +2681,7 @@ static size_t dh_insn_len(const uint8_t* p) {
         i++;                      // EVEX byte 4
         uint8_t mmmmm = eb1 & 0x07;
         if (i >= 15) return 0;
-        uint8_t eop = p[i++];    // opcode
+        i++;                      // skip opcode byte
         if (i >= 15) return 0;
         // Parse modrm
         uint8_t m = p[i++];
@@ -6185,7 +6185,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         int total_probes = 0;
         constexpr int MAX_PROBES = 15;
         uintptr_t best_live_settop = 0;
-        int best_live_hits = 0;
+        int best_live_hits [[maybe_unused]] = 0;
 
         for (const auto& r : regions) {
             if (best_live_settop) break;
@@ -6797,22 +6797,18 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                                hook_addr, prologue, steal,
                                                false, effective_held_lock,
                                                hook_is_settop);
-        // NOP stub is the last 0xC3 before the cleanup thunk.
-        // The cleanup thunk (if present) extends past the nop stub.
-        // Walk backward from end to find the 0xC3 that ISN'T part of the thunk.
+        // NOP stub is the single RET (0xC3) emitted right before the optional
+        // cleanup thunk. When hook_is_settop && steal > 0, the cleanup thunk
+        // (stolen prologue bytes + JMP) is appended after the NOP stub.
+        // The thunk's first byte equals prologue[0], so scan backward for
+        // the 0xC3 immediately followed by that prologue byte.
         size_t nop_pos = t_measure.size() - 1;
         if (hook_is_settop && steal > 0) {
-            // Thunk is at the very end: stolen_len + jmp_size bytes.
-            // NOP stub is right before the thunk.
-            // Scan backward for the RET before the thunk.
             for (size_t si = t_measure.size() - 1; si > 0; si--) {
-                if (t_measure[si] == 0xC3) {
-                    // Check if this is the NOP stub (preceded by the re-entrant jnz patch area)
-                    // vs the thunk's JMP target. The NOP stub is followed by the stolen bytes.
-                    if (si + 1 < t_measure.size() && t_measure[si + 1] == stolen[0]) {
-                        nop_pos = si;
-                        break;
-                    }
+                if (t_measure[si] == 0xC3 && si + 1 < t_measure.size() &&
+                    t_measure[si + 1] == prologue[0]) {
+                    nop_pos = si;
+                    break;
                 }
             }
         }
@@ -8074,6 +8070,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
