@@ -7469,7 +7469,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if (fail_step <= 1)
                     error_ += " lua_resume retry also failed.";
             }
-            }
+            
             set_state(InjectionState::Failed, error_);
             return false;
         }
@@ -8248,6 +8248,7 @@ void Injection::stop_auto_scan() {
 }
 
 
+}
 
 
 
