@@ -5733,33 +5733,25 @@ static std::vector<uint8_t> gen_entry_trampoline(
     size_t j_load_fail = c.size();
     e({0x0F,0x85}); e32(0);       // jnz -> settop_label (load failed)
 
-        // === STEP 3: lua_resume(thread, NULL, 0) ===
-    e({0xC7,0x43,0x2C,0x03,0x00,0x00,0x00}); // mov dword [rbx+0x2C], 3
-    e({0x4C,0x89,0xF7});           // mov rdi, r14 (thread)
-    e({0x31,0xF6});                // xor esi, esi (from=NULL)
-    e({0x31,0xD2});                // xor edx, edx (nresults=0)
-    e({0x48,0xB8}); e64(a.resume); // lua_resume is NOT hooked, call directly
-    e({0xFF,0xD0});                // call lua_resume
+    e({0xC7,0x43,0x2C,0x03,0x00,0x00,0x00});
+    e({0x4C,0x89,0xF7});
+    e({0x31,0xF6});
+    e({0x31,0xD2});
+    e({0x48,0xB8}); e64(a.resume);
+    e({0xFF,0xD0});
+    e({0x89,0x43,0x38});
 
-             // === STEP 4: cleanup — lua_settop(L, -2) to pop the new thread ===
-    //
-    // CRITICAL: Do NOT call addrs.settop (the dead, lock-validated settop).
-    // Even though it calls the correct lua_lock, its INLINED lua_unlock uses
-    // struct offsets from a stale Luau compilation — acquiring the mutex but
-    // never releasing it, causing every subsequent lua_lock to deadlock.
-    //
-    // When hook_target IS a settop function, we embed a callable thunk that
-    // executes the stolen prologue bytes and jumps into the live settop body
-    // (past the hook JMP patch). The live settop's body has correct struct
-    // offsets and properly unlocks the mutex.
-    //
-    // When hook_target is NOT settop (e.g., lua_resume fallback), we skip
-    // step 4 entirely. The pushed thread is garbage-collected by Luau's GC.
-    // Stack growth is bounded: Roblox creates fresh lua_States regularly,
-    // and one extra slot per script execution is negligible vs LUAI_MAXSTACK.
     size_t settop_label = c.size();
     size_t step4_settop_movabs = 0;
-    e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00}); // step 4 skipped
+    if (a.settop) {
+        e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00});
+        e({0x4C,0x89,0xFF});
+        e({0xBE,0xFE,0xFF,0xFF,0xFF});
+        e({0x48,0xB8}); e64(a.settop);
+        e({0xFF,0xD0});
+    } else {
+        e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00});
+    }
   
 
        // === Re-acquire Lua global lock after API calls ===
@@ -5937,6 +5929,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     {
         constexpr size_t MB_SIZE = 16384;
         constexpr size_t PROBE = MB_SIZE + 4096;
+        constexpr size_t PREFER_MIN = 1024 * 1024;
+        uintptr_t fallback_addr = 0;
+        size_t fallback_size = 0;
         for (auto it = regions.rbegin(); it != regions.rend(); ++it) {
             auto& r = *it;
             if (!r.writable() || !r.readable()) continue;
@@ -5944,6 +5939,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             if (r.path.find("[stack") != std::string::npos) continue;
             if (r.path.find("[vvar") != std::string::npos) continue;
             if (r.path.find("[vdso") != std::string::npos) continue;
+            if (r.path.find("heap") != std::string::npos) continue;
             if (!r.path.empty() && r.path[0] == '/') continue;
             uintptr_t check_start = r.end - PROBE;
             check_start &= ~static_cast<uintptr_t>(0xFFF);
@@ -5952,11 +5948,20 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             if (!proc_mem_read(pid, check_start, probe.data(), MB_SIZE)) continue;
             bool all_zero = true;
             for (auto b : probe) if (b != 0) { all_zero = false; break; }
-            if (all_zero) {
+            if (!all_zero) continue;
+            if (r.size() >= PREFER_MIN) {
                 mb_addr = check_start;
                 LOG_INFO("[direct-hook] mailbox at 0x{:X} ({} KB region)", mb_addr, r.size()/1024);
                 break;
             }
+            if (r.size() > fallback_size) {
+                fallback_size = r.size();
+                fallback_addr = check_start;
+            }
+        }
+        if (!mb_addr && fallback_addr) {
+            mb_addr = fallback_addr;
+            LOG_INFO("[direct-hook] mailbox at 0x{:X} (fallback {} KB region)", mb_addr, fallback_size/1024);
         }
     }
     if (!mb_addr) {
@@ -8020,6 +8025,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
