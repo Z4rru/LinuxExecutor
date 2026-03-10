@@ -2293,6 +2293,8 @@ void Injection::stop_elevated_helper() {
     payload_loaded_ = true;
     return true;
 }
+}
+
 
 bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     LOG_INFO("Injecting {} into PID {}", lib_path, pid);
@@ -8138,6 +8140,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
