@@ -5144,6 +5144,127 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     // call or compiler-inlined.
     // ═══════════════════════════════════════════════════════════════
 
+    if (active_lock && out.settop) {
+        uint8_t settop_pre[64];
+        struct iovec sp_l = {settop_pre, sizeof(settop_pre)};
+        struct iovec sp_r = {reinterpret_cast<void*>(out.settop), sizeof(settop_pre)};
+        ssize_t sp_rd = process_vm_readv(pid, &sp_l, 1, &sp_r, 1, 0);
+        if (sp_rd >= 40) {
+            size_t sp_len = static_cast<size_t>(sp_rd);
+            size_t lock_call_pos = 0;
+            for (size_t i = 0; i + 5 <= sp_len; i++) {
+                if (settop_pre[i] != 0xE8) continue;
+                int32_t d;
+                memcpy(&d, &settop_pre[i + 1], 4);
+                uintptr_t t = out.settop + i + 5 + static_cast<int64_t>(d);
+                if (t == active_lock) { lock_call_pos = i; break; }
+            }
+            if (lock_call_pos > 5) {
+                for (size_t scan = lock_call_pos; scan >= 3; scan--) {
+                    if (settop_pre[scan] == 0x48 && scan + 3 <= lock_call_pos) {
+                        if (settop_pre[scan + 1] == 0x89 && settop_pre[scan + 2] == 0xDF) {
+                            out.lua_state_to_lock_arg = -1;
+                            LOG_INFO("[direct-hook] lock arg = L directly (mov rdi, rbx)");
+                            break;
+                        }
+                        if (settop_pre[scan + 1] == 0x8B && settop_pre[scan + 2] == 0x3B) {
+                            out.lua_state_to_lock_arg = 0;
+                            LOG_INFO("[direct-hook] lock arg = [L+0] (mov rdi, [rbx])");
+                            break;
+                        }
+                        if (settop_pre[scan + 1] == 0x8B && settop_pre[scan + 2] == 0x7B &&
+                            scan + 4 <= lock_call_pos) {
+                            out.lua_state_to_lock_arg = static_cast<int8_t>(settop_pre[scan + 3]);
+                            LOG_INFO("[direct-hook] lock arg = [L+{}] (mov rdi, [rbx+disp8])",
+                                     out.lua_state_to_lock_arg);
+                            break;
+                        }
+                        if (settop_pre[scan + 1] == 0x8B && settop_pre[scan + 2] == 0xBB &&
+                            scan + 7 <= lock_call_pos) {
+                            memcpy(&out.lua_state_to_lock_arg, &settop_pre[scan + 3], 4);
+                            LOG_INFO("[direct-hook] lock arg = [L+{}] (mov rdi, [rbx+disp32])",
+                                     out.lua_state_to_lock_arg);
+                            break;
+                        }
+                    }
+                    if (scan == 0) break;
+                }
+            }
+        }
+    }
+
+    if (active_lock && !out.unlock_fn) {
+        uint8_t al_body[32];
+        struct iovec ab_l = {al_body, sizeof(al_body)};
+        struct iovec ab_r = {reinterpret_cast<void*>(active_lock), sizeof(al_body)};
+        ssize_t ab_rd = process_vm_readv(pid, &ab_l, 1, &ab_r, 1, 0);
+        uintptr_t inner_lock_addr = 0;
+        if (ab_rd >= 15) {
+            for (size_t i = 0; i + 5 <= static_cast<size_t>(ab_rd); i++) {
+                if (al_body[i] != 0xE8 && al_body[i] != 0xE9) continue;
+                int32_t d;
+                memcpy(&d, &al_body[i + 1], 4);
+                inner_lock_addr = active_lock + i + 5 + static_cast<int64_t>(d);
+                break;
+            }
+        }
+        if (inner_lock_addr) {
+            uintptr_t scan_lo = (active_lock > 0x200) ? active_lock - 0x200 : 0;
+            uintptr_t scan_hi = active_lock + 0x200;
+            size_t scan_sz = scan_hi - scan_lo;
+            std::vector<uint8_t> region_buf(scan_sz);
+            struct iovec rl = {region_buf.data(), scan_sz};
+            struct iovec rr = {reinterpret_cast<void*>(scan_lo), scan_sz};
+            if (process_vm_readv(pid, &rl, 1, &rr, 1, 0) == static_cast<ssize_t>(scan_sz)) {
+                int64_t best_dist = INT64_MAX;
+                uintptr_t best_unlock = 0;
+                for (size_t off = 1; off + 20 < scan_sz; off++) {
+                    uintptr_t cand = scan_lo + off;
+                    if (cand == active_lock) continue;
+                    uint8_t prev = region_buf[off - 1];
+                    if (prev != 0xC3 && prev != 0xCC && prev != 0x90) continue;
+                    for (size_t j = 0; j < 20 && off + j + 5 < scan_sz; j++) {
+                        if (region_buf[off + j] != 0xE8 && region_buf[off + j] != 0xE9) continue;
+                        int32_t d;
+                        memcpy(&d, &region_buf[off + j + 1], 4);
+                        uintptr_t target = scan_lo + off + j + 5 + static_cast<int64_t>(d);
+                        if (target == inner_lock_addr) break;
+                        int64_t tgt_dist = static_cast<int64_t>(target) -
+                                           static_cast<int64_t>(inner_lock_addr);
+                        if (tgt_dist < 0) tgt_dist = -tgt_dist;
+                        if (tgt_dist > 0x10000) break;
+                        bool has_deref = false;
+                        for (size_t k = 0; k < j && off + k + 3 < scan_sz; k++) {
+                            if (region_buf[off + k] == 0x48 &&
+                                region_buf[off + k + 1] == 0x8B &&
+                                (region_buf[off + k + 2] & 0xC7) == 0x07) {
+                                has_deref = true;
+                                break;
+                            }
+                        }
+                        if (!has_deref && j > 3) break;
+                        int64_t cand_dist = static_cast<int64_t>(cand) -
+                                            static_cast<int64_t>(active_lock);
+                        if (cand_dist < 0) cand_dist = -cand_dist;
+                        if (cand_dist < best_dist) {
+                            best_dist = cand_dist;
+                            best_unlock = cand;
+                            LOG_DEBUG("[direct-hook] active_unlock candidate 0x{:X} "
+                                      "(inner target 0x{:X}, {}B from active_lock)",
+                                      cand, target, cand_dist);
+                        }
+                        break;
+                    }
+                }
+                if (best_unlock) {
+                    out.unlock_fn = best_unlock;
+                    LOG_INFO("[direct-hook] active_unlock at 0x{:X} ({}B from active_lock)",
+                             best_unlock, best_dist);
+                }
+            }
+        }
+    }
+
     if (active_lock && !out.unlock_fn) {
         int32_t gs_off = 0, mx_off = 0;
         uintptr_t pml_addr = 0;
@@ -5672,10 +5793,23 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // can acquire/release the lock independently without deadlocking.
     size_t j_no_captured_L = SIZE_MAX;
     if (hook_held_lock) {
-        if (a.unlock_fn) {
-            e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
+        if (a.unlock_fn && a.lua_state_to_lock_arg >= 0) {
+            e({0x4C,0x89,0xFF});
+            if (a.lua_state_to_lock_arg == 0) {
+                e({0x48,0x8B,0x3F});
+            } else if (a.lua_state_to_lock_arg >= -128 && a.lua_state_to_lock_arg < 128) {
+                e({0x48,0x8B,0x7F});
+                e8(static_cast<uint8_t>(static_cast<int8_t>(a.lua_state_to_lock_arg)));
+            } else {
+                e({0x48,0x8B,0xBF});
+                e32(static_cast<uint32_t>(a.lua_state_to_lock_arg));
+            }
             e({0x48,0xB8}); e64(a.unlock_fn);
-            e({0xFF,0xD0});            // call lua_unlock
+            e({0xFF,0xD0});
+        } else if (a.unlock_fn) {
+            e({0x4C,0x89,0xFF});
+            e({0x48,0xB8}); e64(a.unlock_fn);
+            e({0xFF,0xD0});
         } else if (a.lock_internals_valid && a.pthread_mutex_unlock_addr) {
             // Synthesized inline unlock: pthread_mutex_unlock(&(L->global + mutex_offset))
             // Equivalent to the compiler-inlined lua_unlock that exists in the binary.
@@ -5752,27 +5886,18 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // Note: lock_fn is NOT the hooked function here (we hook settop,
     // not lua_lock), so calling it directly is safe and non-recursive.
     if (hook_held_lock) {
-        if (a.lock_internals_valid && a.pthread_mutex_lock_addr) {
+        if (a.lock_fn && a.lua_state_to_lock_arg >= 0) {
             e({0x4C,0x89,0xFF});
-            if (a.lock_global_state_offset == 0) {
+            if (a.lua_state_to_lock_arg == 0) {
                 e({0x48,0x8B,0x3F});
-            } else if (a.lock_global_state_offset >= -128 && a.lock_global_state_offset < 128) {
+            } else if (a.lua_state_to_lock_arg >= -128 && a.lua_state_to_lock_arg < 128) {
                 e({0x48,0x8B,0x7F});
-                e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_global_state_offset)));
+                e8(static_cast<uint8_t>(static_cast<int8_t>(a.lua_state_to_lock_arg)));
             } else {
                 e({0x48,0x8B,0xBF});
-                e32(static_cast<uint32_t>(a.lock_global_state_offset));
+                e32(static_cast<uint32_t>(a.lua_state_to_lock_arg));
             }
-            if (a.lock_mutex_offset != 0) {
-                if (a.lock_mutex_offset >= -128 && a.lock_mutex_offset < 128) {
-                    e({0x48,0x83,0xC7});
-                    e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_mutex_offset)));
-                } else {
-                    e({0x48,0x81,0xC7});
-                    e32(static_cast<uint32_t>(a.lock_mutex_offset));
-                }
-            }
-            e({0x48,0xB8}); e64(a.pthread_mutex_lock_addr);
+            e({0x48,0xB8}); e64(a.lock_fn);
             e({0xFF,0xD0});
         } else if (a.lock_fn) {
             e({0x4C,0x89,0xFF});
@@ -5780,7 +5905,6 @@ static std::vector<uint8_t> gen_entry_trampoline(
             e({0xFF,0xD0});
         }
     }
-
     // === STEP 5: acknowledge — set ack = seq, clear guard ===
     size_t ack_label = c.size();
     e({0x48,0x8B,0x43,0x10});     // mov rax, [rbx+0x10] (seq)
@@ -7996,6 +8120,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
