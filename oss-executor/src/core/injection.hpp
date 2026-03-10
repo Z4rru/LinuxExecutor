@@ -201,6 +201,7 @@ private:
         int32_t lock_global_state_offset = 0;
         int32_t lock_mutex_offset = 0;
         bool lock_internals_valid = false;
+        int32_t lua_state_to_lock_arg = -1;
     };
 
     struct DirectHookState {
@@ -233,6 +234,7 @@ private:
 };
 
 }
+
 
 
 
