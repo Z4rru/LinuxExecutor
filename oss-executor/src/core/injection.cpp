@@ -3170,11 +3170,10 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if (rs_dist < 0) rs_dist = -rs_dist;
         if (static_cast<uint64_t>(rs_dist) > 0x2800000ULL) {
             LOG_WARN("[direct-hook] pre-validation: lua_resume 0x{:X} is {:.0f}MB "
-                     "from lua_settop 0x{:X} — likely different copies, clearing "
-                     "both for string-ref re-scan with distance filter",
+                     "from lua_settop 0x{:X} — keeping both as they may be valid in this layout",
                      out.resume, rs_dist / (1024.0 * 1024.0), out.settop);
-            out.resume = 0;
-            out.settop = 0;
+            // out.resume = 0;
+            // out.settop = 0;
         }
     }
     if (out.resume && out.load) {
@@ -3183,9 +3182,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if (rl_dist < 0) rl_dist = -rl_dist;
         if (static_cast<uint64_t>(rl_dist) > 0x2800000ULL) {
             LOG_WARN("[direct-hook] pre-validation: luau_load 0x{:X} is {:.0f}MB "
-                     "from lua_resume 0x{:X} — clearing luau_load for re-scan",
+                     "from lua_resume 0x{:X} — keeping it as layout varies",
                      out.load, rl_dist / (1024.0 * 1024.0), out.resume);
-            out.load = 0;
+            // out.load = 0;
         }
     }
     
@@ -3690,7 +3689,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 out.settop = 0;
             }
 
-            // Count CALL instructions to detect stale inlined-unlock settops
+              // Inlined unlock is FINE since bracket is disabled. Do not clear based on CALL count.
             if (out.settop && st_rd >= 40) {
                 size_t st_fend = 0;
                 {
@@ -3708,11 +3707,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if (st_buf[ci] == 0xE8) call_count++;
                     }
                     if (call_count < 2) {
-                        LOG_WARN("[direct-hook] lua_settop at 0x{:X} has only {} CALL(s) "
-                                 "in {} bytes — inlined lua_unlock from stale build, "
-                                 "clearing (need ≥2 for lock+unlock pair)",
+                        LOG_INFO("[direct-hook] lua_settop at 0x{:X} has {} CALL(s) "
+                                 "in {} bytes — keeping it (bracket disabled, inlined unlock is ok)",
                                  out.settop, call_count, st_fend);
-                        out.settop = 0;
                     }
                 }
             }
@@ -3832,9 +3829,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if (ld < 0) ld = -ld;
         if (static_cast<uint64_t>(ld) > 0x2800000ULL) { // >40MB
             LOG_WARN("[direct-hook] luau_load at 0x{:X} is {:.0f}MB from lua_resume "
-                     "0x{:X} — wrong Luau copy, clearing for proximity re-scan",
+                     "0x{:X} — keeping it as layout varies",
                      out.load, ld / (1024.0 * 1024.0), out.resume);
-            out.load = 0;
+            // out.load = 0;
         }
     }
 
@@ -4092,7 +4089,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     // calls lua_resume at step 3; a wrong-copy lua_resume would
     // deadlock on the stale mutex even with global unlock bypass.
     // ═══════════════════════════════════════════════════════════════
-    if (out.resume && active_lock) {
+    if (false && out.resume && active_lock) {
         uint8_t resume_scan_buf[800];
         size_t resume_scan_len = sizeof(resume_scan_buf);
         struct iovec rsl = {resume_scan_buf, resume_scan_len};
@@ -4595,7 +4592,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     // ═══════════════════════════════════════════════════════════════
     // Validate luau_load calls active_lock.
     // ═══════════════════════════════════════════════════════════════
-    if (out.load && active_lock) {
+    if (false && out.load && active_lock) {
         uint8_t load_head[200];
         struct iovec lhl = {load_head, sizeof(load_head)};
         struct iovec lhr = {reinterpret_cast<void*>(out.load),
@@ -4825,7 +4822,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     // A later call may coincidentally resolve to active_lock, but the
     // function EXECUTES the first call FIRST, causing step-1 deadlock.
     // ═══════════════════════════════════════════════════════════════
-    if (out.newthread && active_lock) {
+    if (false && out.newthread && active_lock) {
         uint8_t ntfv[40];
         struct iovec nfl = {ntfv, 40};
         struct iovec nfr = {reinterpret_cast<void*>(out.newthread), 40};
@@ -8105,6 +8102,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
