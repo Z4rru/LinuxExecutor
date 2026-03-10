@@ -5209,8 +5209,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             }
         }
         if (inner_lock_addr) {
-            uintptr_t scan_lo = (active_lock > 0x200) ? active_lock - 0x200 : 0;
-            uintptr_t scan_hi = active_lock + 0x200;
+            uintptr_t scan_lo = (active_lock > 0x1000) ? active_lock - 0x1000 : 0;
+            uintptr_t scan_hi = active_lock + 0x1000;
             size_t scan_sz = scan_hi - scan_lo;
             std::vector<uint8_t> region_buf(scan_sz);
             struct iovec rl = {region_buf.data(), scan_sz};
@@ -5232,7 +5232,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         int64_t tgt_dist = static_cast<int64_t>(target) -
                                            static_cast<int64_t>(inner_lock_addr);
                         if (tgt_dist < 0) tgt_dist = -tgt_dist;
-                        if (tgt_dist > 0x10000) break;
+                        if (tgt_dist > 0x100000) break;
                         bool has_deref = false;
                         for (size_t k = 0; k < j && off + k + 3 < scan_sz; k++) {
                             if (region_buf[off + k] == 0x48 &&
@@ -5242,7 +5242,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                                 break;
                             }
                         }
-                        if (!has_deref && j > 3) break;
+                        if (!has_deref && j > 8) break;
                         int64_t cand_dist = static_cast<int64_t>(cand) -
                                             static_cast<int64_t>(active_lock);
                         if (cand_dist < 0) cand_dist = -cand_dist;
@@ -5811,25 +5811,50 @@ static std::vector<uint8_t> gen_entry_trampoline(
             e({0x48,0xB8}); e64(a.unlock_fn);
             e({0xFF,0xD0});
         } else if (a.lock_internals_valid && a.pthread_mutex_unlock_addr) {
-            // Synthesized inline unlock: pthread_mutex_unlock(&(L->global + mutex_offset))
-            // Equivalent to the compiler-inlined lua_unlock that exists in the binary.
-            // r15 = L (lua_State*). Load L->global into rdi, add mutex offset, call unlock.
+            // Synthesized inline unlock — TWO-STEP dereference chain.
+            //
+            // The lock chain is: lua_settop loads L[lua_state_to_lock_arg] and
+            // passes it to lua_lock. lua_lock then loads [arg+lock_global_state_offset]
+            // and passes THAT to the inner mutex function.
+            //
+            // To unlock, we must replicate BOTH dereferences:
+            //   Step 1: rdi = [L + lua_state_to_lock_arg]   (get lua_lock's argument)
+            //   Step 2: rdi = [rdi + lock_global_state_offset] (replicate lua_lock's load)
+            //   Step 3: rdi += lock_mutex_offset              (apply mutex offset)
+            //   Step 4: call pthread_mutex_unlock(rdi)
+            //
+            // When lua_state_to_lock_arg == -1, lua_lock receives L directly
+            // (no first dereference needed), so we skip step 1.
             e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
+            // Step 1: get lua_lock's actual argument from L
+            if (a.lua_state_to_lock_arg >= 0) {
+                if (a.lua_state_to_lock_arg == 0) {
+                    e({0x48,0x8B,0x3F});   // mov rdi, [rdi]
+                } else if (a.lua_state_to_lock_arg >= -128 && a.lua_state_to_lock_arg < 128) {
+                    e({0x48,0x8B,0x7F});
+                    e8(static_cast<uint8_t>(static_cast<int8_t>(a.lua_state_to_lock_arg)));
+                } else {
+                    e({0x48,0x8B,0xBF});
+                    e32(static_cast<uint32_t>(a.lua_state_to_lock_arg));
+                }
+            }
+            // Step 2: replicate lua_lock's internal dereference
             if (a.lock_global_state_offset == 0) {
                 e({0x48,0x8B,0x3F});   // mov rdi, [rdi]
             } else if (a.lock_global_state_offset >= -128 && a.lock_global_state_offset < 128) {
-                e({0x48,0x8B,0x7F});   // mov rdi, [rdi + disp8]
+                e({0x48,0x8B,0x7F});
                 e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_global_state_offset)));
             } else {
-                e({0x48,0x8B,0xBF});   // mov rdi, [rdi + disp32]
+                e({0x48,0x8B,0xBF});
                 e32(static_cast<uint32_t>(a.lock_global_state_offset));
             }
+            // Step 3: add mutex offset within structure
             if (a.lock_mutex_offset != 0) {
                 if (a.lock_mutex_offset >= -128 && a.lock_mutex_offset < 128) {
-                    e({0x48,0x83,0xC7}); // add rdi, disp8
+                    e({0x48,0x83,0xC7});
                     e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_mutex_offset)));
                 } else {
-                    e({0x48,0x81,0xC7}); // add rdi, disp32
+                    e({0x48,0x81,0xC7});
                     e32(static_cast<uint32_t>(a.lock_mutex_offset));
                 }
             }
@@ -6975,6 +7000,21 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                   "step={} guard={} hits={}",
                                   di, dr_step, dr_guard, dr_hits);
 
+                        if (dr_step == 0 && dr_guard == 1 && di >= 39) {
+                            LOG_ERROR("[direct-hook] dry-run FAILED — "
+                                      "deadlock at step 0 with guard=1: "
+                                      "trampoline entered payload path "
+                                      "but hung in unlock bracket before "
+                                      "reaching lua_newthread. The "
+                                      "synthesized unlock is deriving "
+                                      "the wrong mutex address from L. "
+                                      "Check lua_state_to_lock_arg={} "
+                                      "lock_global_state_offset={} "
+                                      "lock_mutex_offset={}",
+                                      is_lock_hook ? -1 : 0,
+                                      0, 0);
+                            break;
+                        }
                         if (dr_step == 1 && dr_guard == 1 && di >= 39) {
                             LOG_ERROR("[direct-hook] dry-run FAILED — "
                                       "deadlock at step 1 "
@@ -7033,11 +7073,13 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
             dhook_ = {};
 
-            if (fail_step == 1 && addrs.resume != 0 &&
+            if ((fail_step <= 1) && addrs.resume != 0 &&
                 hook_addr != addrs.resume) {
-                LOG_INFO("[direct-hook] step-1 deadlock: live settop "
-                         "called with Lua lock held. Retrying with "
-                         "lua_resume (top-level API, never lock-held)");
+                LOG_INFO("[direct-hook] step-{} deadlock: live settop "
+                         "called with Lua lock held{}. Retrying with "
+                         "lua_resume (top-level API, never lock-held)",
+                         fail_step,
+                         fail_step == 0 ? " (hung in unlock bracket)" : "");
 
                 uint8_t resume_pro[32];
                 if (proc_mem_read(pid, addrs.resume, resume_pro,
@@ -7327,6 +7369,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             }
 
             {
+                uint8_t fail_guard = 0;
+                proc_mem_read(pid, mb_addr + 40, &fail_guard, 1);
                 const char* sn[] = {
                     "trampoline never entered payload path",
                     "lua_newthread", "luau_load",
@@ -7334,13 +7378,22 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 };
                 const char* step_name = (fail_step <= 4)
                     ? sn[fail_step] : "unknown";
-                error_ = "Direct hook dry-run failed — trampoline "
-                         "deadlocked at step " +
-                         std::to_string(fail_step) + " (" +
-                         step_name + ").";
-                if (fail_step == 1)
-                    error_ += " Hook target called with Lua lock "
-                              "held — lua_resume retry also failed.";
+                if (fail_step == 0 && fail_guard == 1) {
+                    error_ = "Direct hook dry-run failed — trampoline "
+                             "entered payload path (guard=1) but hung "
+                             "in unlock bracket before step 1. The "
+                             "synthesized unlock is calling "
+                             "pthread_mutex_unlock with wrong argument "
+                             "(missing dereference in lock chain).";
+                } else {
+                    error_ = "Direct hook dry-run failed — trampoline "
+                             "deadlocked at step " +
+                             std::to_string(fail_step) + " (" +
+                             step_name + ").";
+                    if (fail_step == 1)
+                        error_ += " Hook target called with Lua lock "
+                                  "held — lua_resume retry also failed.";
+                }
             }
             set_state(InjectionState::Failed, error_);
             return false;
@@ -8120,6 +8173,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
