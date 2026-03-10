@@ -4194,7 +4194,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 int64_t rd0 = static_cast<int64_t>(r.start) -
                               static_cast<int64_t>(active_lock);
                 if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
-                if (out.resume) {
+            
                 uintptr_t s_lo = (active_lock > 0x1000000) ? active_lock - 0x1000000 : 0;
                 uintptr_t s_hi = active_lock + 0x1000000;
                 uintptr_t r_lo = std::max(r.start, s_lo);
@@ -8128,6 +8128,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
