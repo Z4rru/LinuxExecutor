@@ -8247,7 +8247,8 @@ void Injection::stop_auto_scan() {
     if (scan_thread_.joinable()) scan_thread_.join();
 }
 
-}
+
+
 
 
 
