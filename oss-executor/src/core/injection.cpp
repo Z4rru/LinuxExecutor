@@ -3222,8 +3222,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                                              static_cast<int64_t>(anchor);
                         int64_t xr_dist_hi = static_cast<int64_t>(xr.end) -
                                              static_cast<int64_t>(anchor);
-                        bool xr_near = (xr_dist_lo > -0x2800000LL && xr_dist_lo < 0x2800000LL) ||
-                                       (xr_dist_hi > -0x2800000LL && xr_dist_hi < 0x2800000LL);
+                        bool xr_near = (xr_dist_lo > -0x1000000LL && xr_dist_lo < 0x1000000LL) ||
+                                       (xr_dist_hi > -0x1000000LL && xr_dist_hi < 0x1000000LL);
                         if (!xr_near) continue;
                     }
                     size_t xscan = std::min(xr.size(), static_cast<size_t>(0x4000000));
@@ -3330,8 +3330,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (!r.readable() || !r.executable()) continue;
                 if (anchor < r.start || anchor >= r.end) continue;
 
-                uintptr_t scan_lo = (anchor > r.start + 0x80000) ? anchor - 0x80000 : r.start;
-                uintptr_t scan_hi = std::min(anchor + 0x80000, r.end);
+                uintptr_t scan_lo = (anchor > r.start + 0x1000000) ? anchor - 0x1000000 : r.start;
+                uintptr_t scan_hi = std::min(anchor + 0x1000000, r.end);
                 size_t scan_sz = scan_hi - scan_lo;
                 if (scan_sz < 512) continue;
 
@@ -3365,6 +3365,12 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 int calls = 0, leas = 0;
                 size_t fsz = 0;
                 bool has_tt9 = false;
+
+                const uint8_t pro9[] = {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB};
+                bool has_pro9 = false;
+                if (p + sizeof(pro9) <= scan_sz && memcmp(&code[p], pro9, sizeof(pro9)) == 0) {
+                    has_pro9 = true;
+                }
 
                 for (size_t j = 0; j < 250 && off+j+8 < scan_sz; j++) {
                     size_t i = off + j;
@@ -3416,17 +3422,18 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     // Check for any MOV with rdi as source (reg field=7, bits 5:3 of modrm)
                     if ((b0 == 0x48 || b0 == 0x49) && b1 == 0x89 && (b2 & 0x38) == 0x38) saves_rdi = true;
                 }
-                if (uses_rsi) {
+               if (uses_rsi) {
                     LOG_DEBUG("[direct-hook] rejecting 0x{:X}: uses rsi (2-arg function)", addr);
                     continue;
                 }
 
                 int score = 0;
+                if (has_pro9) score += 20;
                 if (has_tt9) score += 10;
                 if (calls >= 2 && calls <= 4) score += 3;
                 if (fsz >= 60 && fsz <= 150) score += 2;
                 if (addr < out.settop) score += 1;
-                if (!saves_rdi) score -= 2;
+                if (!saves_rdi && !has_pro9) score -= 2;
 
                 // Cross-validate: check if candidate shares call targets with lua_resume
                 if (out.resume && score >= 5) {
@@ -3574,10 +3581,17 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     if (code[i]==0xC3 && j >= 30) { fsz = j + 1; break; }
                 }
 
-                if (!has_tt9 || uses_rsi || !saves_rdi) continue;
+                const uint8_t pro9[] = {0x55,0x48,0x89,0xE5,0x53,0x50,0x48,0x89,0xFB};
+                bool has_pro9 = false;
+                if (p + sizeof(pro9) <= scan_sz && memcmp(&code[p], pro9, sizeof(pro9)) == 0) {
+                    has_pro9 = true;
+                }
+
+                if (!has_tt9 || uses_rsi || (!saves_rdi && !has_pro9)) continue;
                 if (fsz < 40 || fsz > 200 || leas > 0 || calls < 2 || calls > 5) continue;
 
                 int score = 10; // tt9 guaranteed
+                if (has_pro9) score += 20;
                 if (calls >= 2 && calls <= 4) score += 3;
                 if (fsz >= 60 && fsz <= 150) score += 2;
 
@@ -3723,8 +3737,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             if (!r.readable() || !r.executable()) continue;
             if (out.resume < r.start || out.resume >= r.end) continue;
 
-            uintptr_t scan_lo = (out.resume > r.start + 0x200000) ? out.resume - 0x200000 : r.start;
-            uintptr_t scan_hi = std::min(out.resume + 0x200000, r.end);
+            uintptr_t scan_lo = (out.resume > r.start + 0x1000000) ? out.resume - 0x1000000 : r.start;
+            uintptr_t scan_hi = std::min(out.resume + 0x1000000, r.end);
             size_t scan_sz = scan_hi - scan_lo;
             if (scan_sz < 512) continue;
 
@@ -3864,7 +3878,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     if (!xr.readable() || !xr.executable() || xr.size() < 7) continue;
                     int64_t xdist = static_cast<int64_t>(xr.start) -
                                     static_cast<int64_t>(out.resume);
-                    if (xdist < -0x2800000LL || xdist > 0x2800000LL) continue;
+                    if (xdist < -0x1000000LL || xdist > 0x1000000LL) continue;
                     size_t xscan = std::min(xr.size(), static_cast<size_t>(0x4000000));
                     constexpr size_t LR_CHK = 4096;
                     std::vector<uint8_t> lrbuf(LR_CHK + 16);
@@ -4000,8 +4014,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                               static_cast<int64_t>(out.resume);
                 int64_t rd1 = static_cast<int64_t>(r.end) -
                               static_cast<int64_t>(out.resume);
-                if (!((rd0 > -0x2800000LL && rd0 < 0x2800000LL) ||
-                      (rd1 > -0x2800000LL && rd1 < 0x2800000LL))) continue;
+                if (!((rd0 > -0x1000000LL && rd0 < 0x1000000LL) ||
+                      (rd1 > -0x1000000LL && rd1 < 0x1000000LL))) continue;
                 size_t scan_sz = std::min(r.size(),
                                           static_cast<size_t>(0x4000000));
                 std::vector<uint8_t> code(scan_sz);
@@ -4405,7 +4419,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if (r.size() < 256) continue;
                         int64_t rd0 = static_cast<int64_t>(r.start) -
                                       static_cast<int64_t>(active_lock);
-                        if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
+                        if (rd0 < -0x1000000LL || rd0 > 0x1000000LL) continue;
                         size_t scan_sz = std::min(r.size(),
                                                   static_cast<size_t>(0x4000000));
                         std::vector<uint8_t> code(scan_sz);
@@ -4659,7 +4673,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (r.size() < 512) continue;
                 int64_t rd0 = static_cast<int64_t>(r.start) -
                               static_cast<int64_t>(active_lock);
-                if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
+                if (rd0 < -0x1000000LL || rd0 > 0x1000000LL) continue;
                 size_t scan_sz = std::min(r.size(),
                                           static_cast<size_t>(0x4000000));
                 std::vector<uint8_t> code(scan_sz);
@@ -4887,7 +4901,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     if (!r.readable() || !r.executable() || r.size() < 512) continue;
                     int64_t rd = static_cast<int64_t>(r.start) -
                                  static_cast<int64_t>(out.resume);
-                    if (rd < -0x2800000LL || rd > 0x2800000LL) continue;
+                    if (rd < -0x1000000LL || rd > 0x1000000LL) continue;
                     size_t scan_sz = std::min(r.size(),
                                               static_cast<size_t>(0x4000000));
                     std::vector<uint8_t> code(scan_sz);
@@ -8102,6 +8116,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
