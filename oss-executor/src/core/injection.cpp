@@ -5743,15 +5743,6 @@ static std::vector<uint8_t> gen_entry_trampoline(
 
     size_t settop_label = c.size();
     size_t step4_settop_movabs = 0;
-    if (a.settop) {
-        e({0xC7,0x43,0x2C,0x04,0x00,0x00,0x00});
-        e({0x4C,0x89,0xFF});
-        e({0xBE,0xFE,0xFF,0xFF,0xFF});
-        e({0x48,0xB8}); e64(a.settop);
-        e({0xFF,0xD0});
-    } else {
-        e({0xC7,0x43,0x2C,0x44,0x00,0x00,0x00});
-    }
   
 
        // === Re-acquire Lua global lock after API calls ===
@@ -5761,14 +5752,10 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // Note: lock_fn is NOT the hooked function here (we hook settop,
     // not lua_lock), so calling it directly is safe and non-recursive.
     if (hook_held_lock) {
-        if (a.lock_fn) {
-            e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
-            e({0x48,0xB8}); e64(a.lock_fn);
-            e({0xFF,0xD0});            // call lua_lock
-        } else if (a.lock_internals_valid && a.pthread_mutex_lock_addr) {
-            e({0x4C,0x89,0xFF});       // mov rdi, r15 (L)
+        if (a.lock_internals_valid && a.pthread_mutex_lock_addr) {
+            e({0x4C,0x89,0xFF});
             if (a.lock_global_state_offset == 0) {
-                e({0x48,0x8B,0x3F});   // mov rdi, [rdi]
+                e({0x48,0x8B,0x3F});
             } else if (a.lock_global_state_offset >= -128 && a.lock_global_state_offset < 128) {
                 e({0x48,0x8B,0x7F});
                 e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_global_state_offset)));
@@ -5778,14 +5765,18 @@ static std::vector<uint8_t> gen_entry_trampoline(
             }
             if (a.lock_mutex_offset != 0) {
                 if (a.lock_mutex_offset >= -128 && a.lock_mutex_offset < 128) {
-                    e({0x48,0x83,0xC7}); // add rdi, disp8
+                    e({0x48,0x83,0xC7});
                     e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_mutex_offset)));
                 } else {
-                    e({0x48,0x81,0xC7}); // add rdi, disp32
+                    e({0x48,0x81,0xC7});
                     e32(static_cast<uint32_t>(a.lock_mutex_offset));
                 }
             }
             e({0x48,0xB8}); e64(a.pthread_mutex_lock_addr);
+            e({0xFF,0xD0});
+        } else if (a.lock_fn) {
+            e({0x4C,0x89,0xFF});
+            e({0x48,0xB8}); e64(a.lock_fn);
             e({0xFF,0xD0});
         }
     }
@@ -5884,28 +5875,8 @@ static std::vector<uint8_t> gen_entry_trampoline(
     // This avoids calling the dead settop whose inlined lua_unlock has
     // stale struct offsets that fail to release the mutex.
     // ═══════════════════════════════════════════════════════════════
-    size_t cleanup_thunk_label = 0;
-    if (hook_target_is_settop && hook_target != 0 && stolen_len > 0) {
-        cleanup_thunk_label = c.size();
-        // Emit the stolen prologue bytes
-        for (size_t i = 0; i < stolen_len; i++) e8(stolen[i]);
-        // Jump to the original function body (past the hook JMP patch)
-        uintptr_t thunk_cont = hook_target + stolen_len;
-        int64_t thunk_jd = static_cast<int64_t>(thunk_cont) -
-                           static_cast<int64_t>(cave_addr + c.size() + 5);
-        if (thunk_jd >= INT32_MIN && thunk_jd <= INT32_MAX) {
-            e8(0xE9);
-            e32(static_cast<uint32_t>(static_cast<int32_t>(thunk_jd)));
-        } else {
-            e({0xFF,0x25,0x00,0x00,0x00,0x00});
-            e64(thunk_cont);
-        }
-        // Patch step 4's movabs to point to this thunk
-        if (step4_settop_movabs != 0) {
-            uintptr_t thunk_addr = cave_addr + cleanup_thunk_label;
-            memcpy(&c[step4_settop_movabs + 2], &thunk_addr, 8);
-        }
-    }
+    (void)step4_settop_movabs;
+    (void)hook_target_is_settop;
 
     return c;
 }
@@ -6279,7 +6250,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 auto probe_tramp = gen_entry_trampoline(
                     addrs, mb_addr, cave.padding_start, cand,
                     cand_pro, cand_steal,
-                    true, false, true);
+                    true, true, true);
                 if (probe_tramp.size() > CAVE_SIZE) continue;
                 if (!proc_mem_write(pid, cave.padding_start,
                                     probe_tramp.data(),
@@ -6610,13 +6581,13 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                  "unavailable — held-lock hook will likely deadlock");
                     }
 
-                    hook_needs_unlock = false;
+                    hook_needs_unlock = true;
 
                     auto held_tramp = gen_entry_trampoline(
                         addrs, mb_addr, cave.padding_start,
                         best_live_settop, prologue, steal,
                         false,
-                        false, true);
+                        true, true);
                     if (held_tramp.size() <= CAVE_SIZE &&
                         proc_mem_write(pid, cave.padding_start,
                                        held_tramp.data(),
@@ -8025,6 +7996,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
