@@ -5509,8 +5509,12 @@ brute_done:
                             if (delta >= -0x100000LL && delta <= 0x100000LL) {
                                 pmu_addr = libc_base + unlock_sym + delta;
                             } else {
-                                pmu_addr = libc_base + unlock_sym;
-                                delta = 0;
+                                LOG_WARN("[direct-hook] inner lock 0x{:X} is {:.1f}MB "
+                                         "from libc lock 0x{:X} — custom lock "
+                                         "implementation, NOT using glibc unlock",
+                                         pml_addr,
+                                         static_cast<double>(delta) / (1024.0 * 1024.0),
+                                         libc_base + lock_sym);
                             }
                             LOG_DEBUG("[direct-hook] ELF: lock_sym=0x{:X} unlock_sym=0x{:X} "
                                       "delta={} → remote_unlock=0x{:X}",
@@ -5529,14 +5533,26 @@ brute_done:
                     int64_t delta = static_cast<int64_t>(pml_addr) - static_cast<int64_t>(pml_sym);
                     if (delta >= -0x100000LL && delta <= 0x100000LL) {
                         pmu_addr = pmu_sym + delta;
+                        LOG_DEBUG("[direct-hook] dlsym: lock_sym=0x{:X} unlock_sym=0x{:X} "
+                                  "delta={} → remote_unlock=0x{:X}",
+                                  pml_sym, pmu_sym, delta, pmu_addr);
                     } else {
-                        pmu_addr = pmu_sym;
-                        delta = 0;
+                        LOG_WARN("[direct-hook] dlsym: inner lock 0x{:X} is {:.1f}MB from "
+                                 "dlsym lock 0x{:X} — custom lock, NOT using glibc unlock",
+                                 pml_addr,
+                                 static_cast<double>(delta) / (1024.0 * 1024.0),
+                                 pml_sym);
                     }
-                    LOG_DEBUG("[direct-hook] dlsym: lock_sym=0x{:X} unlock_sym=0x{:X} "
-                              "delta={} → remote_unlock=0x{:X}",
-                              pml_sym, pmu_sym, delta, pmu_addr);
-                } else if (pmu_sym) {
+                } else if (pmu_sym && pml_addr) {
+                    int64_t dist = static_cast<int64_t>(pml_addr) - static_cast<int64_t>(pmu_sym);
+                    if (dist < 0) dist = -dist;
+                    if (dist < 0x100000LL) {
+                        pmu_addr = pmu_sym;
+                    } else {
+                        LOG_WARN("[direct-hook] dlsym unlock 0x{:X} is {:.1f}MB from "
+                                 "inner lock — skipping", pmu_sym, dist / (1024.0 * 1024.0));
+                    }
+                } else if (pmu_sym && !pml_addr) {
                     pmu_addr = pmu_sym;
                 }
             }
@@ -5548,10 +5564,22 @@ brute_done:
                 struct iovec ph_l = {lock_head, 8};
                 struct iovec ph_r = {reinterpret_cast<void*>(pml_addr), 8};
                 if (process_vm_readv(pid, &ph_l, 1, &ph_r, 1, 0) == 8) {
-                    for (int64_t try_off : {static_cast<int64_t>(0x30), static_cast<int64_t>(0x40),
-                                            static_cast<int64_t>(0x50), static_cast<int64_t>(0x60),
-                                            static_cast<int64_t>(0x80), static_cast<int64_t>(0x20),
-                                            static_cast<int64_t>(-0x30), static_cast<int64_t>(-0x40)}) {
+                for (int64_t try_off : {static_cast<int64_t>(0x10), static_cast<int64_t>(0x20),
+                                        static_cast<int64_t>(0x30), static_cast<int64_t>(0x40),
+                                        static_cast<int64_t>(0x50), static_cast<int64_t>(0x60),
+                                        static_cast<int64_t>(0x70), static_cast<int64_t>(0x80),
+                                        static_cast<int64_t>(0x90), static_cast<int64_t>(0xA0),
+                                        static_cast<int64_t>(0xC0), static_cast<int64_t>(0x100),
+                                        static_cast<int64_t>(0x140), static_cast<int64_t>(0x180),
+                                        static_cast<int64_t>(0x200), static_cast<int64_t>(0x300),
+                                        static_cast<int64_t>(0x400), static_cast<int64_t>(0x600),
+                                        static_cast<int64_t>(0x800),
+                                        static_cast<int64_t>(-0x10), static_cast<int64_t>(-0x20),
+                                        static_cast<int64_t>(-0x30), static_cast<int64_t>(-0x40),
+                                        static_cast<int64_t>(-0x60), static_cast<int64_t>(-0x80),
+                                        static_cast<int64_t>(-0xA0), static_cast<int64_t>(-0xC0),
+                                        static_cast<int64_t>(-0x100), static_cast<int64_t>(-0x200),
+                                        static_cast<int64_t>(-0x400), static_cast<int64_t>(-0x800)}) {
                         uintptr_t cand = pml_addr + try_off;
                         uint8_t cand_head[4];
                         struct iovec cl = {cand_head, 4};
@@ -6830,8 +6858,55 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         settop_probe_live = true;
         hook_needs_unlock = false;
     }
-          // Re-generate trampoline with the final validated addrs
+                   // Re-generate trampoline with the final validated addrs
     // (lua_settop may have been re-scanned by lock-anchored validation)
+
+    // ═══════════════════════════════════════════════════════════════
+    // BRACKET COMPATIBILITY CHECK
+    //
+    // The unlock bracket requires a COMPATIBLE unlock function.
+    // Sober uses a custom lock implementation (not glibc) — calling
+    // glibc's pthread_mutex_unlock on a Sober-locked mutex hangs.
+    //
+    // When no compatible unlock is available, DISABLE the bracket.
+    // The API calls (lua_newthread, luau_load, lua_resume) will try
+    // to acquire the lock internally:
+    //   - If recursive mutex → nested lock succeeds, everything works
+    //   - If non-recursive  → step-1 deadlock → lua_resume fallback
+    // Either outcome is better than deadlocking in the unlock itself.
+    // ═══════════════════════════════════════════════════════════════
+    if (hook_needs_unlock && !addrs.unlock_fn) {
+        bool unlock_compatible = false;
+        if (addrs.lock_internals_valid && addrs.pthread_mutex_unlock_addr) {
+            // Check that lock and unlock are from the SAME implementation
+            if (addrs.pthread_mutex_lock_addr != 0) {
+                int64_t lu_dist = static_cast<int64_t>(addrs.pthread_mutex_lock_addr) -
+                                  static_cast<int64_t>(addrs.pthread_mutex_unlock_addr);
+                if (lu_dist < 0) lu_dist = -lu_dist;
+                if (static_cast<uint64_t>(lu_dist) <= 0x100000ULL) { // ≤1MB
+                    unlock_compatible = true;
+                    LOG_INFO("[direct-hook] lock/unlock pair compatible "
+                             "(distance={:.1f}KB)", lu_dist / 1024.0);
+                } else {
+                    LOG_WARN("[direct-hook] inner lock 0x{:X} and synthesized "
+                             "unlock 0x{:X} are {:.1f}MB apart — INCOMPATIBLE "
+                             "(custom vs glibc), disabling bracket",
+                             addrs.pthread_mutex_lock_addr,
+                             addrs.pthread_mutex_unlock_addr,
+                             lu_dist / (1024.0 * 1024.0));
+                }
+            } else {
+                unlock_compatible = true; // no inner lock known, trust it
+            }
+        }
+        if (!unlock_compatible) {
+            LOG_WARN("[direct-hook] no compatible unlock available — "
+                     "disabling held-lock bracket (will rely on "
+                     "recursive mutex or lua_resume fallback)");
+            hook_needs_unlock = false;
+        }
+    }
+
     bool effective_held_lock = is_lock_hook || hook_needs_unlock;
     LOG_INFO("[direct-hook] final function addresses: resume=0x{:X} newthread=0x{:X} "
              "load=0x{:X} settop=0x{:X} lock=0x{:X} held_lock={} internals={}",
@@ -7146,7 +7221,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                     uint16_t zh = 0;
                                     proc_mem_write(pid, mb_addr + 42,
                                                    &zh, 2);
-                                    usleep(1000000);
+                                    usleep(3000000);
                                     uint16_t rh = 0;
                                     proc_mem_read(pid, mb_addr + 42,
                                                   &rh, 2);
@@ -7154,9 +7229,11 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                     if (rh < 1) {
                                         LOG_WARN("[direct-hook] "
                                             "lua_resume at 0x{:X} "
-                                            "has {} hits in 1s — "
+                                            "has {} hits in 3s — "
                                             "may not be called "
-                                            "frequently", addrs.resume,
+                                            "frequently (try during "
+                                            "active gameplay, not "
+                                            "lobby)", addrs.resume,
                                             rh);
                                         proc_mem_write(pid,
                                             addrs.resume, resume_pro,
@@ -7376,24 +7453,22 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                     "lua_newthread", "luau_load",
                     "lua_resume", "lua_settop(-2) cleanup"
                 };
-                const char* step_name = (fail_step <= 4)
-                    ? sn[fail_step] : "unknown";
                 if (fail_step == 0 && fail_guard == 1) {
                     error_ = "Direct hook dry-run failed — trampoline "
                              "entered payload path (guard=1) but hung "
-                             "in unlock bracket before step 1. The "
-                             "synthesized unlock is calling "
-                             "pthread_mutex_unlock with wrong argument "
-                             "(missing dereference in lock chain).";
+                             "before step 1. Lock bracket incompatible "
+                             "or API call deadlocked on non-recursive mutex.";
                 } else {
+                    const char* step_name = (fail_step <= 4)
+                        ? sn[fail_step] : "unknown";
                     error_ = "Direct hook dry-run failed — trampoline "
                              "deadlocked at step " +
                              std::to_string(fail_step) + " (" +
                              step_name + ").";
-                    if (fail_step == 1)
-                        error_ += " Hook target called with Lua lock "
-                                  "held — lua_resume retry also failed.";
                 }
+                if (fail_step <= 1)
+                    error_ += " lua_resume retry also failed.";
+            }
             }
             set_state(InjectionState::Failed, error_);
             return false;
@@ -8173,6 +8248,7 @@ void Injection::stop_auto_scan() {
 }
 
 }
+
 
 
 
