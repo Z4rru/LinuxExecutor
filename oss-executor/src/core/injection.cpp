@@ -4016,13 +4016,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             for (const auto& r : regions) {
                 if (out.load) break;
                 if (!r.readable() || !r.executable()) continue;
-                int64_t rd0 = static_cast<int64_t>(r.start) -
-                              static_cast<int64_t>(out.resume);
-                int64_t rd1 = static_cast<int64_t>(r.end) -
-                              static_cast<int64_t>(out.resume);
-            for (const auto& r : regions) {
-                if (out.load) break;
-                if (!r.readable() || !r.executable()) continue;
                 uintptr_t s_lo = (out.resume > 0x1000000) ? out.resume - 0x1000000 : 0;
                 uintptr_t s_hi = out.resume + 0x1000000;
                 uintptr_t r_lo = std::max(r.start, s_lo);
@@ -8135,6 +8128,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
