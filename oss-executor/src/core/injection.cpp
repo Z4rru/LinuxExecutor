@@ -1579,6 +1579,13 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         return false;
     }
 
+    if (proc_info_.via_flatpak || proc_info_.via_sober) {
+        LOG_WARN("dlopen returned handle 0x{:X} — assuming success for Flatpak/Sober containerized environment", result);
+        payload_loaded_ = true;
+        stop_elevated_helper();
+        return true;
+    }
+
     {
         bool lib_mapped = false;
         for (int maps_retry = 0; maps_retry < 10 && !lib_mapped; maps_retry++) {
@@ -2257,6 +2264,9 @@ void Injection::stop_elevated_helper() {
     proc_mem_write(pid, data_addr, orig_data, sizeof(orig_data));
 
     {
+    if (proc_info_.via_flatpak || proc_info_.via_sober) {
+        LOG_WARN("dlopen execution completed — bypassing maps check for Flatpak/Sober");
+    } else {
         bool lib_mapped = false;
         std::ifstream maps_check("/proc/" + std::to_string(pid) + "/maps");
         std::string maps_line;
@@ -2279,6 +2289,7 @@ void Injection::stop_elevated_helper() {
 
     stop_elevated_helper();
     LOG_INFO("inject_via_procmem: complete, process restored");
+
     payload_loaded_ = true;
     return true;
 }
@@ -3218,8 +3229,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     uintptr_t r_lo = xr.start;
                     uintptr_t r_hi = xr.end;
                     if (anchor != 0) {
-                        uintptr_t s_lo = (anchor > 0x1000000) ? anchor - 0x1000000 : 0;
-                        uintptr_t s_hi = anchor + 0x1000000;
+                        uintptr_t s_lo = (anchor > 0x80000000ULL) ? anchor - 0x80000000ULL : 0;
+                        uintptr_t s_hi = anchor + 0x80000000ULL;
                         r_lo = std::max(xr.start, s_lo);
                         r_hi = std::min(xr.end, s_hi);
                         if (r_lo >= r_hi) continue;
@@ -3328,13 +3339,12 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (!r.readable() || !r.executable()) continue;
                 if (anchor < r.start || anchor >= r.end) continue;
 
-                uintptr_t s_lo = (anchor > 0x1000000) ? anchor - 0x1000000 : 0;
-                uintptr_t s_hi = anchor + 0x1000000;
+                uintptr_t s_lo = (anchor > 0x80000000ULL) ? anchor - 0x80000000ULL : 0;
+                uintptr_t s_hi = anchor + 0x80000000ULL;
                 uintptr_t scan_lo = std::max(r.start, s_lo);
                 uintptr_t scan_hi = std::min(r.end, s_hi);
                 if (scan_lo >= scan_hi) continue;
                 size_t scan_sz = scan_hi - scan_lo;
-                if (scan_sz < 512) continue;
 
             std::vector<uint8_t> code(scan_sz);
             struct iovec li = {code.data(), scan_sz};
@@ -3738,8 +3748,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             if (!r.readable() || !r.executable()) continue;
             if (out.resume < r.start || out.resume >= r.end) continue;
 
-            uintptr_t s_lo = (out.resume > 0x1000000) ? out.resume - 0x1000000 : 0;
-            uintptr_t s_hi = out.resume + 0x1000000;
+            uintptr_t s_lo = (out.resume > 0x80000000ULL) ? out.resume - 0x80000000ULL : 0;
+            uintptr_t s_hi = out.resume + 0x80000000ULL;
             uintptr_t scan_lo = std::max(r.start, s_lo);
             uintptr_t scan_hi = std::min(r.end, s_hi);
             if (scan_lo >= scan_hi) continue;
@@ -3880,8 +3890,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 for (const auto& xr : regions) {
                     if (out.load) break;
                     if (!xr.readable() || !xr.executable() || xr.size() < 7) continue;
-                    uintptr_t s_lo = (out.resume > 0x1000000) ? out.resume - 0x1000000 : 0;
-                    uintptr_t s_hi = out.resume + 0x1000000;
+                    uintptr_t s_lo = (out.resume > 0x80000000ULL) ? out.resume - 0x80000000ULL : 0;
+                    uintptr_t s_hi = out.resume + 0x80000000ULL;
                     uintptr_t r_lo = std::max(xr.start, s_lo);
                     uintptr_t r_hi = std::min(xr.end, s_hi);
                     if (r_lo >= r_hi) continue;
@@ -4016,8 +4026,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             for (const auto& r : regions) {
                 if (out.load) break;
                 if (!r.readable() || !r.executable()) continue;
-                uintptr_t s_lo = (out.resume > 0x1000000) ? out.resume - 0x1000000 : 0;
-                uintptr_t s_hi = out.resume + 0x1000000;
+                uintptr_t s_lo = (out.resume > 0x80000000ULL) ? out.resume - 0x80000000ULL : 0;
+                uintptr_t s_hi = out.resume + 0x80000000ULL;
                 uintptr_t r_lo = std::max(r.start, s_lo);
                 uintptr_t r_hi = std::min(r.end, s_hi);
                 if (r_lo >= r_hi) continue;
@@ -4195,8 +4205,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                               static_cast<int64_t>(active_lock);
                 if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
             
-                uintptr_t s_lo = (active_lock > 0x1000000) ? active_lock - 0x1000000 : 0;
-                uintptr_t s_hi = active_lock + 0x1000000;
+                uintptr_t s_lo = (active_lock > 0x80000000ULL) ? active_lock - 0x80000000ULL : 0;
+                uintptr_t s_hi = active_lock + 0x80000000ULL;
                 uintptr_t r_lo = std::max(r.start, s_lo);
                 uintptr_t r_hi = std::min(r.end, s_hi);
                 if (r_lo >= r_hi) continue;
@@ -4426,8 +4436,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if (best_st_addr && best_st_score >= 20) break;
                         if (!r.readable() || !r.executable()) continue;
                         if (r.size() < 256) continue;
-                        uintptr_t s_lo = (active_lock > 0x1000000) ? active_lock - 0x1000000 : 0;
-                        uintptr_t s_hi = active_lock + 0x1000000;
+                        uintptr_t s_lo = (active_lock > 0x80000000ULL) ? active_lock - 0x80000000ULL : 0;
+                        uintptr_t s_hi = active_lock + 0x80000000ULL;
                         uintptr_t r_lo = std::max(r.start, s_lo);
                         uintptr_t r_hi = std::min(r.end, s_hi);
                         if (r_lo >= r_hi) continue;
@@ -4681,8 +4691,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (out.load) break;
                 if (!r.readable() || !r.executable()) continue;
                 if (r.size() < 512) continue;
-                uintptr_t s_lo = (active_lock > 0x1000000) ? active_lock - 0x1000000 : 0;
-                uintptr_t s_hi = active_lock + 0x1000000;
+                uintptr_t s_lo = (out.resume > 0x80000000ULL) ? out.resume - 0x80000000ULL : 0;
+                uintptr_t s_hi = out.resume + 0x80000000ULL;
                 uintptr_t r_lo = std::max(r.start, s_lo);
                 uintptr_t r_hi = std::min(r.end, s_hi);
                 if (r_lo >= r_hi) continue;
@@ -8128,6 +8138,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
