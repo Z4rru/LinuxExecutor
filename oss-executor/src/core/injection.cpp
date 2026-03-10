@@ -3213,27 +3213,25 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 uintptr_t str_addr = *hit;
                 for (const auto& xr : regions) {
                     if (!xr.readable() || !xr.executable() || xr.size() < 7) continue;
-                    // When we have an anchor function, skip xref regions that are
-                    // too far away — they belong to stale Luau copies.
                     uintptr_t anchor = out.resume ? out.resume :
                                        (out.settop ? out.settop : 0);
+                    uintptr_t r_lo = xr.start;
+                    uintptr_t r_hi = xr.end;
                     if (anchor != 0) {
-                        int64_t xr_dist_lo = static_cast<int64_t>(xr.start) -
-                                             static_cast<int64_t>(anchor);
-                        int64_t xr_dist_hi = static_cast<int64_t>(xr.end) -
-                                             static_cast<int64_t>(anchor);
-                        bool xr_near = (xr_dist_lo > -0x1000000LL && xr_dist_lo < 0x1000000LL) ||
-                                       (xr_dist_hi > -0x1000000LL && xr_dist_hi < 0x1000000LL);
-                        if (!xr_near) continue;
+                        uintptr_t s_lo = (anchor > 0x1000000) ? anchor - 0x1000000 : 0;
+                        uintptr_t s_hi = anchor + 0x1000000;
+                        r_lo = std::max(xr.start, s_lo);
+                        r_hi = std::min(xr.end, s_hi);
+                        if (r_lo >= r_hi) continue;
                     }
-                    size_t xscan = std::min(xr.size(), static_cast<size_t>(0x4000000));
+                    size_t xscan = r_hi - r_lo;
                     constexpr size_t CHUNK = 4096;
                     std::vector<uint8_t> buf(CHUNK + 16);
                     for (size_t off = 0; off + 7 <= xscan; off += CHUNK) {
                         size_t avail = xscan - off;
                         size_t rd = std::min(avail, CHUNK + 7);
                         struct iovec local_iov = { buf.data(), rd };
-                        struct iovec remote_iov = { reinterpret_cast<void*>(xr.start + off), rd };
+                        struct iovec remote_iov = { reinterpret_cast<void*>(r_lo + off), rd };
                         if (process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0) != static_cast<ssize_t>(rd)) continue;
                         for (size_t i = 0; i + 7 <= rd; i++) {
                             bool found_xref = false;
@@ -3241,14 +3239,14 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                             // Both use ModRM mod=00 rm=101 for RIP-relative addressing
                             if ((buf[i] == 0x8D || buf[i] == 0x8B) && (buf[i+1] & 0xC7) == 0x05) {
                                 int32_t disp; memcpy(&disp, &buf[i+2], 4);
-                                uintptr_t target = xr.start + off + i + 6 + (int64_t)disp;
+                                uintptr_t target = r_lo + off + i + 6 + (int64_t)disp;
                                 if (target == str_addr) found_xref = true;
                             }
                             // REX + LEA/MOV reg,[rip+disp32]
                             if (!found_xref && buf[i] >= 0x40 && buf[i] <= 0x4F &&
                                 (buf[i+1] == 0x8D || buf[i+1] == 0x8B) && (buf[i+2] & 0xC7) == 0x05) {
                                 int32_t disp; memcpy(&disp, &buf[i+3], 4);
-                                uintptr_t target = xr.start + off + i + 7 + (int64_t)disp;
+                                uintptr_t target = r_lo + off + i + 7 + (int64_t)disp;
                                 if (target == str_addr) found_xref = true;
                             }
                             // MOVABS reg, imm64 — absolute address in immediate (non-PIC / JIT code)
@@ -3259,7 +3257,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                                 if (imm == str_addr) found_xref = true;
                             }
                             if (!found_xref) continue;
-                            uintptr_t xref_addr = xr.start + off + i;
+                            uintptr_t xref_addr = r_lo + off + i;
                             uintptr_t limit = (xref_addr > 4096) ? xref_addr - 4096 : 0;
                             for (uintptr_t p = xref_addr - 1; p >= limit; p--) {
                                 uint8_t w[8];
@@ -3330,8 +3328,11 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (!r.readable() || !r.executable()) continue;
                 if (anchor < r.start || anchor >= r.end) continue;
 
-                uintptr_t scan_lo = (anchor > r.start + 0x1000000) ? anchor - 0x1000000 : r.start;
-                uintptr_t scan_hi = std::min(anchor + 0x1000000, r.end);
+                uintptr_t s_lo = (anchor > 0x1000000) ? anchor - 0x1000000 : 0;
+                uintptr_t s_hi = anchor + 0x1000000;
+                uintptr_t scan_lo = std::max(r.start, s_lo);
+                uintptr_t scan_hi = std::min(r.end, s_hi);
+                if (scan_lo >= scan_hi) continue;
                 size_t scan_sz = scan_hi - scan_lo;
                 if (scan_sz < 512) continue;
 
@@ -3737,8 +3738,11 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             if (!r.readable() || !r.executable()) continue;
             if (out.resume < r.start || out.resume >= r.end) continue;
 
-            uintptr_t scan_lo = (out.resume > r.start + 0x1000000) ? out.resume - 0x1000000 : r.start;
-            uintptr_t scan_hi = std::min(out.resume + 0x1000000, r.end);
+            uintptr_t s_lo = (out.resume > 0x1000000) ? out.resume - 0x1000000 : 0;
+            uintptr_t s_hi = out.resume + 0x1000000;
+            uintptr_t scan_lo = std::max(r.start, s_lo);
+            uintptr_t scan_hi = std::min(r.end, s_hi);
+            if (scan_lo >= scan_hi) continue;
             size_t scan_sz = scan_hi - scan_lo;
             if (scan_sz < 512) continue;
 
@@ -3876,10 +3880,12 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 for (const auto& xr : regions) {
                     if (out.load) break;
                     if (!xr.readable() || !xr.executable() || xr.size() < 7) continue;
-                    int64_t xdist = static_cast<int64_t>(xr.start) -
-                                    static_cast<int64_t>(out.resume);
-                    if (xdist < -0x1000000LL || xdist > 0x1000000LL) continue;
-                    size_t xscan = std::min(xr.size(), static_cast<size_t>(0x4000000));
+                    uintptr_t s_lo = (out.resume > 0x1000000) ? out.resume - 0x1000000 : 0;
+                    uintptr_t s_hi = out.resume + 0x1000000;
+                    uintptr_t r_lo = std::max(xr.start, s_lo);
+                    uintptr_t r_hi = std::min(xr.end, s_hi);
+                    if (r_lo >= r_hi) continue;
+                    size_t xscan = r_hi - r_lo;
                     constexpr size_t LR_CHK = 4096;
                     std::vector<uint8_t> lrbuf(LR_CHK + 16);
                     for (size_t lroff = 0; lroff + 7 <= xscan && !out.load;
@@ -3887,7 +3893,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         size_t avail = xscan - lroff;
                         size_t rdsz = std::min(avail, LR_CHK + static_cast<size_t>(7));
                         struct iovec lrl = {lrbuf.data(), rdsz};
-                        struct iovec lrr = {reinterpret_cast<void*>(xr.start + lroff), rdsz};
+                        struct iovec lrr = {reinterpret_cast<void*>(r_lo + lroff), rdsz};
                         if (process_vm_readv(pid, &lrl, 1, &lrr, 1, 0) !=
                             static_cast<ssize_t>(rdsz)) continue;
                         for (size_t li = 0; li + 7 <= rdsz && !out.load; li++) {
@@ -3895,13 +3901,13 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                                                         // LEA or MOV reg,[rip+disp32] (0x8D=LEA, 0x8B=MOV)
                             if ((lrbuf[li]==0x8D || lrbuf[li]==0x8B) && (lrbuf[li+1]&0xC7)==0x05) {
                                 int32_t d; memcpy(&d, &lrbuf[li+2], 4);
-                                if (xr.start+lroff+li+6+(int64_t)d == str_addr) xf=true;
+                                if (r_lo+lroff+li+6+(int64_t)d == str_addr) xf=true;
                             }
                             // REX + LEA/MOV reg,[rip+disp32]
                             if (!xf && lrbuf[li]>=0x40 && lrbuf[li]<=0x4F &&
                                 (lrbuf[li+1]==0x8D || lrbuf[li+1]==0x8B) && (lrbuf[li+2]&0xC7)==0x05) {
                                 int32_t d; memcpy(&d, &lrbuf[li+3], 4);
-                                if (xr.start+lroff+li+7+(int64_t)d == str_addr) xf=true;
+                                if (r_lo+lroff+li+7+(int64_t)d == str_addr) xf=true;
                             }
                             // MOVABS reg, imm64 — absolute address in immediate
                             if (!xf && li + 10 <= rdsz &&
@@ -3911,7 +3917,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                                 if (imm == str_addr) xf=true;
                             }
                             if (!xf) continue;
-                            uintptr_t xa = xr.start + lroff + li;
+                            uintptr_t xa = r_lo + lroff + li;
                             uintptr_t lim = (xa > 4096) ? xa - 4096 : 0;
                             for (uintptr_t p = xa-1; p >= lim && !out.load; p--) {
                                 uint8_t w[8];
@@ -4014,19 +4020,26 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                               static_cast<int64_t>(out.resume);
                 int64_t rd1 = static_cast<int64_t>(r.end) -
                               static_cast<int64_t>(out.resume);
-                if (!((rd0 > -0x1000000LL && rd0 < 0x1000000LL) ||
-                      (rd1 > -0x1000000LL && rd1 < 0x1000000LL))) continue;
-                size_t scan_sz = std::min(r.size(),
-                                          static_cast<size_t>(0x4000000));
+            for (const auto& r : regions) {
+                if (out.load) break;
+                if (!r.readable() || !r.executable()) continue;
+                uintptr_t s_lo = (out.resume > 0x1000000) ? out.resume - 0x1000000 : 0;
+                uintptr_t s_hi = out.resume + 0x1000000;
+                uintptr_t r_lo = std::max(r.start, s_lo);
+                uintptr_t r_hi = std::min(r.end, s_hi);
+                if (r_lo >= r_hi) continue;
+                size_t scan_sz = r_hi - r_lo;
+                if (scan_sz < 512) continue;
+
                 std::vector<uint8_t> code(scan_sz);
                 struct iovec lli = {code.data(), scan_sz};
-                struct iovec lri = {reinterpret_cast<void*>(r.start), scan_sz};
+                struct iovec lri = {reinterpret_cast<void*>(r_lo), scan_sz};
                 if (process_vm_readv(pid, &lli, 1, &lri, 1, 0) !=
                     static_cast<ssize_t>(scan_sz)) continue;
                 for (size_t off = 1; off + 500 < scan_sz; off++) {
                     if (code[off-1]!=0xC3 && code[off-1]!=0xCC &&
                         code[off-1]!=0x90) continue;
-                    uintptr_t addr = r.start + off;
+                    uintptr_t addr = r_lo + off;
                     if (addr==out.resume || addr==out.settop ||
                         addr==out.newthread || addr==out.sandbox) continue;
                     size_t p = off;
@@ -4189,26 +4202,29 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                               static_cast<int64_t>(active_lock);
                 if (rd0 < -0x2800000LL || rd0 > 0x2800000LL) continue;
                 if (out.resume) {
-                    int64_t rdr = static_cast<int64_t>(r.start) -
-                                  static_cast<int64_t>(out.resume);
-                    int64_t rdr_e = static_cast<int64_t>(r.end) -
-                                    static_cast<int64_t>(out.resume);
-                    bool near_resume = (rdr > -0xA00000LL && rdr < 0xA00000LL) ||
-                                       (rdr_e > -0xA00000LL && rdr_e < 0xA00000LL);
-                    if (!near_resume) continue;
+                uintptr_t s_lo = (active_lock > 0x1000000) ? active_lock - 0x1000000 : 0;
+                uintptr_t s_hi = active_lock + 0x1000000;
+                uintptr_t r_lo = std::max(r.start, s_lo);
+                uintptr_t r_hi = std::min(r.end, s_hi);
+                if (r_lo >= r_hi) continue;
+                if (out.resume) {
+                    uintptr_t rs_lo = (out.resume > 0xA00000) ? out.resume - 0xA00000 : 0;
+                    uintptr_t rs_hi = out.resume + 0xA00000;
+                    r_lo = std::max(r_lo, rs_lo);
+                    r_hi = std::min(r_hi, rs_hi);
+                    if (r_lo >= r_hi) continue;
                 }
-                size_t scan_sz = std::min(r.size(),
-                                          static_cast<size_t>(0x4000000));
+                size_t scan_sz = r_hi - r_lo;
                 std::vector<uint8_t> code(scan_sz);
                 struct iovec sli = {code.data(), scan_sz};
-                struct iovec sri = {reinterpret_cast<void*>(r.start),
+                struct iovec sri = {reinterpret_cast<void*>(r_lo),
                                     scan_sz};
                 if (process_vm_readv(pid, &sli, 1, &sri, 1, 0) !=
                     static_cast<ssize_t>(scan_sz)) continue;
                 for (size_t off = 1; off + 800 < scan_sz; off++) {
                     if (code[off - 1] != 0xC3 && code[off - 1] != 0xCC &&
                         code[off - 1] != 0x90) continue;
-                    uintptr_t addr = r.start + off;
+                    uintptr_t addr = r_lo + off;
                     if (addr == out.settop || addr == out.newthread ||
                         addr == out.load) continue;
                     size_t p = off;
@@ -4417,14 +4433,15 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if (best_st_addr && best_st_score >= 20) break;
                         if (!r.readable() || !r.executable()) continue;
                         if (r.size() < 256) continue;
-                        int64_t rd0 = static_cast<int64_t>(r.start) -
-                                      static_cast<int64_t>(active_lock);
-                        if (rd0 < -0x1000000LL || rd0 > 0x1000000LL) continue;
-                        size_t scan_sz = std::min(r.size(),
-                                                  static_cast<size_t>(0x4000000));
+                        uintptr_t s_lo = (active_lock > 0x1000000) ? active_lock - 0x1000000 : 0;
+                        uintptr_t s_hi = active_lock + 0x1000000;
+                        uintptr_t r_lo = std::max(r.start, s_lo);
+                        uintptr_t r_hi = std::min(r.end, s_hi);
+                        if (r_lo >= r_hi) continue;
+                        size_t scan_sz = r_hi - r_lo;
                         std::vector<uint8_t> code(scan_sz);
                         struct iovec sli = {code.data(), scan_sz};
-                        struct iovec sri = {reinterpret_cast<void*>(r.start),
+                        struct iovec sri = {reinterpret_cast<void*>(r_lo),
                                             scan_sz};
                         if (process_vm_readv(pid, &sli, 1, &sri, 1, 0) !=
                             static_cast<ssize_t>(scan_sz)) continue;
@@ -4432,7 +4449,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                             if (code[off - 1] != 0xC3 &&
                                 code[off - 1] != 0xCC &&
                                 code[off - 1] != 0x90) continue;
-                            uintptr_t addr = r.start + off;
+                            uintptr_t addr = r_lo + off;
                             if (addr == best_raddr || addr == out.newthread ||
                                 addr == out.load) continue;
                             size_t p = off;
@@ -4671,21 +4688,22 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 if (out.load) break;
                 if (!r.readable() || !r.executable()) continue;
                 if (r.size() < 512) continue;
-                int64_t rd0 = static_cast<int64_t>(r.start) -
-                              static_cast<int64_t>(active_lock);
-                if (rd0 < -0x1000000LL || rd0 > 0x1000000LL) continue;
-                size_t scan_sz = std::min(r.size(),
-                                          static_cast<size_t>(0x4000000));
+                uintptr_t s_lo = (active_lock > 0x1000000) ? active_lock - 0x1000000 : 0;
+                uintptr_t s_hi = active_lock + 0x1000000;
+                uintptr_t r_lo = std::max(r.start, s_lo);
+                uintptr_t r_hi = std::min(r.end, s_hi);
+                if (r_lo >= r_hi) continue;
+                size_t scan_sz = r_hi - r_lo;
                 std::vector<uint8_t> code(scan_sz);
                 struct iovec lli = {code.data(), scan_sz};
-                struct iovec lri = {reinterpret_cast<void*>(r.start),
+                struct iovec lri = {reinterpret_cast<void*>(r_lo),
                                     scan_sz};
                 if (process_vm_readv(pid, &lli, 1, &lri, 1, 0) !=
                     static_cast<ssize_t>(scan_sz)) continue;
                 for (size_t off = 1; off + 500 < scan_sz; off++) {
                     if (code[off - 1] != 0xC3 && code[off - 1] != 0xCC &&
                         code[off - 1] != 0x90) continue;
-                    uintptr_t addr = r.start + off;
+                    uintptr_t addr = r_lo + off;
                     if (addr == out.resume || addr == out.settop ||
                         addr == out.newthread || addr == out.sandbox)
                         continue;
@@ -4899,14 +4917,15 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                 for (const auto& r : regions) {
                     if (best_addr) break;
                     if (!r.readable() || !r.executable() || r.size() < 512) continue;
-                    int64_t rd = static_cast<int64_t>(r.start) -
-                                 static_cast<int64_t>(out.resume);
-                    if (rd < -0x1000000LL || rd > 0x1000000LL) continue;
-                    size_t scan_sz = std::min(r.size(),
-                                              static_cast<size_t>(0x4000000));
+                    uintptr_t s_lo = (out.resume > 0x1000000) ? out.resume - 0x1000000 : 0;
+                    uintptr_t s_hi = out.resume + 0x1000000;
+                    uintptr_t r_lo = std::max(r.start, s_lo);
+                    uintptr_t r_hi = std::min(r.end, s_hi);
+                    if (r_lo >= r_hi) continue;
+                    size_t scan_sz = r_hi - r_lo;
                     std::vector<uint8_t> code(scan_sz);
                     struct iovec rsl = {code.data(), scan_sz};
-                    struct iovec rsr = {reinterpret_cast<void*>(r.start), scan_sz};
+                    struct iovec rsr = {reinterpret_cast<void*>(r_lo), scan_sz};
                     if (process_vm_readv(pid, &rsl, 1, &rsr, 1, 0) !=
                         static_cast<ssize_t>(scan_sz)) continue;
                     for (size_t off = 1; off + sizeof(pro9) + 30 < scan_sz; off++) {
@@ -4921,7 +4940,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                             pro_off += 4;
                         if (pro_off + sizeof(pro9) + 20 >= scan_sz) continue;
                         if (memcmp(&code[pro_off], pro9, sizeof(pro9)) != 0) continue;
-                        uintptr_t cand = r.start + off;
+                        uintptr_t cand = r_lo + off;
                         if (cand == out.resume || cand == out.settop ||
                             cand == out.load) continue;
                         // Find first E8 after prologue
@@ -8116,6 +8135,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
