@@ -5808,15 +5808,15 @@ static std::vector<uint8_t> gen_entry_trampoline(
                     e32(static_cast<uint32_t>(a.lua_state_to_lock_arg));
                 }
             }
-            // Step 2: replicate lua_lock's internal dereference
-            if (a.lock_global_state_offset == 0) {
-                e({0x48,0x8B,0x3F});   // mov rdi, [rdi]
-            } else if (a.lock_global_state_offset >= -128 && a.lock_global_state_offset < 128) {
-                e({0x48,0x8B,0x7F});
-                e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_global_state_offset)));
-            } else {
-                e({0x48,0x8B,0xBF});
-                e32(static_cast<uint32_t>(a.lock_global_state_offset));
+               // Step 2: replicate lua_lock's internal dereference
+            if (a.lock_global_state_offset != 0) {
+                if (a.lock_global_state_offset >= -128 && a.lock_global_state_offset < 128) {
+                    e({0x48,0x8B,0x7F});
+                    e8(static_cast<uint8_t>(static_cast<int8_t>(a.lock_global_state_offset)));
+                } else {
+                    e({0x48,0x8B,0xBF});
+                    e32(static_cast<uint32_t>(a.lock_global_state_offset));
+                }
             }
             // Step 3: add mutex offset within structure
             if (a.lock_mutex_offset != 0) {
@@ -6211,9 +6211,13 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 }
                 if (lock_arg != 0) {
                     uintptr_t global_state = 0;
-                    uintptr_t gs_addr = lock_arg +
-                        static_cast<uintptr_t>(addrs.lock_global_state_offset);
-                    if (proc_mem_read(pid, gs_addr, &global_state, 8) && global_state != 0) {
+                    if (addrs.lock_global_state_offset != 0) {
+                        uintptr_t gs_addr = lock_arg + static_cast<uintptr_t>(addrs.lock_global_state_offset);
+                        if (!proc_mem_read(pid, gs_addr, &global_state, 8)) global_state = 0;
+                    } else {
+                        global_state = lock_arg;
+                    }
+                    if (global_state != 0) {
                         uintptr_t mutex_addr = global_state +
                             static_cast<uintptr_t>(addrs.lock_mutex_offset);
                         uintptr_t kind_addr = mutex_addr + 16;
@@ -6754,13 +6758,13 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                  "unavailable — held-lock hook will likely deadlock");
                     }
 
-                    hook_needs_unlock = false;
+                    hook_needs_unlock = true;
 
                     auto held_tramp = gen_entry_trampoline(
                         addrs, mb_addr, cave.padding_start,
                         best_live_settop, prologue, steal,
                         false,
-                        false, false);
+                        true, true);
                     if (held_tramp.size() <= CAVE_SIZE &&
                         proc_mem_write(pid, cave.padding_start,
                                        held_tramp.data(),
@@ -6836,9 +6840,10 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                             hook_addr = addrs.resume;
                             is_lock_hook = false;
                             settop_probe_live = true;
+                            hook_needs_unlock = true;
                             LOG_INFO("[direct-hook] lua_resume hook "
-                                     "succeeded as fallback (no "
-                                     "unlock/lock bracket needed, "
+                                     "succeeded as fallback (using "
+                                     "unlock/lock bracket, "
                                      "step 4 cleanup skipped)");
                         }
                     }
@@ -7177,7 +7182,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                         auto rt = gen_entry_trampoline(
                             addrs, mb_addr, cave.padding_start,
                             addrs.resume, resume_pro, resume_steal,
-                            false, false, false);
+                            false, true, false);
 
                         if (rt.size() <= CAVE_SIZE &&
                             proc_mem_write(pid, cave.padding_start,
@@ -7255,7 +7260,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                                 addrs.resume,
                                                 resume_pro,
                                                 resume_steal,
-                                                false, false, false);
+                                                false, true, false);
                                         proc_mem_write(pid,
                                             cave.padding_start,
                                             rt_final.data(),
@@ -8269,6 +8274,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
