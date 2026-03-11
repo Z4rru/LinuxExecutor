@@ -7874,6 +7874,17 @@ bool Injection::execute_script(const std::string& source) {
         if (armed_seq > 0) {
             bool executed = wait_for_mailbox_ack(armed_seq, sent_bc_len, sent_bc_ver);
             if (executed) {
+                uint32_t final_step = 0;
+                int32_t resume_result = 0;
+                proc_mem_read(memory_.get_pid(), dhook_.mailbox_addr + 44, &final_step, 4);
+                proc_mem_read(memory_.get_pid(), dhook_.mailbox_addr + 56, &resume_result, 4);
+                if (final_step < 3) {
+                    set_state(InjectionState::Ready,
+                              "luau_load failed (step=" + std::to_string(final_step) +
+                              ") — bytecode version mismatch? Update Luau in CMakeLists.txt");
+                    LOG_ERROR("Trampoline completed but luau_load failed at step {}", final_step);
+                    return false;
+                }
                 set_state(InjectionState::Ready, "Script executed in Roblox");
                 return true;
             }
@@ -8153,6 +8164,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
