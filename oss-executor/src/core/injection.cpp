@@ -7646,11 +7646,27 @@ bool Injection::inject() {
 
             if (handshake) {
                 LOG_INFO("Payload handshake confirmed");
+                payload_loaded_ = true;
             } else {
-                LOG_WARN("Payload handshake timeout — library may still be initializing");
+                LOG_WARN("Payload handshake failed — payload not functional in sandbox");
+                payload_loaded_ = false;
+
+                if (proc_info_.via_flatpak || proc_info_.via_sober) {
+                    std::string staged = "/proc/" + std::to_string(memory_.get_pid()) +
+                                         "/root/tmp/liboss_payload.so";
+                    if (std::remove(staged.c_str()) == 0)
+                        LOG_DEBUG("Cleaned up staged payload: {}", staged);
+                }
+
+                LOG_INFO("Attempting direct hook injection (payload IPC unreachable)...");
+                set_state(InjectionState::Injecting, "Trying direct hook injection...");
+                if (inject_via_direct_hook(memory_.get_pid())) {
+                    payload_loaded_ = true;
+                    LOG_INFO("Direct hook injection succeeded after payload handshake failure");
+                } else {
+                    LOG_WARN("Direct hook injection also failed: {}", error_);
+                }
             }
-       
-            payload_loaded_ = true;
         } else {
             // *** CHUNK 2 APPLIED: direct hook fallback after library injection failure ***
             LOG_WARN("Library injection failed ({}), continuing with VM-scan mode", error_);
@@ -7795,8 +7811,8 @@ bool Injection::verify_payload_alive() {
     if (::stat((prefix + "/tmp/oss_payload_cmd").c_str(), &st) == 0)
         return true;
 
-    LOG_WARN("Payload mapped but no IPC channel reachable");
-    return mapped;
+    LOG_WARN("Payload mapped but no IPC channel reachable — payload not functional");
+    return false;
 }
 
 bool Injection::execute_script(const std::string& source) {
@@ -8015,13 +8031,10 @@ bool Injection::execute_script(const std::string& source) {
                     set_state(InjectionState::Ready,
                               "Script executed via file IPC");
                     LOG_INFO("File IPC confirmed: payload consumed command");
-                } else {
-                    set_state(InjectionState::Ready,
-                              "Script dispatched via file IPC (unconfirmed)");
-                    LOG_WARN("File IPC: no ack after 2s — payload may not "
-                             "have consumed the command");
+                    return true;
                 }
-                return true;
+                LOG_WARN("File IPC: no ack after 2s — payload not running, trying other channels");
+                ::unlink(cmd_path.c_str());
             }
             LOG_ERROR("File IPC write/rename error: {}", strerror(errno));
             ::unlink(tmp_cmd.c_str());
@@ -8140,6 +8153,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
