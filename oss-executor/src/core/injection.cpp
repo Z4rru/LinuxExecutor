@@ -6189,65 +6189,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         }
         LOG_INFO("[direct-hook] {} probe: {} hits in 1000ms — LIVE!", name, hits);
 
-        // Patch Lua global mutex to PTHREAD_MUTEX_RECURSIVE to prevent
-        // step-1 deadlock when lua_newthread re-acquires the held lock.
-        // Derivation: glibc x86_64 pthread_mutex_t.__kind is at offset 16.
-        // PTHREAD_MUTEX_RECURSIVE_NP = 1.
-        {
-            uintptr_t captured_L = 0;
-            proc_mem_read(pid, mb_addr + 0x30, &captured_L, 8);
-            if (captured_L != 0 && captured_L > 0x10000 &&
-                captured_L < 0x7FFFFFFFFFFFULL &&
-                addrs.pthread_mutex_lock_addr != 0) {
-                uintptr_t lock_arg = captured_L;
-                if (addrs.lua_state_to_lock_arg >= 0) {
-                    uintptr_t deref_addr = captured_L +
-                        static_cast<uintptr_t>(addrs.lua_state_to_lock_arg);
-                    if (!proc_mem_read(pid, deref_addr, &lock_arg, 8) || lock_arg == 0) {
-                        LOG_WARN("[direct-hook] mutex patch: deref L+{} failed",
-                                 addrs.lua_state_to_lock_arg);
-                        lock_arg = 0;
-                    }
-                }
-               
-                if (lock_arg != 0) {
-                    uintptr_t global_state = 0;
-                    uintptr_t gs_addr = 0;
-                    if (addrs.lock_global_state_offset != 0) {
-                        gs_addr = lock_arg + static_cast<uintptr_t>(addrs.lock_global_state_offset);
-                        if (!proc_mem_read(pid, gs_addr, &global_state, 8)) global_state = 0;
-                    } else {
-                        global_state = lock_arg;
-                    }
-                    if (global_state != 0) {
-                        uintptr_t mutex_addr = global_state +
-                            static_cast<uintptr_t>(addrs.lock_mutex_offset);
-                        uintptr_t kind_addr = mutex_addr + 16;
-                        int32_t current_kind = 0;
-                        if (proc_mem_read(pid, kind_addr, &current_kind, 4)) {
-                            if (current_kind == 0) {
-                                int32_t recursive = 1;
-                                if (proc_mem_write(pid, kind_addr, &recursive, 4)) {
-                                    LOG_INFO("[direct-hook] patched mutex to RECURSIVE "
-                                             "(mutex=0x{:X} kind=0x{:X})",
-                                             mutex_addr, kind_addr);
-                                } else {
-                                    LOG_WARN("[direct-hook] mutex kind write failed");
-                                }
-                            } else {
-                                LOG_DEBUG("[direct-hook] mutex kind already {} at 0x{:X}",
-                                          current_kind, kind_addr);
-                            }
-                        }
-                    } else {
-                        LOG_WARN("[direct-hook] mutex patch: global_State read failed "
-                                 "(gs_addr=0x{:X})", gs_addr);
-                    }
-                }
-            } else if (captured_L != 0) {
-                LOG_DEBUG("[direct-hook] mutex patch skipped: lock internals unavailable");
-            }
-        }
+        // Mutex patching removed: blindly writing to offset 16 corrupts custom lock 
+        // implementations (like Sober's), causing step-1 deadlocks.
+        // We rely entirely on the unlock/lock bracket instead.
 
         // Commit: store stolen bytes and patch for cleanup
         memcpy(prologue, pro, st);
@@ -6842,10 +6786,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                             hook_addr = addrs.resume;
                             is_lock_hook = false;
                             settop_probe_live = true;
-                            hook_needs_unlock = true;
+                            hook_needs_unlock = false;
                             LOG_INFO("[direct-hook] lua_resume hook "
-                                     "succeeded as fallback (using "
-                                     "unlock/lock bracket, "
+                                     "succeeded as fallback (no bracket needed, "
                                      "step 4 cleanup skipped)");
                         }
                     }
@@ -8276,6 +8219,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
