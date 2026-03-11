@@ -3195,9 +3195,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if (rl_dist < 0) rl_dist = -rl_dist;
         if (static_cast<uint64_t>(rl_dist) > 0x2800000ULL) {
             LOG_WARN("[direct-hook] pre-validation: luau_load 0x{:X} is {:.0f}MB "
-                     "from lua_resume 0x{:X} — keeping it as layout varies",
+                     "from lua_resume 0x{:X} — clearing for proximity re-scan",
                      out.load, rl_dist / (1024.0 * 1024.0), out.resume);
-            // out.load = 0;
+            out.load = 0;
         }
     }
     
@@ -3859,9 +3859,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if (ld < 0) ld = -ld;
         if (static_cast<uint64_t>(ld) > 0x2800000ULL) { // >40MB
             LOG_WARN("[direct-hook] luau_load at 0x{:X} is {:.0f}MB from lua_resume "
-                     "0x{:X} — keeping it as layout varies",
+                     "0x{:X} — wrong copy, clearing for proximity re-scan",
                      out.load, ld / (1024.0 * 1024.0), out.resume);
-            // out.load = 0;
+            out.load = 0;
         }
     }
 
@@ -6786,9 +6786,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                             hook_addr = addrs.resume;
                             is_lock_hook = false;
                             settop_probe_live = true;
-                            hook_needs_unlock = false;
+                            hook_needs_unlock = true;
                             LOG_INFO("[direct-hook] lua_resume hook "
-                                     "succeeded as fallback (no bracket needed, "
+                                     "succeeded as fallback (unlock bracket enabled, "
                                      "step 4 cleanup skipped)");
                         }
                     }
@@ -8219,6 +8219,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
