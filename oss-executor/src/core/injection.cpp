@@ -6209,10 +6209,12 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                         lock_arg = 0;
                     }
                 }
+               
                 if (lock_arg != 0) {
                     uintptr_t global_state = 0;
+                    uintptr_t gs_addr = 0;
                     if (addrs.lock_global_state_offset != 0) {
-                        uintptr_t gs_addr = lock_arg + static_cast<uintptr_t>(addrs.lock_global_state_offset);
+                        gs_addr = lock_arg + static_cast<uintptr_t>(addrs.lock_global_state_offset);
                         if (!proc_mem_read(pid, gs_addr, &global_state, 8)) global_state = 0;
                     } else {
                         global_state = lock_arg;
@@ -8274,6 +8276,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
