@@ -3516,8 +3516,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     break;
                 }
             }
-            // First CALL = lua_lock
-            for (int i = 0; i < static_cast<int>(std::min(nt_fend, static_cast<size_t>(30))); i++) {
+                        // First CALL = lua_lock (expanded to catch calls after long prologues)
+            for (int i = 0; i < static_cast<int>(std::min(nt_fend, static_cast<size_t>(80))); i++) {
                 if (ntb[i] == 0xE8) {
                     int32_t d; memcpy(&d, &ntb[i+1], 4);
                     out.lock_fn = out.newthread + i + 5 + (int64_t)d;
@@ -3672,7 +3672,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     break;
                 }
             }
-            for (int i = 0; i < static_cast<int>(std::min(nt2_fend, static_cast<size_t>(30))); i++) {
+            for (int i = 0; i < static_cast<int>(std::min(nt2_fend, static_cast<size_t>(80))); i++) {
                 if (ntb2[i] == 0xE8) {
                     int32_t d; memcpy(&d, &ntb2[i+1], 4);
                     out.lock_fn = out.newthread + i + 5 + (int64_t)d;
@@ -4112,7 +4112,38 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     }
 
     
-      uintptr_t active_lock = out.lock_fn;
+          // Fallback: extract lua_lock from lua_settop if lua_newthread extraction failed
+    if (!out.lock_fn && out.settop) {
+        uint8_t st_lock_buf[128];
+        struct iovec stl_l = {st_lock_buf, sizeof(st_lock_buf)};
+        struct iovec stl_r = {reinterpret_cast<void*>(out.settop), sizeof(st_lock_buf)};
+        ssize_t stl_rd = process_vm_readv(pid, &stl_l, 1, &stl_r, 1, 0);
+        if (stl_rd >= 20) {
+            size_t stl_len = static_cast<size_t>(stl_rd);
+            size_t stl_fend = stl_len;
+            for (size_t si = 20; si + 1 < stl_len; si++) {
+                if (st_lock_buf[si] != 0xC3) continue;
+                uint8_t nx = st_lock_buf[si + 1];
+                if (nx == 0xCC || nx == 0x90 || nx == 0x55 || nx == 0x53 ||
+                    nx == 0xF3 || nx == 0x00) {
+                    stl_fend = si + 1;
+                    break;
+                }
+            }
+            for (size_t i = 0; i < std::min(stl_fend, static_cast<size_t>(80)); i++) {
+                if (st_lock_buf[i] != 0xE8) continue;
+                int32_t d;
+                memcpy(&d, &st_lock_buf[i + 1], 4);
+                uintptr_t target = out.settop + i + 5 + static_cast<int64_t>(d);
+                out.lock_fn = target;
+                LOG_INFO("[direct-hook] lua_lock at 0x{:X} (fallback from lua_settop+{})",
+                         out.lock_fn, i);
+                break;
+            }
+        }
+    }
+
+    uintptr_t active_lock = out.lock_fn;
     // ═══════════════════════════════════════════════════════════════
     // Validate lua_resume calls active_lock.
     // lua_resume is a Lua C API function — it MUST call lua_lock.
@@ -5036,7 +5067,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     // ═══════════════════════════════════════════════════════════════
 
     if (active_lock && out.newthread) {
-        uint8_t nt_pre[64];
+        uint8_t nt_pre[128];
         struct iovec sp_l = {nt_pre, sizeof(nt_pre)};
         struct iovec sp_r = {reinterpret_cast<void*>(out.newthread), sizeof(nt_pre)};
         ssize_t sp_rd = process_vm_readv(pid, &sp_l, 1, &sp_r, 1, 0);
@@ -5074,6 +5105,26 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                             scan + 7 <= lock_call_pos) {
                             memcpy(&out.lua_state_to_lock_arg, &nt_pre[scan + 3], 4);
                             LOG_INFO("[direct-hook] lock arg =[L+{}] (mov rdi, [rbx+disp32])",
+                                     out.lua_state_to_lock_arg);
+                            break;
+                        }
+                        // rdi-based patterns: lock arg loaded via mov rdi,[rdi+X]
+                        if (nt_pre[scan + 1] == 0x8B && nt_pre[scan + 2] == 0x3F) {
+                            out.lua_state_to_lock_arg = 0;
+                            LOG_INFO("[direct-hook] lock arg = [L+0] (mov rdi, [rdi])");
+                            break;
+                        }
+                        if (nt_pre[scan + 1] == 0x8B && nt_pre[scan + 2] == 0x7F &&
+                            scan + 4 <= lock_call_pos) {
+                            out.lua_state_to_lock_arg = static_cast<int8_t>(nt_pre[scan + 3]);
+                            LOG_INFO("[direct-hook] lock arg = [L+{}] (mov rdi, [rdi+disp8])",
+                                     out.lua_state_to_lock_arg);
+                            break;
+                        }
+                        if (nt_pre[scan + 1] == 0x8B && nt_pre[scan + 2] == 0xBF &&
+                            scan + 7 <= lock_call_pos) {
+                            memcpy(&out.lua_state_to_lock_arg, &nt_pre[scan + 3], 4);
+                            LOG_INFO("[direct-hook] lock arg = [L+{}] (mov rdi, [rdi+disp32])",
                                      out.lua_state_to_lock_arg);
                             break;
                         }
@@ -6089,7 +6140,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                 bool target_is_settop = true) -> bool {
         auto t = gen_entry_trampoline(addrs, mb_addr, cave.padding_start,
                                        target, pro, st,
-                                       false, false, target_is_settop);
+                                       true, false, target_is_settop);
         LOG_INFO("[direct-hook] {} trampoline: {} bytes", name, t.size());
         if (t.size() > CAVE_SIZE) return false;
         if (!proc_mem_write(pid, cave.padding_start, t.data(), t.size())) return false;
@@ -6137,6 +6188,60 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             return false;
         }
         LOG_INFO("[direct-hook] {} probe: {} hits in 1000ms — LIVE!", name, hits);
+
+        // Patch Lua global mutex to PTHREAD_MUTEX_RECURSIVE to prevent
+        // step-1 deadlock when lua_newthread re-acquires the held lock.
+        // Derivation: glibc x86_64 pthread_mutex_t.__kind is at offset 16.
+        // PTHREAD_MUTEX_RECURSIVE_NP = 1.
+        {
+            uintptr_t captured_L = 0;
+            proc_mem_read(pid, mb_addr + 0x30, &captured_L, 8);
+            if (captured_L != 0 && captured_L > 0x10000 &&
+                captured_L < 0x7FFFFFFFFFFFULL &&
+                addrs.pthread_mutex_lock_addr != 0) {
+                uintptr_t lock_arg = captured_L;
+                if (addrs.lua_state_to_lock_arg >= 0) {
+                    uintptr_t deref_addr = captured_L +
+                        static_cast<uintptr_t>(addrs.lua_state_to_lock_arg);
+                    if (!proc_mem_read(pid, deref_addr, &lock_arg, 8) || lock_arg == 0) {
+                        LOG_WARN("[direct-hook] mutex patch: deref L+{} failed",
+                                 addrs.lua_state_to_lock_arg);
+                        lock_arg = 0;
+                    }
+                }
+                if (lock_arg != 0) {
+                    uintptr_t global_state = 0;
+                    uintptr_t gs_addr = lock_arg +
+                        static_cast<uintptr_t>(addrs.lock_global_state_offset);
+                    if (proc_mem_read(pid, gs_addr, &global_state, 8) && global_state != 0) {
+                        uintptr_t mutex_addr = global_state +
+                            static_cast<uintptr_t>(addrs.lock_mutex_offset);
+                        uintptr_t kind_addr = mutex_addr + 16;
+                        int32_t current_kind = 0;
+                        if (proc_mem_read(pid, kind_addr, &current_kind, 4)) {
+                            if (current_kind == 0) {
+                                int32_t recursive = 1;
+                                if (proc_mem_write(pid, kind_addr, &recursive, 4)) {
+                                    LOG_INFO("[direct-hook] patched mutex to RECURSIVE "
+                                             "(mutex=0x{:X} kind=0x{:X})",
+                                             mutex_addr, kind_addr);
+                                } else {
+                                    LOG_WARN("[direct-hook] mutex kind write failed");
+                                }
+                            } else {
+                                LOG_DEBUG("[direct-hook] mutex kind already {} at 0x{:X}",
+                                          current_kind, kind_addr);
+                            }
+                        }
+                    } else {
+                        LOG_WARN("[direct-hook] mutex patch: global_State read failed "
+                                 "(gs_addr=0x{:X})", gs_addr);
+                    }
+                }
+            } else if (captured_L != 0) {
+                LOG_DEBUG("[direct-hook] mutex patch skipped: lock internals unavailable");
+            }
+        }
 
         // Commit: store stolen bytes and patch for cleanup
         memcpy(prologue, pro, st);
@@ -8164,6 +8269,7 @@ void Injection::stop_auto_scan() {
 
 
 }
+
 
 
 
