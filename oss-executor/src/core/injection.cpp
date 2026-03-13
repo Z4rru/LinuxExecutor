@@ -33,9 +33,6 @@ namespace fs = std::filesystem;
 
 namespace oss {
 
-// ═══════════════════════════════════════════════════════════════════
-// Constants
-// ═══════════════════════════════════════════════════════════════════
 static constexpr size_t REGION_SCAN_CAP = 0x4000000;
 static constexpr size_t REGION_MIN      = 0x1000;
 static constexpr size_t REGION_MAX      = 0x80000000ULL;
@@ -67,9 +64,6 @@ static const std::string PATH_KEYWORDS[] = {
 };
 static const std::string SELF_KEYWORDS[] = { "OSS","OSSExecutor","oss-executor","AppImage" };
 
-// ═══════════════════════════════════════════════════════════════════
-// Small static utilities
-// ═══════════════════════════════════════════════════════════════════
 static bool is_self_process(pid_t pid) { return pid==getpid()||pid==getppid(); }
 
 static bool is_self_process_name(const std::string& name) {
@@ -109,9 +103,6 @@ static ProcessDetails get_process_details(pid_t pid) {
 
 static pid_t get_tracer_pid(pid_t pid) { return get_process_details(pid).tracer_pid; }
 
-// ═══════════════════════════════════════════════════════════════════
-// x86-64 instruction length decoder
-// ═══════════════════════════════════════════════════════════════════
 static size_t dh_insn_len(const uint8_t* p) {
     if (p[0]==0xF3&&p[1]==0x0F&&p[2]==0x1E&&p[3]==0xFA) return 4;
     size_t i=0;
@@ -120,6 +111,10 @@ static size_t dh_insn_len(const uint8_t* p) {
     bool rex_w=false;
     if(p[i]>=0x40&&p[i]<=0x4F){rex_w=(p[i]&0x08)!=0;i++;}
     uint8_t op=p[i++];
+    auto mlen=[&](size_t s)->size_t{size_t j=s;if(j>=15)return 0;uint8_t m=p[j++];
+        uint8_t mod=(m>>6)&3,rm=m&7;
+        if(mod!=3&&rm==4){if(j>=15)return 0;uint8_t sib=p[j++];if(mod==0&&(sib&7)==5)j+=4;}
+        if(mod==0&&rm==5)j+=4;else if(mod==1)j+=1;else if(mod==2)j+=4;return j;};
     if(op==0xC5){if(i>=14)return 0;i++;uint8_t vop=p[i++];if(vop==0x77)return i;if(i>=15)return 0;
         uint8_t m=p[i++];uint8_t mod=(m>>6)&3,rm=m&7;
         if(mod!=3&&rm==4){if(i>=15)return 0;uint8_t sib=p[i++];if(mod==0&&(sib&7)==5)i+=4;}
@@ -145,10 +140,6 @@ static size_t dh_insn_len(const uint8_t* p) {
     if(op>=0xB8&&op<=0xBF)return i+(rex_w?8:4);
     if(op==0xE8||op==0xE9)return i+4;
     if(op==0xEB||(op>=0x70&&op<=0x7F))return i+1;
-    auto mlen=[&](size_t s)->size_t{size_t j=s;if(j>=15)return 0;uint8_t m=p[j++];
-        uint8_t mod=(m>>6)&3,rm=m&7;
-        if(mod!=3&&rm==4){if(j>=15)return 0;uint8_t sib=p[j++];if(mod==0&&(sib&7)==5)j+=4;}
-        if(mod==0&&rm==5)j+=4;else if(mod==1)j+=1;else if(mod==2)j+=4;return j;};
     if(op==0x80||op==0x82||op==0x83||op==0xC0||op==0xC1)return mlen(i)+1;
     if(op==0x81||op==0xC7||op==0x69)return mlen(i)+4;
     if(op==0xC6||op==0x6B)return mlen(i)+1;
@@ -188,9 +179,6 @@ static size_t dh_insn_len(const uint8_t* p) {
     return 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Code analysis helpers — eliminate massive duplication
-// ═══════════════════════════════════════════════════════════════════
 static bool at_func_boundary(uint8_t prev) {
     return prev==0xC3||prev==0xCC||prev==0x90;
 }
@@ -307,7 +295,6 @@ static uintptr_t last_call_in_func(const uint8_t* buf, size_t fend, uintptr_t ba
     return last;
 }
 
-// Generic proximity scan: finds function matching criteria near anchor
 struct ProxResult { uintptr_t addr=0; size_t fsz=0; int score=-1; };
 
 template<typename Scorer>
@@ -339,7 +326,6 @@ static ProxResult scan_funcs_near(pid_t pid, const std::vector<MemoryRegion>& re
     return best;
 }
 
-// String-ref based function finder
 static uintptr_t find_func_by_stringref(pid_t pid, Memory& mem,
     const std::vector<MemoryRegion>& regions, const char* const* needles,
     uintptr_t anchor, const std::vector<uintptr_t>& exclude)
@@ -406,9 +392,6 @@ static uintptr_t find_func_by_stringref(pid_t pid, Memory& mem,
     return 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Unified ELF symbol resolution (merges find_elf_symbol_impl + dh_find_elf_sym_sections)
-// ═══════════════════════════════════════════════════════════════════
 static uintptr_t find_elf_symbol_impl(const std::string& filepath, const std::string& symbol,
                                        uintptr_t load_bias=0, bool use_sections=false) {
     FILE* f=fopen(filepath.c_str(),"rb"); if(!f) return 0;
@@ -416,7 +399,6 @@ static uintptr_t find_elf_symbol_impl(const std::string& filepath, const std::st
     if(fread(&ehdr,sizeof(ehdr),1,f)!=1||memcmp(ehdr.e_ident,ELFMAG,SELFMAG)!=0||
        ehdr.e_ident[EI_CLASS]!=ELFCLASS64){fclose(f);return 0;}
 
-    // Section-based lookup (more complete, includes static symbols)
     if(use_sections&&ehdr.e_shnum>0){
         std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
         fseek(f,(long)ehdr.e_shoff,SEEK_SET);
@@ -443,7 +425,6 @@ static uintptr_t find_elf_symbol_impl(const std::string& filepath, const std::st
         fclose(f); return 0;
     }
 
-    // Dynamic-symbol lookup (PT_DYNAMIC based)
     std::vector<Elf64_Phdr> phdrs(ehdr.e_phnum);
     fseek(f,(long)ehdr.e_phoff,SEEK_SET);
     if(fread(phdrs.data(),sizeof(Elf64_Phdr),ehdr.e_phnum,f)!=ehdr.e_phnum){fclose(f);return 0;}
@@ -470,7 +451,8 @@ static uintptr_t find_elf_symbol_impl(const std::string& filepath, const std::st
     int64_t strtab_off=va_to_foff(strtab_va),symtab_off=va_to_foff(symtab_va);
     if(strtab_off<0||symtab_off<0){fclose(f);return 0;}
     std::vector<char> strtab(strsz);
-    fseek(f,(long)strtab_off,SEEK_SET); fread(strtab.data(),1,strsz,f);
+    fseek(f,(long)strtab_off,SEEK_SET);
+    if(fread(strtab.data(),1,strsz,f)!=strsz){fclose(f);return 0;}
     size_t nsyms=0;
     if(hash_va){int64_t ho=va_to_foff(hash_va);if(ho>=0){uint32_t h[2];fseek(f,(long)ho,SEEK_SET);
         if(fread(h,sizeof(h),1,f)==1) nsyms=h[1];}}
@@ -487,9 +469,6 @@ uintptr_t Injection::find_elf_symbol(const std::string& fp, const std::string& s
     return find_elf_symbol_impl(fp, sym);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Injection singleton + basic methods
-// ═══════════════════════════════════════════════════════════════════
 Injection& Injection::instance() { static Injection inst; return inst; }
 
 std::string Injection::read_proc_cmdline(pid_t pid) {
@@ -498,17 +477,21 @@ std::string Injection::read_proc_cmdline(pid_t pid) {
         std::replace(r.begin(),r.end(),'\0',' ');while(!r.empty()&&r.back()==' ')r.pop_back();return r;}
     catch(...){return{};}
 }
+
 std::string Injection::read_proc_comm(pid_t pid) {
     try{std::ifstream f("/proc/"+std::to_string(pid)+"/comm");if(!f)return{};
         std::string s;std::getline(f,s);while(!s.empty()&&(s.back()=='\n'||s.back()=='\r'))s.pop_back();return s;}
     catch(...){return{};}
 }
+
 std::string Injection::read_proc_exe(pid_t pid) {
     try{return fs::read_symlink("/proc/"+std::to_string(pid)+"/exe").string();}catch(...){return{};}
 }
+
 bool Injection::has_roblox_token(const std::string& s) {
     for(const auto& t:ROBLOX_TOKENS) if(s.find(t)!=std::string::npos) return true; return false;
 }
+
 bool Injection::process_alive() const { pid_t p=memory_.get_pid(); return p>0&&kill(p,0)==0; }
 bool Injection::is_attached() const { return memory_.is_valid()&&state_==InjectionState::Ready&&process_alive()&&payload_loaded_; }
 
@@ -520,9 +503,6 @@ void Injection::set_state(InjectionState s, const std::string& msg) {
     if(cb) cb(s,msg); LOG_INFO("[injection] {}",msg);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Process scanning
-// ═══════════════════════════════════════════════════════════════════
 std::vector<pid_t> Injection::descendants(pid_t root) {
     std::vector<pid_t> all;
     auto children=[](pid_t parent){std::vector<pid_t> ch;
@@ -657,9 +637,6 @@ pid_t Injection::find_roblox_pid() {
     return scan_for_roblox()?memory_.get_pid():-1;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Memory I/O
-// ═══════════════════════════════════════════════════════════════════
 bool Injection::write_to_process(uintptr_t addr, const void* data, size_t len) {
     pid_t pid=memory_.get_pid(); if(pid<=0) return false;
     struct iovec l={const_cast<void*>(data),len},r={reinterpret_cast<void*>(addr),len};
@@ -695,9 +672,6 @@ bool Injection::proc_mem_read(pid_t pid, uintptr_t addr, void* buf, size_t len) 
     ssize_t rd=pread(fd,buf,len,(off_t)addr); close(fd); return rd==(ssize_t)len;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Elevated helper (pkexec python bridge)
-// ═══════════════════════════════════════════════════════════════════
 bool Injection::start_elevated_helper() {
     if(elevated_pid_>0) return true;
     std::string script="/tmp/.oss_mem_helper.py";
@@ -742,7 +716,7 @@ bool Injection::elevated_mem_write(pid_t pid, uintptr_t addr, const void* data, 
 }
 
 void Injection::stop_elevated_helper() {
-    if(elevated_in_fd_>=0){write(elevated_in_fd_,"Q\n",2);close(elevated_in_fd_);elevated_in_fd_=-1;}
+    if(elevated_in_fd_>=0){(void)!write(elevated_in_fd_,"Q\n",2);close(elevated_in_fd_);elevated_in_fd_=-1;}
     if(elevated_out_fd_>=0){close(elevated_out_fd_);elevated_out_fd_=-1;}
     if(elevated_pid_>0){int st;
         if(waitpid(elevated_pid_,&st,WNOHANG)==0){kill(elevated_pid_,SIGTERM);usleep(100000);
@@ -758,11 +732,9 @@ bool Injection::freeze_tracer(pid_t tp) {
         if(pd.state=='T'||pd.state=='t') return true;}
     kill(tp,SIGCONT); return false;
 }
+
 void Injection::thaw_tracer(pid_t tp) { if(tp>0) kill(tp,SIGCONT); }
 
-// ═══════════════════════════════════════════════════════════════════
-// Payload + Symbol resolution
-// ═══════════════════════════════════════════════════════════════════
 bool Injection::should_scan_region(const MemoryRegion& r) const {
     if(!r.readable()||r.size()<REGION_MIN||r.size()>REGION_MAX) return false;
     if(r.path.empty()||r.path[0]=='[') return true;
@@ -869,9 +841,6 @@ std::string Injection::resolve_socket_path() {
     return PAYLOAD_SOCK;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Code cave + thread state helpers
-// ═══════════════════════════════════════════════════════════════════
 struct ExeRegionInfo { uintptr_t text_end,padding_start,base; size_t padding_size; };
 
 static bool find_code_cave(pid_t pid, const std::vector<MemoryRegion>& regions,
@@ -900,6 +869,7 @@ static bool find_code_cave(pid_t pid, const std::vector<MemoryRegion>& regions,
 }
 
 struct ThreadState{uintptr_t rip,rsp;};
+
 static bool get_thread_state(pid_t pid, pid_t tid, ThreadState& out) {
     std::string path="/proc/"+std::to_string(pid)+"/task/"+std::to_string(tid)+"/syscall";
     std::ifstream f(path);
@@ -924,7 +894,6 @@ static pid_t pick_injectable_thread(pid_t pid) {
     return pid;
 }
 
-// Shared helper: find a safe writable anonymous region for shellcode data
 static uintptr_t find_data_region(const std::vector<MemoryRegion>& regions) {
     size_t best_size=0; uintptr_t best=0;
     for(const auto& r:regions){
@@ -942,9 +911,18 @@ static uintptr_t find_data_region(const std::vector<MemoryRegion>& regions) {
     return 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// inject_via_inline_hook
-// ═══════════════════════════════════════════════════════════════════
+static bool install_jump_patch(uint8_t* patch, size_t& patch_len,
+                               uintptr_t from, uintptr_t to, size_t steal) {
+    int64_t disp=(int64_t)to-(int64_t)(from+5);
+    if(disp>=INT32_MIN&&disp<=INT32_MAX&&steal>=5){
+        patch[0]=0xE9;int32_t r32=(int32_t)disp;memcpy(patch+1,&r32,4);
+        for(size_t i=5;i<steal;i++)patch[i]=0x90;patch_len=steal;return true;}
+    if(steal>=14){
+        patch[0]=0xFF;patch[1]=0x25;memset(patch+2,0,4);memcpy(patch+6,&to,8);
+        patch_len=14;return true;}
+    return false;
+}
+
 bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
                                         uintptr_t dlopen_addr, uint64_t dlopen_flags) {
     LOG_INFO("Attempting inline hook injection into PID {}...",pid);
@@ -1007,32 +985,27 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     if(!proc_mem_read(pid,cave.padding_start,orig_cave,256)){
         proc_mem_write(pid,data_addr,orig_data,sizeof(orig_data));error_="Failed to save cave";return false;}
 
-    // Build shellcode
     uint8_t sc[256]; memset(sc,0xCC,sizeof(sc)); int off=0;
-    sc[off++]=0x9C; // pushfq
+    sc[off++]=0x9C;
     for(uint8_t r:{0x50,0x51,0x52,0x53,0x55,0x56,0x57}) sc[off++]=r;
     for(int r=0x50;r<=0x57;r++){sc[off++]=0x41;sc[off++]=(uint8_t)r;}
     sc[off++]=0x55;sc[off++]=0x48;sc[off++]=0x89;sc[off++]=0xE5;
     sc[off++]=0x48;sc[off++]=0x83;sc[off++]=0xE4;sc[off++]=0xF0;
 
-    // CMPXCHG guard
     sc[off++]=0x48;sc[off++]=0xBA;memcpy(sc+off,&guard_addr,8);off+=8;
     sc[off++]=0x48;sc[off++]=0xB8;memcpy(sc+off,&magic,8);off+=8;
     sc[off++]=0xB9;sc[off++]=0x01;sc[off++]=0x00;sc[off++]=0x00;sc[off++]=0x00;
     sc[off++]=0xF0;sc[off++]=0x48;sc[off++]=0x0F;sc[off++]=0xB1;sc[off++]=0x0A;
     sc[off++]=0x0F;sc[off++]=0x85;int jnz_off=off;off+=4;
 
-    // dlopen call
     sc[off++]=0x48;sc[off++]=0xBF;memcpy(sc+off,&path_addr,8);off+=8;
     sc[off++]=0x48;sc[off++]=0xBE;memcpy(sc+off,&dlopen_flags,8);off+=8;
     sc[off++]=0x48;sc[off++]=0xB8;memcpy(sc+off,&dlopen_addr,8);off+=8;
     sc[off++]=0xFF;sc[off++]=0xD0;
 
-    // Store result
     sc[off++]=0x48;sc[off++]=0xBA;memcpy(sc+off,&result_addr,8);off+=8;
     sc[off++]=0x48;sc[off++]=0x89;sc[off++]=0x02;
 
-    // Store completion
     uint64_t comp=COMPLETION_MAGIC;
     sc[off++]=0x48;sc[off++]=0xBA;memcpy(sc+off,&completion_addr,8);off+=8;
     sc[off++]=0x48;sc[off++]=0xB8;memcpy(sc+off,&comp,8);off+=8;
@@ -1041,7 +1014,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     int skip_target=off;
     int32_t jnz_rel=skip_target-(jnz_off+4);memcpy(sc+jnz_off,&jnz_rel,4);
 
-    // Restore regs
     sc[off++]=0x48;sc[off++]=0x89;sc[off++]=0xEC;sc[off++]=0x5D;
     for(int r=0x5F;r>=0x58;r--){sc[off++]=0x41;sc[off++]=(uint8_t)r;}
     for(uint8_t r:{0x5F,0x5E,0x5D,0x5B,0x5A,0x59,0x58}) sc[off++]=r;
@@ -1060,30 +1032,21 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     if(!proc_mem_write(pid,cave.padding_start,sc,off)){
         proc_mem_write(pid,data_addr,orig_data,sizeof(orig_data));error_="Failed to write shellcode";return false;}
 
-    // Install hook patch
-    uint8_t hook_patch[16];int hook_size=0;
-    int64_t hook_disp=(int64_t)cave.padding_start-(int64_t)(hook_func_addr+5);
-    if(hook_disp>=INT32_MIN&&hook_disp<=INT32_MAX&&steal_size>=5){
-        hook_patch[0]=0xE9;int32_t r32=(int32_t)hook_disp;memcpy(hook_patch+1,&r32,4);
-        for(int i=5;i<steal_size;i++)hook_patch[i]=0x90;hook_size=steal_size;
-    }else if(steal_size>=14){
-        hook_patch[0]=0xFF;hook_patch[1]=0x25;memset(hook_patch+2,0,4);
-        memcpy(hook_patch+6,&cave.padding_start,8);hook_size=14;
-    }else{proc_mem_write(pid,cave.padding_start,orig_cave,256);
+    uint8_t hook_patch[16];size_t hook_size=0;
+    if(!install_jump_patch(hook_patch,hook_size,hook_func_addr,cave.padding_start,steal_size)){
+        proc_mem_write(pid,cave.padding_start,orig_cave,256);
         proc_mem_write(pid,data_addr,orig_data,sizeof(orig_data));error_="Cannot encode jump";return false;}
 
     if(!proc_mem_write(pid,hook_func_addr,hook_patch,hook_size)){
         proc_mem_write(pid,cave.padding_start,orig_cave,256);
         proc_mem_write(pid,data_addr,orig_data,sizeof(orig_data));error_="Failed to install hook";return false;}
 
-    // Wait for completion
     bool completed=false;uint64_t result=0;
     for(int i=0;i<100;i++){
         usleep(100000);if(kill(pid,0)!=0){error_="Process died";return false;}
         uint64_t c=0;proc_mem_read(pid,completion_addr,&c,8);
         if(c==COMPLETION_MAGIC){proc_mem_read(pid,result_addr,&result,8);completed=true;break;}}
 
-    // Restore
     proc_mem_write(pid,hook_func_addr,orig_prologue,steal_size);
     usleep(50000);
     proc_mem_write(pid,cave.padding_start,orig_cave,256);
@@ -1092,7 +1055,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     if(!completed){error_="Inline hook timed out";return false;}
     if(result==0){error_="dlopen returned NULL";return false;}
 
-    // Verify mapping
     bool lib_mapped=false;
     for(int retry=0;retry<10&&!lib_mapped;retry++){
         if(retry>0)usleep(100000);
@@ -1108,9 +1070,6 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
     payload_loaded_=true;stop_elevated_helper();return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// inject_via_procmem
-// ═══════════════════════════════════════════════════════════════════
 bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
                                     uintptr_t dlopen_addr, uint64_t dlopen_flags) {
     LOG_INFO("inject_via_procmem: PID {} lib={}",pid,lib_path);
@@ -1163,7 +1122,6 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
         kill(pid,SIGCONT);proc_mem_write(pid,data_addr,orig_data,sizeof(orig_data));
         cleanup_tracer();error_="Failed to read code at RIP";return false;}
 
-    // Build shellcode
     uintptr_t return_addr=ts.rip;
     uint8_t sc[256];memset(sc,0,sizeof(sc));int off=0;
     sc[off++]=0x48;sc[off++]=0x81;sc[off++]=0xEC;sc[off++]=0x80;sc[off++]=0x00;sc[off++]=0x00;sc[off++]=0x00;
@@ -1180,7 +1138,6 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
     sc[off++]=0x48;sc[off++]=0xB9;memcpy(sc+off,&result_addr,8);off+=8;
     sc[off++]=0x48;sc[off++]=0x89;sc[off++]=0x01;
 
-    // Spin wait for done signal
     int spin_top=off;
     sc[off++]=0x48;sc[off++]=0xB9;memcpy(sc+off,&done_addr,8);off+=8;
     sc[off++]=0x48;sc[off++]=0x8B;sc[off++]=0x09;
@@ -1201,12 +1158,11 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
         kill(pid,SIGCONT);proc_mem_write(pid,data_addr,orig_data,sizeof(orig_data));
         cleanup_tracer();error_="Failed to write shellcode";return false;}
 
-    // Trampoline at RIP
-    uint8_t tramp[16];int toff=0;
-    int64_t jd=(int64_t)cave.padding_start-(int64_t)(ts.rip+5);
-    if(jd>=INT32_MIN&&jd<=INT32_MAX){tramp[toff++]=0xE9;int32_t r32=(int32_t)jd;memcpy(tramp+toff,&r32,4);toff+=4;}
-    else{tramp[toff++]=0xFF;tramp[toff++]=0x25;memset(tramp+toff,0,4);toff+=4;
-        memcpy(tramp+toff,&cave.padding_start,8);toff+=8;}
+    uint8_t tramp[16];size_t toff=0;
+    if(!install_jump_patch(tramp,toff,ts.rip,cave.padding_start,14)){
+        kill(pid,SIGCONT);proc_mem_write(pid,cave.padding_start,orig_cave,256);
+        proc_mem_write(pid,data_addr,orig_data,sizeof(orig_data));cleanup_tracer();
+        error_="Failed to encode trampoline";return false;}
 
     if(!proc_mem_write(pid,ts.rip,tramp,toff)){
         kill(pid,SIGCONT);proc_mem_write(pid,cave.padding_start,orig_cave,256);
@@ -1255,9 +1211,6 @@ bool Injection::inject_via_procmem(pid_t pid, const std::string& lib_path,
     stop_elevated_helper();payload_loaded_=true;return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// inject_shellcode_ptrace
-// ═══════════════════════════════════════════════════════════════════
 bool Injection::inject_shellcode_ptrace(pid_t pid, const std::string& lib_path,
                                          uintptr_t dlopen_addr, uint64_t dlopen_flags) {
     auto wait_for_trap=[](pid_t p)->bool{
@@ -1283,12 +1236,10 @@ bool Injection::inject_shellcode_ptrace(pid_t pid, const std::string& lib_path,
         ptrace(PTRACE_SETREGS,pid,nullptr,&orig_regs);
         ptrace(PTRACE_DETACH,pid,nullptr,nullptr);};
 
-    // Inject syscall;int3
     uint8_t sc_trap[]={0x0F,0x05,0xCC};
     long insn=orig_code[0];memcpy(&insn,sc_trap,3);
     ptrace(PTRACE_POKETEXT,pid,(void*)rip,(void*)insn);
 
-    // mmap
     struct user_regs_struct mmap_regs=orig_regs;
     mmap_regs.rax=9;mmap_regs.rdi=0;mmap_regs.rsi=4096;
     mmap_regs.rdx=PROT_READ|PROT_WRITE|PROT_EXEC;
@@ -1302,13 +1253,11 @@ bool Injection::inject_shellcode_ptrace(pid_t pid, const std::string& lib_path,
     uintptr_t mem_addr=result_regs.rax;
     if(mem_addr==0||(int64_t)mem_addr<0){restore_and_detach();error_="Remote mmap failed";return false;}
 
-    // Write path
     size_t plen=lib_path.size()+1;
     for(size_t i=0;i<plen;i+=sizeof(long)){
         long word=0;memcpy(&word,lib_path.c_str()+i,std::min(sizeof(long),plen-i));
         ptrace(PTRACE_POKETEXT,pid,(void*)(mem_addr+256+i),(void*)word);}
 
-    // Build shellcode
     uint8_t shellcode[64]={};int so=0;
     uintptr_t sc_path=mem_addr+256;
     shellcode[so++]=0x48;shellcode[so++]=0xBF;memcpy(shellcode+so,&sc_path,8);so+=8;
@@ -1329,7 +1278,6 @@ bool Injection::inject_shellcode_ptrace(pid_t pid, const std::string& lib_path,
     ptrace(PTRACE_GETREGS,pid,nullptr,&result_regs);
     uintptr_t dlopen_result=result_regs.rax;
 
-    // munmap + restore
     struct user_regs_struct munmap_regs=orig_regs;
     munmap_regs.rax=11;munmap_regs.rdi=mem_addr;munmap_regs.rsi=4096;munmap_regs.rip=rip;
     ptrace(PTRACE_SETREGS,pid,nullptr,&munmap_regs);
@@ -1344,9 +1292,6 @@ bool Injection::inject_shellcode(pid_t pid, const std::string& lp, uintptr_t da,
     return inject_shellcode_ptrace(pid,lp,da,df);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// inject_library (orchestrator)
-// ═══════════════════════════════════════════════════════════════════
 bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     LOG_INFO("Injecting {} into PID {}",lib_path,pid);
     std::string target_path=prepare_payload_for_injection(pid,lib_path);
@@ -1374,9 +1319,6 @@ bool Injection::inject_library(pid_t pid, const std::string& lib_path) {
     return inject_via_inline_hook(pid,target_path,dlopen_addr,flags);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Lock internals extraction
-// ═══════════════════════════════════════════════════════════════════
 static bool extract_lock_internals(pid_t pid, uintptr_t lock_fn_addr,
                                     int32_t& global_offset_out,
                                     int32_t& mutex_offset_out,
@@ -1426,7 +1368,6 @@ static bool extract_lock_internals(pid_t pid, uintptr_t lock_fn_addr,
         size_t il=dh_insn_len(code+pos);if(il==0)break;pos+=il;
     }
 
-    // Pass 2: MOV-to-rdi fallback
     if(!found_global){
         pos=0;if(pos+4<=code_len&&code[pos]==0xF3&&code[pos+1]==0x0F&&code[pos+2]==0x1E&&code[pos+3]==0xFA)pos+=4;
         for(size_t scan=pos;scan+10<code_len;scan++){
@@ -1456,11 +1397,7 @@ done:
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// find_remote_luau_functions
-// ═══════════════════════════════════════════════════════════════════
 bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
-    // Phase 1: ELF symbol lookup
     char exe_link[512];std::string exe_path;
     {std::string link="/proc/"+std::to_string(pid)+"/exe";
      ssize_t len=readlink(link.c_str(),exe_link,sizeof(exe_link)-1);
@@ -1501,11 +1438,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if(!a)a=find_remote_symbol(pid,"dl",s.name);
         if(a){*s.dst=a;LOG_INFO("[direct-hook] dlsym: {} at 0x{:X}",s.name,a);}}
 
-    // Distance validation
     if(out.resume&&out.load){int64_t d=(int64_t)out.resume-(int64_t)out.load;if(d<0)d=-d;
         if((uint64_t)d>0x2800000ULL){LOG_WARN("[direct-hook] luau_load too far from lua_resume, clearing");out.load=0;}}
 
-    // Phase 2: String-ref fallback
     auto regions=memory_.get_regions();
     struct{const char* name;uintptr_t* dst;const char* strings[4];}fallbacks[]={
         {"lua_resume",&out.resume,{"cannot resume dead coroutine","cannot resume running coroutine",nullptr}},
@@ -1517,12 +1452,11 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     for(auto& fb:fallbacks){if(*fb.dst)continue;
         std::vector<uintptr_t> excl;
         if(out.resume)excl.push_back(out.resume);if(out.settop)excl.push_back(out.settop);
-        if(out.newthread)excl.push_back(out.newthread);if(out.load)excl.push_back(out.load);
+                if(out.newthread)excl.push_back(out.newthread);if(out.load)excl.push_back(out.load);
         uintptr_t anchor=out.resume?out.resume:(out.settop?out.settop:0);
         uintptr_t found=find_func_by_stringref(pid,memory_,regions,fb.strings,anchor,excl);
         if(found){*fb.dst=found;LOG_INFO("[direct-hook] string-ref: {} at 0x{:X}",fb.name,found);}}
 
-    // Phase 3: Proximity scan for lua_newthread (no string literals)
     if(!out.newthread){
         std::vector<uintptr_t> anchors;
         if(out.settop)anchors.push_back(out.settop);
@@ -1532,10 +1466,9 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         for(uintptr_t anchor:anchors){
             if(out.newthread) break;
             auto result=scan_funcs_near(pid,regions,anchor,0x80000000LL,excl,
-                [&](pid_t p,uintptr_t addr,const uint8_t* code,size_t off,size_t scan_sz,uintptr_t rbase)->int{
+                [&](pid_t p,uintptr_t addr,const uint8_t* code,size_t off,size_t scan_sz,uintptr_t)->int{
                     auto sig=analyze_func_sig(code,off,scan_sz,250,30);
                     if(sig.func_size<40||sig.func_size>200||sig.leas>0||sig.calls<2||sig.calls>6) return -1;
-                    // Must be 1-arg (no rsi save)
                     bool uses_rsi=false;
                     for(size_t bi=0;bi<20&&off+bi+3<scan_sz;bi++){
                         uint8_t b=code[off+bi];
@@ -1552,10 +1485,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     return score;},20);
             if(result.addr&&result.score>=8){
                 out.newthread=result.addr;
-                LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} (score={})",result.addr,result.score);}}
-    }
+                LOG_INFO("[direct-hook] proximity: lua_newthread=0x{:X} (score={})",result.addr,result.score);}}}
 
-    // Extract lua_lock from lua_newthread (first CALL)
     if(out.newthread&&!out.lock_fn){
         uint8_t ntb[128];struct iovec nl={ntb,sizeof(ntb)},nr={reinterpret_cast<void*>(out.newthread),sizeof(ntb)};
         ssize_t nrd=process_vm_readv(pid,&nl,1,&nr,1,0);
@@ -1567,7 +1498,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
     if(!out.free_fn){out.free_fn=find_remote_symbol(pid,"c","free");}
 
-    // Validate lua_settop (must be 2-arg)
     if(out.settop){
         uint8_t stb[128];struct iovec sl={stb,sizeof(stb)},sr={reinterpret_cast<void*>(out.settop),sizeof(stb)};
         if(process_vm_readv(pid,&sl,1,&sr,1,0)>=24){
@@ -1575,11 +1505,10 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             if(sig.saves_rdx&&!sig.saves_rsi){LOG_WARN("[direct-hook] lua_settop wrong sig, clearing");out.settop=0;}
             else if(!sig.saves_rsi){LOG_WARN("[direct-hook] lua_settop no rsi, clearing");out.settop=0;}}}
 
-    // Proximity scan for lua_settop if missing
     if(!out.settop&&out.resume){
         std::vector<uintptr_t> excl={out.resume,out.newthread,out.load};
         auto result=scan_funcs_near(pid,regions,out.resume,0x80000000LL,excl,
-            [&](pid_t p,uintptr_t addr,const uint8_t* code,size_t off,size_t scan_sz,uintptr_t rbase)->int{
+            [&](pid_t p,uintptr_t addr,const uint8_t* code,size_t off,size_t scan_sz,uintptr_t)->int{
                 auto sig=analyze_func_sig(code,off,scan_sz,250,20);
                 if(!sig.saves_rdi||!sig.saves_rsi||sig.saves_rdx) return -1;
                 if(sig.func_size<30||sig.func_size>250||sig.calls<1||sig.calls>8) return -1;
@@ -1589,17 +1518,15 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if(result.addr&&result.score>=15){out.settop=result.addr;
             LOG_INFO("[direct-hook] proximity: lua_settop=0x{:X} (score={})",result.addr,result.score);}}
 
-    // Proximity re-scan for luau_load if missing
     if(!out.load&&out.resume){
         const char* load_needles[]={"bytecode version mismatch","truncated",nullptr};
         std::vector<uintptr_t> excl={out.resume,out.settop,out.newthread};
         uintptr_t found=find_func_by_stringref(pid,memory_,regions,load_needles,out.resume,excl);
         if(found){out.load=found;LOG_INFO("[direct-hook] proximity string-ref: luau_load at 0x{:X}",found);}
 
-        // Signature fallback: large 3+ arg function sharing calls with lua_resume
         if(!out.load){
             auto result=scan_funcs_near(pid,regions,out.resume,0x80000000LL,excl,
-                [&](pid_t p,uintptr_t addr,const uint8_t* code,size_t off,size_t scan_sz,uintptr_t rbase)->int{
+                [&](pid_t p,uintptr_t addr,const uint8_t* code,size_t off,size_t scan_sz,uintptr_t)->int{
                     auto sig=analyze_func_sig(code,off,scan_sz,2000,200);
                     if(!sig.saves_rdi||!sig.saves_rsi||!sig.saves_rdx) return -1;
                     if(sig.func_size<200||sig.calls<5) return -1;
@@ -1609,7 +1536,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             if(result.addr&&result.score>=12){out.load=result.addr;
                 LOG_INFO("[direct-hook] proximity sig: luau_load=0x{:X} (score={})",result.addr,result.score);}}}
 
-    // Fallback lua_lock from lua_settop
     if(!out.lock_fn&&out.settop){
         uint8_t stb[128];struct iovec sl={stb,sizeof(stb)},sr={reinterpret_cast<void*>(out.settop),sizeof(stb)};
         if(process_vm_readv(pid,&sl,1,&sr,1,0)>=20){
@@ -1621,7 +1547,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
     uintptr_t active_lock=out.lock_fn;
 
-    // Extract lock argument pattern from lua_newthread
     if(active_lock&&out.newthread){
         uint8_t nt_pre[128];struct iovec sp_l={nt_pre,sizeof(nt_pre)},sp_r={reinterpret_cast<void*>(out.newthread),sizeof(nt_pre)};
         ssize_t sp_rd=process_vm_readv(pid,&sp_l,1,&sp_r,1,0);
@@ -1646,7 +1571,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         {memcpy(&out.lua_state_to_lock_arg,&nt_pre[s+3],4);break;}
                     if(s==0) break;}}}}
 
-    // Discover active_unlock by neighbor scanning
     if(active_lock&&!out.unlock_fn){
         uint8_t al_body[32];struct iovec ab_l={al_body,sizeof(al_body)},ab_r={reinterpret_cast<void*>(active_lock),sizeof(al_body)};
         ssize_t ab_rd=process_vm_readv(pid,&ab_l,1,&ab_r,1,0);
@@ -1674,12 +1598,10 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if(cd<best_dist){best_dist=cd;best_ul=cand;}break;}}
                 if(best_ul){out.unlock_fn=best_ul;LOG_INFO("[direct-hook] active_unlock at 0x{:X}",best_ul);}}}}
 
-    // Extract lock internals for synthesized unlock
     if(active_lock&&!out.unlock_fn){
         int32_t gs_off=0,mx_off=0;uintptr_t pml_addr=0;
         bool internals_ok=extract_lock_internals(pid,active_lock,gs_off,mx_off,pml_addr);
 
-        // Brute-force fallback
         if(!internals_ok){
             uint8_t lk[48];struct iovec lkl={lk,sizeof(lk)},lkr={reinterpret_cast<void*>(active_lock),sizeof(lk)};
             ssize_t lkrd=process_vm_readv(pid,&lkl,1,&lkr,1,0);
@@ -1702,7 +1624,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             out.lock_global_state_offset=gs_off;out.lock_mutex_offset=mx_off;
             out.pthread_mutex_lock_addr=pml_addr;
 
-            // Find pthread_mutex_unlock
             uintptr_t pmu=0;
             uintptr_t pml_sym=find_remote_symbol(pid,"c","pthread_mutex_lock");
             uintptr_t pmu_sym=find_remote_symbol(pid,"c","pthread_mutex_unlock");
@@ -1722,7 +1643,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             if(pmu){out.pthread_mutex_unlock_addr=pmu;out.lock_internals_valid=true;
                 LOG_INFO("[direct-hook] pthread_mutex_unlock=0x{:X}",pmu);}}}
 
-    // Extract lua_unlock from lua_settop (last CALL before RET)
     if(out.settop&&active_lock&&!out.unlock_fn){
         uint8_t stbuf[256];struct iovec ul_l={stbuf,sizeof(stbuf)},ul_r={reinterpret_cast<void*>(out.settop),sizeof(stbuf)};
         ssize_t ul_rd=process_vm_readv(pid,&ul_l,1,&ul_r,1,0);
@@ -1737,9 +1657,6 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
     return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// gen_entry_trampoline — generates the hook shellcode
-// ═══════════════════════════════════════════════════════════════════
 template<typename AddrsType>
 static std::vector<uint8_t> gen_entry_trampoline(
     const AddrsType& a, uintptr_t mailbox_addr, uintptr_t cave_addr,
@@ -1752,7 +1669,6 @@ static std::vector<uint8_t> gen_entry_trampoline(
     auto e32=[&](uint32_t v){for(int i=0;i<4;i++)c.push_back((v>>(i*8))&0xFF);};
     auto e64=[&](uint64_t v){for(int i=0;i<8;i++)c.push_back((v>>(i*8))&0xFF);};
 
-    // Helper: emit unlock sequence
     auto emit_unlock=[&](){
         if(a.unlock_fn&&a.lua_state_to_lock_arg>=0){
             e({0x4C,0x89,0xFF});
@@ -1779,7 +1695,6 @@ static std::vector<uint8_t> gen_entry_trampoline(
                 else{e({0x48,0x81,0xC7});e32((uint32_t)a.lock_mutex_offset);}}
             e({0x48,0xB8});e64(a.pthread_mutex_unlock_addr);e({0xFF,0xD0});}};
 
-    // Helper: emit lock sequence
     auto emit_lock=[&](){
         if(a.lock_fn&&a.lua_state_to_lock_arg>=0){
             e({0x4C,0x89,0xFF});
@@ -1790,26 +1705,24 @@ static std::vector<uint8_t> gen_entry_trampoline(
             e({0x48,0xB8});e64(a.lock_fn);e({0xFF,0xD0});
         }else if(a.lock_fn){e({0x4C,0x89,0xFF});e({0x48,0xB8});e64(a.lock_fn);e({0xFF,0xD0});}};
 
-    // === SAVE ALL REGISTERS ===
     e8(0x9C);e8(0x50);e8(0x51);e8(0x52);e8(0x56);e8(0x57);
     e({0x41,0x50});e({0x41,0x51});e({0x41,0x52});e({0x41,0x53});
     e8(0x53);e({0x41,0x56});e({0x41,0x57});e8(0x55);
     e({0x48,0x89,0xE5});e({0x48,0x83,0xE4,0xF0});
 
-    e({0x48,0xBB});e64(mailbox_addr); // rbx = mailbox
-    if(capture_rdi_to_mailbox) e({0x48,0x89,0x7B,0x30}); // [rbx+0x30] = rdi
-    e({0x66,0xFF,0x43,0x2A}); // inc word [rbx+0x2A]
+    e({0x48,0xBB});e64(mailbox_addr);
+    if(capture_rdi_to_mailbox) e({0x48,0x89,0x7B,0x30});
+    e({0x66,0xFF,0x43,0x2A});
 
-    e({0x80,0x7B,0x28,0x00}); // cmp byte [rbx+0x28], 0
+    e({0x80,0x7B,0x28,0x00});
     size_t j_guard=c.size(); e({0x0F,0x85});e32(0);
-    e({0x48,0x8B,0x43,0x10});e({0x48,0x3B,0x43,0x18}); // seq <= ack?
+    e({0x48,0x8B,0x43,0x10});e({0x48,0x3B,0x43,0x18});
     size_t j_seq=c.size(); e({0x0F,0x86});e32(0);
-    e({0xC6,0x43,0x28,0x01}); // guard=1
-    e({0x49,0x89,0xFF}); // r15=rdi (L)
+    e({0xC6,0x43,0x28,0x01});
+    e({0x49,0x89,0xFF});
 
     if(hook_held_lock) emit_unlock();
 
-    // Step 1: lua_newthread
     size_t j_nt_fail=SIZE_MAX;
     if(a.newthread){
         e({0xC7,0x43,0x2C,0x01,0x00,0x00,0x00});
@@ -1818,7 +1731,6 @@ static std::vector<uint8_t> gen_entry_trampoline(
         j_nt_fail=c.size();e({0x0F,0x84});e32(0);
     }else{e({0xC7,0x43,0x2C,0x01,0x00,0x00,0x00});e({0x4D,0x89,0xFE});}
 
-    // Step 2: luau_load
     e({0xC7,0x43,0x2C,0x02,0x00,0x00,0x00});
     e({0x4C,0x89,0xF7});
     size_t chunk_movabs=c.size();e({0x48,0xBE});e64(0);
@@ -1827,7 +1739,6 @@ static std::vector<uint8_t> gen_entry_trampoline(
     e({0x85,0xC0});
     size_t j_load_fail=c.size();e({0x0F,0x85});e32(0);
 
-    // Step 3: lua_resume
     e({0xC7,0x43,0x2C,0x03,0x00,0x00,0x00});
     e({0x4C,0x89,0xF7});e({0x31,0xF6});e({0x31,0xD2});
     e({0x48,0xB8});e64(a.resume);e({0xFF,0xD0});
@@ -1837,11 +1748,10 @@ static std::vector<uint8_t> gen_entry_trampoline(
 
     if(hook_held_lock) emit_lock();
 
-    // Step 5: ack
     size_t ack_label=c.size();
-    e({0x48,0x8B,0x43,0x10});e({0x48,0x89,0x43,0x18}); // ack=seq
+    e({0x48,0x8B,0x43,0x10});e({0x48,0x89,0x43,0x18});
     e({0xC7,0x43,0x2C,0x05,0x00,0x00,0x00});
-    e({0xC6,0x43,0x28,0x00}); // guard=0
+    e({0xC6,0x43,0x28,0x00});
 
     size_t skip_label=c.size();
     auto patch_j=[&](size_t off,size_t target){int32_t r=(int32_t)(target-(off+4));memcpy(&c[off],&r,4);};
@@ -1850,7 +1760,6 @@ static std::vector<uint8_t> gen_entry_trampoline(
     if(j_nt_fail!=SIZE_MAX) patch_j(j_nt_fail+2,ack_label);
     patch_j(j_load_fail+2,settop_label);
 
-    // Restore + stolen bytes + jump back
     e({0x48,0x89,0xEC});e8(0x5D);
     e({0x41,0x5F});e({0x41,0x5E});e8(0x5B);
     e({0x41,0x5B});e({0x41,0x5A});e({0x41,0x59});e({0x41,0x58});
@@ -1863,21 +1772,54 @@ static std::vector<uint8_t> gen_entry_trampoline(
     if(jd>=INT32_MIN&&jd<=INT32_MAX){e8(0xE9);e32((uint32_t)(int32_t)jd);}
     else{e({0xFF,0x25,0x00,0x00,0x00,0x00});e64(cont);}
 
-    // Chunk name "=oss"
     size_t chunk_label=c.size();
     e({0x3D,0x6F,0x73,0x73,0x00});
     uintptr_t chunk_abs=cave_addr+chunk_label;
     memcpy(&c[chunk_movabs+2],&chunk_abs,8);
 
-    e8(0xC3); // NOP stub (single RET)
+    e8(0xC3);
 
     (void)hook_target_is_settop;
     return c;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// inject_via_direct_hook
-// ═══════════════════════════════════════════════════════════════════
+static bool do_dryrun(pid_t pid, uintptr_t mb_addr, int timeout_iters=100) {
+    size_t bc_len=0;char* bc=luau_compile("return",6,nullptr,&bc_len);
+    if(!bc||bc_len==0||(uint8_t)bc[0]==0||bc_len>16320){free(bc);return true;}
+    uint64_t seq=0,ack=0;
+    struct iovec sl,sr;
+    sl={&seq,8};sr={reinterpret_cast<void*>(mb_addr+16),8};process_vm_readv(pid,&sl,1,&sr,1,0);
+    sl={&ack,8};sr={reinterpret_cast<void*>(mb_addr+24),8};process_vm_readv(pid,&sl,1,&sr,1,0);
+    if(seq>ack){free(bc);return true;}
+    std::string path="/proc/"+std::to_string(pid)+"/mem";
+    int fd=open(path.c_str(),O_RDWR);
+    auto pw=[&](uintptr_t a,const void* d,size_t l){
+        if(fd>=0){pwrite(fd,d,l,(off_t)a);return;}
+        struct iovec wl={const_cast<void*>(d),l},wr={reinterpret_cast<void*>(a),l};
+        process_vm_writev(pid,&wl,1,&wr,1,0);};
+    pw(mb_addr+64,bc,bc_len);
+    uint32_t tsz=(uint32_t)bc_len,tfl=1,z32=0;uint8_t z8=0;uint16_t z16=0;
+    pw(mb_addr+32,&tsz,4);pw(mb_addr+36,&tfl,4);
+    pw(mb_addr+44,&z32,4);pw(mb_addr+40,&z8,1);pw(mb_addr+42,&z16,2);
+    uint64_t arm=seq+1;pw(mb_addr+16,&arm,8);
+    free(bc);
+    bool pass=false;
+    for(int i=0;i<timeout_iters;i++){
+        usleep(50000);if(kill(pid,0)!=0)break;
+        uint64_t da=0;
+        struct iovec al={&da,8},ar={reinterpret_cast<void*>(mb_addr+24),8};
+        process_vm_readv(pid,&al,1,&ar,1,0);
+        if(da>=arm){pass=true;break;}
+        if(i>=39){uint32_t ds=0;uint8_t dg=0;
+            struct iovec dsl={&ds,4},dsr={reinterpret_cast<void*>(mb_addr+44),4};
+            process_vm_readv(pid,&dsl,1,&dsr,1,0);
+            struct iovec dgl={&dg,1},dgr={reinterpret_cast<void*>(mb_addr+40),1};
+            process_vm_readv(pid,&dgl,1,&dgr,1,0);
+            if(ds<=1&&dg==1){LOG_ERROR("[direct-hook] dry-run deadlock at step {}",ds);break;}}}
+    if(fd>=0) close(fd);
+    return pass;
+}
+
 bool Injection::inject_via_direct_hook(pid_t pid) {
     if(dhook_.active) return true;
     LOG_INFO("[direct-hook] starting for PID {}",pid);
@@ -1887,7 +1829,6 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
     auto regions=memory_.get_regions();
 
-    // Find mailbox region
     uintptr_t mb_addr=0;
     {constexpr size_t MB_SIZE=16384;
      for(auto it=regions.rbegin();it!=regions.rend();++it){
@@ -1926,20 +1867,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     bool hook_needs_unlock=false;
     uint8_t patch[16]={};size_t patch_len=0;
 
-    // Helper: try hooking a target, probe liveness, return success
     auto try_hook=[&](uintptr_t target,const char* name,uint8_t* pro,size_t st,bool held_lock)->bool{
         auto t=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,target,pro,st,true,held_lock,target!=addrs.resume);
         if(t.size()>CAVE_SIZE||!proc_mem_write(pid,cave.padding_start,t.data(),t.size())) return false;
         uint8_t p[16];size_t pl;
-        int64_t hd=(int64_t)cave.padding_start-(int64_t)(target+5);
-        if(hd>=INT32_MIN&&hd<=INT32_MAX&&st>=5){p[0]=0xE9;int32_t r32=(int32_t)hd;memcpy(p+1,&r32,4);
-            for(size_t i=5;i<st;i++)p[i]=0x90;pl=st;}
-        else if(st>=14){p[0]=0xFF;p[1]=0x25;memset(p+2,0,4);memcpy(p+6,&cave.padding_start,8);pl=14;}
-        else return false;
+        if(!install_jump_patch(p,pl,target,cave.padding_start,st)) return false;
         if(!proc_mem_write(pid,target,p,pl)) return false;
         uint8_t vf[16]={};proc_mem_read(pid,target,vf,pl);
         if(memcmp(vf,p,pl)!=0){LOG_ERROR("[direct-hook] patch didn't persist");return false;}
-
         uint16_t zh=0;proc_mem_write(pid,mb_addr+42,&zh,2);
         usleep(1000000);uint16_t hits=0;proc_mem_read(pid,mb_addr+42,&hits,2);
         if(hits<10){LOG_WARN("[direct-hook] {} only {} hits — dead",name,hits);
@@ -1947,13 +1882,11 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         LOG_INFO("[direct-hook] {} probe: {} hits — LIVE!",name,hits);
         memcpy(patch,p,pl);patch_len=pl;return true;};
 
-    // Attempt 1: lua_settop direct
     if(!try_hook(addrs.settop,"lua_settop",prologue,steal,false)){
         LOG_WARN("[direct-hook] lua_settop dead, searching for live variant...");
         uintptr_t dead_settop=addrs.settop;
         bool found_live=false;int total_probes=0;constexpr int MAX_PROBES=15;
 
-        // Scan for live settop-like functions
         for(const auto& r:regions){
             if(found_live||total_probes>=MAX_PROBES) break;
             if(!r.readable()||!r.executable()||r.size()<256) continue;
@@ -1977,7 +1910,6 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if(!sig.saves_rdi||!sig.saves_rsi||sig.saves_rdx) continue;
                 if(sig.func_size<30||sig.func_size>250||sig.calls<1||sig.calls>8) continue;
 
-                // Check calls active_lock
                 bool has_alock=false;
                 for(size_t fi=0;fi<60&&off+fi+5<=scan_sz;fi++){
                     if(code[off+fi]!=0xE8)continue;int32_t cd;memcpy(&cd,&code[off+fi+1],4);
@@ -1994,7 +1926,6 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                     if(il==0||cand_steal+il>sizeof(cand_pro))break;cand_steal+=il;}
                 if(cand_steal<5) continue;
 
-                // Extract unlock from this candidate
                 if(!addrs.unlock_fn){
                     uint8_t ls_buf[256];struct iovec ls_l={ls_buf,sizeof(ls_buf)},
                         ls_r={reinterpret_cast<void*>(cand),sizeof(ls_buf)};
@@ -2008,10 +1939,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 hook_addr=cand;
 
                 if(try_hook(cand,"live_settop",cand_pro,cand_steal,true)){found_live=true;break;}
-                else{hook_addr=addrs.settop;memcpy(prologue,cand_pro,steal);} // reset
+                else{hook_addr=addrs.settop;memcpy(prologue,cand_pro,steal);}
             }}
 
-        // Fallback: try lua_resume
         if(!found_live&&addrs.resume){
             LOG_INFO("[direct-hook] trying lua_resume as fallback hook target");
             uint8_t rpro[32];
@@ -2025,21 +1955,18 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         if(!found_live){LOG_ERROR("[direct-hook] all hook targets exhausted");return false;}
     }
 
-    // Bracket compatibility check
     if(hook_needs_unlock&&!addrs.unlock_fn&&addrs.lock_internals_valid&&addrs.pthread_mutex_unlock_addr){
         if(addrs.pthread_mutex_lock_addr){
             int64_t lu=(int64_t)addrs.pthread_mutex_lock_addr-(int64_t)addrs.pthread_mutex_unlock_addr;
             if(lu<0)lu=-lu;if((uint64_t)lu>0x100000ULL){
                 LOG_WARN("[direct-hook] lock/unlock incompatible, disabling bracket");hook_needs_unlock=false;}}}
 
-    // Final trampoline with validated settings
     bool effective_held_lock=hook_needs_unlock;
     {auto t_final=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,hook_addr,prologue,steal,
                                         false,effective_held_lock,hook_addr!=addrs.resume);
      if(!proc_mem_write(pid,cave.padding_start,t_final.data(),t_final.size())){
          proc_mem_write(pid,hook_addr,prologue,steal);return false;}}
 
-    // Store state
     dhook_.cave_addr=cave.padding_start;dhook_.mailbox_addr=mb_addr;dhook_.cave_size=CAVE_SIZE;
     dhook_.stolen_len=steal;dhook_.resume_addr=addrs.resume;dhook_.newthread_addr=addrs.newthread;
     dhook_.load_addr=addrs.load;dhook_.settop_addr=hook_addr;
@@ -2050,83 +1977,47 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
     LOG_INFO("[direct-hook] HOOK ARMED at 0x{:X}, cave=0x{:X}, mailbox=0x{:X}",hook_addr,cave.padding_start,mb_addr);
 
-    // Dry-run validation
-    {size_t bc_len=0;char* bc=luau_compile("return",6,nullptr,&bc_len);
-     bool pass=false;
-     if(bc&&bc_len>0&&(uint8_t)bc[0]!=0&&bc_len<=16320){
-         uint64_t seq=0,ack=0;
-         proc_mem_read(pid,mb_addr+16,&seq,8);proc_mem_read(pid,mb_addr+24,&ack,8);
-         if(seq<=ack){
-             proc_mem_write(pid,mb_addr+64,bc,bc_len);
-             uint32_t tsz=(uint32_t)bc_len,tfl=1,z32=0;uint8_t z8=0;uint16_t z16=0;
-             proc_mem_write(pid,mb_addr+32,&tsz,4);proc_mem_write(pid,mb_addr+36,&tfl,4);
-             proc_mem_write(pid,mb_addr+44,&z32,4);proc_mem_write(pid,mb_addr+40,&z8,1);
-             proc_mem_write(pid,mb_addr+42,&z16,2);
-             uint64_t arm=seq+1;proc_mem_write(pid,mb_addr+16,&arm,8);
-             for(int i=0;i<100;i++){usleep(50000);if(kill(pid,0)!=0)break;
-                 uint64_t da=0;proc_mem_read(pid,mb_addr+24,&da,8);
-                 if(da>=arm){pass=true;break;}
-                 if(i>=39){uint32_t ds=0;uint8_t dg=0;
-                     proc_mem_read(pid,mb_addr+44,&ds,4);proc_mem_read(pid,mb_addr+40,&dg,1);
-                     if(ds<=1&&dg==1){LOG_ERROR("[direct-hook] dry-run deadlock at step {}",ds);break;}}}
-         }else pass=true;
-     }else pass=true;
-     free(bc);
-     if(!pass){
-         proc_mem_write(pid,hook_addr,prologue,steal);
-         DirectMailbox empty{};proc_mem_write(pid,mb_addr,&empty,sizeof(empty));
-         dhook_={};
+    if(!do_dryrun(pid,mb_addr)){
+        proc_mem_write(pid,hook_addr,prologue,steal);
+        DirectMailbox empty{};proc_mem_write(pid,mb_addr,&empty,sizeof(empty));
+        dhook_={};
 
-         // Retry with lua_resume if settop deadlocked
-         if(hook_addr!=addrs.resume&&addrs.resume){
-             LOG_INFO("[direct-hook] retrying with lua_resume...");
-             uint8_t rpro[32];
-             if(proc_mem_read(pid,addrs.resume,rpro,sizeof(rpro))){
-                 size_t rs=0;while(rs<5){size_t il=dh_insn_len(rpro+rs);if(il==0||rs+il>sizeof(rpro))break;rs+=il;}
-                 if(rs>=5){
-                     DirectMailbox mb2{};memcpy(mb2.magic,"OSS_DMBOX_V3\0\0\0\0",16);
-                     proc_mem_write(pid,mb_addr,&mb2,sizeof(mb2));
-                     auto rt=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,addrs.resume,rpro,rs,false,true,false);
-                     if(rt.size()<=CAVE_SIZE&&proc_mem_write(pid,cave.padding_start,rt.data(),rt.size())){
-                         uint8_t rp[16];size_t rpl;
-                         int64_t rd=(int64_t)cave.padding_start-(int64_t)(addrs.resume+5);
-                         if(rd>=INT32_MIN&&rd<=INT32_MAX){rp[0]=0xE9;int32_t r32=(int32_t)rd;memcpy(rp+1,&r32,4);
-                             for(size_t i=5;i<rs;i++)rp[i]=0x90;rpl=rs;}
-                         else{rp[0]=0xFF;rp[1]=0x25;memset(rp+2,0,4);memcpy(rp+6,&cave.padding_start,8);rpl=14;}
-                         if(proc_mem_write(pid,addrs.resume,rp,rpl)){
-                             // Quick dry-run
-                             size_t rbc_len=0;char* rbc=luau_compile("return",6,nullptr,&rbc_len);
-                             bool rpass=false;
-                             if(rbc&&rbc_len>0){
-                                 proc_mem_write(pid,mb_addr+64,rbc,rbc_len);
-                                 uint32_t rsz=(uint32_t)rbc_len,rfl=1,z32=0;uint8_t z8=0;uint16_t z16=0;
-                                 proc_mem_write(pid,mb_addr+32,&rsz,4);proc_mem_write(pid,mb_addr+36,&rfl,4);
-                                 proc_mem_write(pid,mb_addr+44,&z32,4);proc_mem_write(pid,mb_addr+40,&z8,1);
-                                 proc_mem_write(pid,mb_addr+42,&z16,2);
-                                 uint64_t rarm=1;proc_mem_write(pid,mb_addr+16,&rarm,8);
-                                 for(int i=0;i<100;i++){usleep(50000);if(kill(pid,0)!=0)break;
-                                     uint64_t ra=0;proc_mem_read(pid,mb_addr+24,&ra,8);
-                                     if(ra>=rarm){rpass=true;break;}}}
-                             free(rbc);
-                             if(rpass){
-                                 dhook_.cave_addr=cave.padding_start;dhook_.mailbox_addr=mb_addr;
-                                 dhook_.cave_size=CAVE_SIZE;dhook_.stolen_len=rs;
-                                 dhook_.resume_addr=addrs.resume;dhook_.newthread_addr=addrs.newthread;
-                                 dhook_.load_addr=addrs.load;dhook_.settop_addr=addrs.resume;
-                                 memcpy(dhook_.stolen_bytes,rpro,rs);memcpy(dhook_.orig_patch,rpro,rpl);
-                                 dhook_.patch_len=rpl;dhook_.active=true;
-                                 dhook_.nop_stub_addr=cave.padding_start+rt.size()-1;
-                                 set_state(InjectionState::Ready,"Direct hook active — ready for scripts");
-                                 return true;}
-                             proc_mem_write(pid,addrs.resume,rpro,rs);}}}}
-         error_="Direct hook dry-run failed";set_state(InjectionState::Failed,error_);return false;}}
+        if(hook_addr!=addrs.resume&&addrs.resume){
+            LOG_INFO("[direct-hook] retrying with lua_resume...");
+            uint8_t rpro[32];
+            if(proc_mem_read(pid,addrs.resume,rpro,sizeof(rpro))){
+                size_t rs=0;while(rs<5){size_t il=dh_insn_len(rpro+rs);if(il==0||rs+il>sizeof(rpro))break;rs+=il;}
+                if(rs>=5){
+                    DirectMailbox mb2{};memcpy(mb2.magic,"OSS_DMBOX_V3\0\0\0\0",16);
+                    proc_mem_write(pid,mb_addr,&mb2,sizeof(mb2));
+                    auto rt=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,addrs.resume,rpro,rs,false,true,false);
+                    if(rt.size()<=CAVE_SIZE&&proc_mem_write(pid,cave.padding_start,rt.data(),rt.size())){
+                        uint8_t rp[16];size_t rpl=0;
+                        if(install_jump_patch(rp,rpl,addrs.resume,cave.padding_start,rs)&&
+                           proc_mem_write(pid,addrs.resume,rp,rpl)){
+                            if(do_dryrun(pid,mb_addr,100)){
+                                dhook_.cave_addr=cave.padding_start;dhook_.mailbox_addr=mb_addr;
+                                dhook_.cave_size=CAVE_SIZE;dhook_.stolen_len=rs;
+                                dhook_.resume_addr=addrs.resume;dhook_.newthread_addr=addrs.newthread;
+                                dhook_.load_addr=addrs.load;dhook_.settop_addr=addrs.resume;
+                                memcpy(dhook_.stolen_bytes,rpro,rs);memcpy(dhook_.orig_patch,rpro,rpl);
+                                dhook_.patch_len=rpl;dhook_.active=true;
+                                dhook_.nop_stub_addr=cave.padding_start+rt.size()-1;
+                                set_state(InjectionState::Ready,"Direct hook active \u2014 ready for scripts");
+                                return true;
+                            }
+                            proc_mem_write(pid,addrs.resume,rpro,rs);
+                        }
+                    }
+                }
+            }
+        }
+        error_="Direct hook dry-run failed";set_state(InjectionState::Failed,error_);return false;
+    }
 
-    set_state(InjectionState::Ready,"Direct hook active — ready for scripts");return true;
+    set_state(InjectionState::Ready,"Direct hook active \u2014 ready for scripts");return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// cleanup, mailbox, attach/detach
-// ═══════════════════════════════════════════════════════════════════
 void Injection::cleanup_direct_hook() {
     if(!dhook_.active) return;
     pid_t pid=memory_.get_pid();
@@ -2194,9 +2085,6 @@ bool Injection::detach() {
     return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// inject() — main orchestrator
-// ═══════════════════════════════════════════════════════════════════
 bool Injection::inject() {
     if(!attach()) return false;
     if(dhook_.active&&payload_loaded_&&process_alive()) return true;
@@ -2204,7 +2092,6 @@ bool Injection::inject() {
 
     std::string payload=find_payload_path();
     if(!payload.empty()){
-        // Try to lower ptrace_scope
         {std::ifstream sf("/proc/sys/kernel/yama/ptrace_scope");int scope=-1;
          if(sf){sf>>scope;sf.close();
          if(scope>0){
@@ -2216,7 +2103,7 @@ bool Injection::inject() {
 
         set_state(InjectionState::Injecting,"Injecting payload...");
         if(inject_library(memory_.get_pid(),payload)){
-            set_state(InjectionState::Initializing,"Payload loaded — waiting for init...");
+            set_state(InjectionState::Initializing,"Payload loaded \u2014 waiting for init...");
             auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
             bool handshake=false;
             while(std::chrono::steady_clock::now()<deadline){
@@ -2262,7 +2149,6 @@ bool Injection::verify_payload_alive() {
     struct stat st;
     if(::stat((prefix+"/tmp/oss_payload_ready").c_str(),&st)==0) return true;
 
-    // Abstract socket
     int afd=::socket(AF_UNIX,SOCK_STREAM,0);
     if(afd>=0){struct sockaddr_un aa{};aa.sun_family=AF_UNIX;aa.sun_path[0]='\0';
         static constexpr char AS[]="oss_executor_v2";memcpy(aa.sun_path+1,AS,sizeof(AS)-1);
@@ -2270,7 +2156,6 @@ bool Injection::verify_payload_alive() {
         struct timeval tv{};tv.tv_usec=500000;setsockopt(afd,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof(tv));
         bool ok=(::connect(afd,(struct sockaddr*)&aa,al)==0);::close(afd);if(ok)return true;}
 
-    // Unix socket
     std::string sp=prefix+PAYLOAD_SOCK;int fd=::socket(AF_UNIX,SOCK_STREAM,0);
     if(fd>=0){struct sockaddr_un addr{};addr.sun_family=AF_UNIX;
         strncpy(addr.sun_path,sp.c_str(),sizeof(addr.sun_path)-1);
@@ -2281,9 +2166,6 @@ bool Injection::verify_payload_alive() {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// execute_script
-// ═══════════════════════════════════════════════════════════════════
 bool Injection::execute_script(const std::string& source) {
     if(state_!=InjectionState::Ready) return false;
     if(!process_alive()){set_state(InjectionState::Failed,"Target process exited");payload_loaded_=false;memory_.set_pid(0);return false;}
@@ -2292,7 +2174,6 @@ bool Injection::execute_script(const std::string& source) {
 
     set_state(InjectionState::Executing,"Executing ("+std::to_string(source.size())+" bytes)...");
 
-    // Direct hook path
     if(dhook_.active){
         size_t bc_len=0;char* bc=luau_compile(source.c_str(),source.size(),nullptr,&bc_len);
         if(!bc||bc_len==0||(uint8_t)bc[0]==0){
@@ -2308,20 +2189,17 @@ bool Injection::execute_script(const std::string& source) {
         if(armed>0){set_state(InjectionState::Ready,"Script dispatch timeout");return false;}
         LOG_WARN("Mailbox send failed, trying IPC fallback");}
 
-    // Compile-verify for IPC path
     {size_t bc_len=0;char* bc=luau_compile(source.c_str(),source.size(),nullptr,&bc_len);
      if(!bc||bc_len==0||(uint8_t)bc[0]==0){
          std::string ce=(bc&&bc_len>1)?std::string(bc+1,bc_len-1):"unknown";
          free(bc);set_state(InjectionState::Ready,"Compile error: "+ce);return false;}
      free(bc);}
 
-    // IPC channels: abstract socket → unix socket → file IPC
     auto try_send=[&](int fd)->bool{
         const char* d=source.data();size_t rem=source.size();
         while(rem>0){ssize_t n=::write(fd,d,rem);if(n<=0)return false;d+=n;rem-=(size_t)n;}
         ::shutdown(fd,SHUT_WR);return true;};
 
-    // Abstract socket
     {int afd=::socket(AF_UNIX,SOCK_STREAM,0);
      if(afd>=0){struct sockaddr_un aa{};aa.sun_family=AF_UNIX;aa.sun_path[0]='\0';
          static constexpr char AS[]="oss_executor_v2";memcpy(aa.sun_path+1,AS,sizeof(AS)-1);
@@ -2331,7 +2209,6 @@ bool Injection::execute_script(const std::string& source) {
              ::close(afd);set_state(InjectionState::Ready,"Script dispatched");return true;}
          ::close(afd);}}
 
-    // Unix socket
     std::string sock_path=PAYLOAD_SOCK;
     if(proc_info_.via_flatpak||proc_info_.via_sober){pid_t p=memory_.get_pid();
         if(p>0)sock_path="/proc/"+std::to_string(p)+"/root"+PAYLOAD_SOCK;}
@@ -2343,7 +2220,6 @@ bool Injection::execute_script(const std::string& source) {
              ::close(fd);set_state(InjectionState::Ready,"Script dispatched");return true;}
          ::close(fd);}}
 
-    // File IPC
     {std::string cmd_path="/tmp/oss_payload_cmd";
      if(proc_info_.via_flatpak||proc_info_.via_sober){pid_t p=memory_.get_pid();
          if(p>0)cmd_path="/proc/"+std::to_string(p)+"/root/tmp/oss_payload_cmd";}
@@ -2362,9 +2238,6 @@ bool Injection::execute_script(const std::string& source) {
     set_state(InjectionState::Ready,"All IPC channels failed");return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Auto-scan lifecycle
-// ═══════════════════════════════════════════════════════════════════
 void Injection::start_auto_scan() {
     bool expected=false;if(!scanning_.compare_exchange_strong(expected,true))return;
     scan_thread_=std::thread([this](){
@@ -2372,7 +2245,7 @@ void Injection::start_auto_scan() {
             if(memory_.is_valid()&&!process_alive()){
                 cleanup_direct_hook();mode_=InjectionMode::None;vm_marker_addr_=0;
                 vm_scan_={};proc_info_={};payload_loaded_=false;payload_mapped_name_.clear();
-                memory_.set_pid(0);set_state(InjectionState::Idle,"Process exited — rescanning...");}
+                memory_.set_pid(0);set_state(InjectionState::Idle,"Process exited \u2014 rescanning...");}
             if(!memory_.is_valid()) scan_for_roblox();
             for(int i=0;i<AUTOSCAN_TICKS&&scanning_.load();i++)
                 std::this_thread::sleep_for(std::chrono::milliseconds(TICK_MS));}});
