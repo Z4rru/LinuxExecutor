@@ -651,7 +651,8 @@ bool Injection::read_from_process(uintptr_t addr, void* buf, size_t len) {
     struct iovec l={buf,len},r={reinterpret_cast<void*>(addr),len};
     if(process_vm_readv(pid,&l,1,&r,1,0)==(ssize_t)len) return true;
     std::ifstream f("/proc/"+std::to_string(pid)+"/mem",std::ios::binary);
-    if(!f) return false; f.seekg((std::streamoff)addr);
+    if(!f) return false;
+    f.seekg((std::streamoff)addr);
     f.read((char*)buf,(std::streamsize)len); return f.gcount()==(std::streamsize)len;
 }
 
@@ -755,13 +756,15 @@ bool Injection::locate_luau_vm() {
     auto regions=memory_.get_regions(); vm_scan_={}; vm_marker_addr_=0;
     uintptr_t ba=0;std::string bm,bp;uintptr_t bb=0;int bh=0;
     for(const auto& region:regions){
-        if(!should_scan_region(region)) continue; vm_scan_.regions_scanned++;
+        if(!should_scan_region(region)) continue;
+        vm_scan_.regions_scanned++;
         int rh=0;uintptr_t fh=0;std::string fm;
         for(const auto& marker:PRIMARY_MARKERS){
             std::vector<uint8_t> pat(marker.begin(),marker.end());std::string mask(pat.size(),'x');
             size_t sl=std::min(region.size(),REGION_SCAN_CAP); vm_scan_.bytes_scanned+=sl;
             auto res=memory_.pattern_scan(pat,mask,region.start,sl);
-            if(!res) continue; rh++; if(fh==0){fh=*res;fm=marker;}
+            if(!res) continue;
+            rh++; if(fh==0){fh=*res;fm=marker;}
             if(rh>=3&&cross_validate(region.start,region.size())){
                 vm_scan_.marker_addr=fh;vm_scan_.region_base=region.start;
                 vm_scan_.marker_name=fm;vm_scan_.region_path=region.path.empty()?"[anon]":region.path;
@@ -916,7 +919,8 @@ static bool install_jump_patch(uint8_t* patch, size_t& patch_len,
     int64_t disp=(int64_t)to-(int64_t)(from+5);
     if(disp>=INT32_MIN&&disp<=INT32_MAX&&steal>=5){
         patch[0]=0xE9;int32_t r32=(int32_t)disp;memcpy(patch+1,&r32,4);
-        for(size_t i=5;i<steal;i++)patch[i]=0x90;patch_len=steal;return true;}
+        for(size_t i=5;i<steal;i++) patch[i]=0x90;
+        patch_len=steal;return true;}
     if(steal>=14){
         patch[0]=0xFF;patch[1]=0x25;memset(patch+2,0,4);memcpy(patch+6,&to,8);
         patch_len=14;return true;}
@@ -937,7 +941,8 @@ bool Injection::inject_via_inline_hook(pid_t pid, const std::string& lib_path,
         if(!proc_mem_read(pid,addr,orig_prologue,sizeof(orig_prologue))) continue;
         int pos=0;
         while(pos<14){size_t il=dh_insn_len(orig_prologue+pos);if(il==0)break;
-            if(orig_prologue[pos]==0xC3||orig_prologue[pos]==0xCC)break;pos+=(int)il;if(pos>=5)break;}
+            if(orig_prologue[pos]==0xC3||orig_prologue[pos]==0xCC) break;
+            pos+=(int)il;if(pos>=5)break;}
         if(pos>=5){hook_func_addr=addr;hooked_name=name;steal_size=pos;
             LOG_INFO("Targeting '{}' at 0x{:X} (steal={})",name,addr,pos);break;}}
     if(!hook_func_addr){error_="No hookable libc function found";return false;}
@@ -1363,7 +1368,8 @@ static bool extract_lock_internals(pid_t pid, uintptr_t lock_fn_addr,
         if(found_global&&pos+5<=code_len&&(code[pos]==0xE8||code[pos]==0xE9)){
             int32_t disp;memcpy(&disp,&code[pos+1],4);
             call_target=lock_fn_addr+pos+5+(int64_t)disp;
-            if(!found_mutex)mx_off=0;break;}
+            if(!found_mutex) mx_off=0;
+            break;}
 
         size_t il=dh_insn_len(code+pos);if(il==0)break;pos+=il;
     }
@@ -1451,8 +1457,10 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
 
     for(auto& fb:fallbacks){if(*fb.dst)continue;
         std::vector<uintptr_t> excl;
-        if(out.resume)excl.push_back(out.resume);if(out.settop)excl.push_back(out.settop);
-                if(out.newthread)excl.push_back(out.newthread);if(out.load)excl.push_back(out.load);
+        if(out.resume) excl.push_back(out.resume);
+        if(out.settop) excl.push_back(out.settop);
+                if(out.newthread) excl.push_back(out.newthread);
+                if(out.load) excl.push_back(out.load);
         uintptr_t anchor=out.resume?out.resume:(out.settop?out.settop:0);
         uintptr_t found=find_func_by_stringref(pid,memory_,regions,fb.strings,anchor,excl);
         if(found){*fb.dst=found;LOG_INFO("[direct-hook] string-ref: {} at 0x{:X}",fb.name,found);}}
@@ -1479,7 +1487,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                     size_t pp=off;if(pp+4<=scan_sz&&code[pp]==0xF3)pp+=4;
                     bool has_pro9=(pp+sizeof(pro9)<=scan_sz&&memcmp(&code[pp],pro9,sizeof(pro9))==0);
                     int score=0;
-                    if(has_pro9)score+=20;if(sig.has_tt9)score+=10;
+                    if(has_pro9) score+=20;
+                    if(sig.has_tt9) score+=10;
                     if(sig.calls>=2&&sig.calls<=4)score+=3;
                     if(out.resume&&score>=5){int sh=shared_call_count(p,addr,out.resume,sig.func_size);if(sh>0)score+=5;}
                     return score;},20);
@@ -1607,7 +1616,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             ssize_t lkrd=process_vm_readv(pid,&lkl,1,&lkr,1,0);
             if(lkrd>=20){for(size_t i=0;i+7<(size_t)lkrd;i++){
                 if(lk[i]!=0x48&&lk[i]!=0x4C)continue;
-                if(lk[i+1]!=0x8B)continue;uint8_t modrm=lk[i+2];
+                if(lk[i+1]!=0x8B) continue;
+                uint8_t modrm=lk[i+2];
                 uint8_t mod=(modrm>>6)&3,rm=modrm&7;
                 if(rm!=7||mod==3||rm==4)continue;
                 int32_t dv=0;size_t ie=0;
