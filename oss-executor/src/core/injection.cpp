@@ -489,7 +489,8 @@ std::string Injection::read_proc_exe(pid_t pid) {
 }
 
 bool Injection::has_roblox_token(const std::string& s) {
-    for(const auto& t:ROBLOX_TOKENS) if(s.find(t)!=std::string::npos) return true; return false;
+    for(const auto& t:ROBLOX_TOKENS) if(s.find(t)!=std::string::npos) return true;
+    return false;
 }
 
 bool Injection::process_alive() const { pid_t p=memory_.get_pid(); return p>0&&kill(p,0)==0; }
@@ -500,15 +501,18 @@ void Injection::set_status_callback(StatusCallback cb) { std::lock_guard<std::mu
 void Injection::set_state(InjectionState s, const std::string& msg) {
     state_=s; if(s==InjectionState::Failed) error_=msg;
     StatusCallback cb; {std::lock_guard<std::mutex> lk(mtx_);cb=status_cb_;}
-    if(cb) cb(s,msg); LOG_INFO("[injection] {}",msg);
+    if(cb) cb(s,msg);
+    LOG_INFO("[injection] {}",msg);
 }
 
 std::vector<pid_t> Injection::descendants(pid_t root) {
     std::vector<pid_t> all;
     auto children=[](pid_t parent){std::vector<pid_t> ch;
         try{for(const auto& e:fs::directory_iterator("/proc")){
-            if(!e.is_directory())continue;std::string dn=e.path().filename().string();
-            if(!std::all_of(dn.begin(),dn.end(),::isdigit))continue;pid_t pid=std::stoi(dn);
+            if(!e.is_directory()) continue;
+            std::string dn=e.path().filename().string();
+            if(!std::all_of(dn.begin(),dn.end(),::isdigit)) continue;
+            pid_t pid=std::stoi(dn);
             if(pid==parent)continue;
             try{std::ifstream sf(e.path()/"stat");std::string line;std::getline(sf,line);
                 auto ce=line.rfind(')');if(ce==std::string::npos)continue;
@@ -594,7 +598,8 @@ bool Injection::scan_wine_cmdline() {
 
 bool Injection::scan_wine_regions() {
     for(const auto& h:WINE_HOSTS) for(auto pid:Memory::find_all_processes(h)){
-        if(is_self_process(pid)) continue; Memory mem(pid);
+        if(is_self_process(pid)) continue;
+        Memory mem(pid);
         for(const auto& r:mem.get_regions()){std::string lp=r.path;
             std::transform(lp.begin(),lp.end(),lp.begin(),::tolower);
             if(lp.find("roblox")!=std::string::npos){adopt_target(pid,"via Wine memory region");
@@ -616,7 +621,8 @@ bool Injection::scan_flatpak() {
 
 bool Injection::scan_brute() {
     try{for(const auto& e:fs::directory_iterator("/proc")){
-        if(!e.is_directory()) continue; std::string d=e.path().filename().string();
+        if(!e.is_directory()) continue;
+        std::string d=e.path().filename().string();
         if(!std::all_of(d.begin(),d.end(),::isdigit)) continue;
         pid_t pid=std::stoi(d); if(pid<=1||is_self_process(pid)) continue;
         std::string comm=read_proc_comm(pid);if(is_self_process_name(comm))continue;
