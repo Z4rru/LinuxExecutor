@@ -1794,7 +1794,7 @@ static bool do_dryrun(pid_t pid, uintptr_t mb_addr, int timeout_iters=100) {
     std::string path="/proc/"+std::to_string(pid)+"/mem";
     int fd=open(path.c_str(),O_RDWR);
     auto pw=[&](uintptr_t a,const void* d,size_t l){
-        if(fd>=0){pwrite(fd,d,l,(off_t)a);return;}
+        if(fd>=0){(void)!pwrite(fd,d,l,(off_t)a);return;}
         struct iovec wl={const_cast<void*>(d),l},wr={reinterpret_cast<void*>(a),l};
         process_vm_writev(pid,&wl,1,&wr,1,0);};
     pw(mb_addr+64,bc,bc_len);
@@ -1912,7 +1912,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
                 bool has_alock=false;
                 for(size_t fi=0;fi<60&&off+fi+5<=scan_sz;fi++){
-                    if(code[off+fi]!=0xE8)continue;int32_t cd;memcpy(&cd,&code[off+fi+1],4);
+                    if(code[off+fi]!=0xE8) continue;
+                    int32_t cd; memcpy(&cd,&code[off+fi+1],4);
                     uintptr_t ct=r.start+off+fi+5+(int64_t)cd;
                     if(ct==addrs.lock_fn){has_alock=true;break;}
                     if(first_call_reaches(pid,ct,addrs.lock_fn,20)){has_alock=true;break;}break;}
@@ -1923,7 +1924,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if(!proc_mem_read(pid,cand,cand_pro,sizeof(cand_pro))) continue;
                 size_t cand_steal=0;
                 while(cand_steal<5){size_t il=dh_insn_len(cand_pro+cand_steal);
-                    if(il==0||cand_steal+il>sizeof(cand_pro))break;cand_steal+=il;}
+                    if(il==0||cand_steal+il>sizeof(cand_pro)) break;
+                    cand_steal+=il;}
                 if(cand_steal<5) continue;
 
                 if(!addrs.unlock_fn){
@@ -1947,7 +1949,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             uint8_t rpro[32];
             if(proc_mem_read(pid,addrs.resume,rpro,sizeof(rpro))){
                 size_t rsteal=0;while(rsteal<5){size_t il=dh_insn_len(rpro+rsteal);
-                    if(il==0||rsteal+il>sizeof(rpro))break;rsteal+=il;}
+                    if(il==0||rsteal+il>sizeof(rpro)) break;
+                    rsteal+=il;}
                 if(rsteal>=5&&try_hook(addrs.resume,"lua_resume",rpro,rsteal,true)){
                     hook_addr=addrs.resume;memcpy(prologue,rpro,rsteal);steal=rsteal;
                     hook_needs_unlock=true;found_live=true;}}}
@@ -1958,7 +1961,8 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     if(hook_needs_unlock&&!addrs.unlock_fn&&addrs.lock_internals_valid&&addrs.pthread_mutex_unlock_addr){
         if(addrs.pthread_mutex_lock_addr){
             int64_t lu=(int64_t)addrs.pthread_mutex_lock_addr-(int64_t)addrs.pthread_mutex_unlock_addr;
-            if(lu<0)lu=-lu;if((uint64_t)lu>0x100000ULL){
+            if(lu<0) lu=-lu;
+            if((uint64_t)lu>0x100000ULL){
                 LOG_WARN("[direct-hook] lock/unlock incompatible, disabling bracket");hook_needs_unlock=false;}}}
 
     bool effective_held_lock=hook_needs_unlock;
