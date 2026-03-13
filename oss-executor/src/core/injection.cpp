@@ -344,7 +344,7 @@ static uintptr_t find_func_by_stringref(pid_t pid, Memory& mem,
                 uintptr_t r_lo=xr.start, r_hi=xr.end;
                 if(anchor){
                     uintptr_t s_lo=(anchor>0x80000000ULL)?anchor-0x80000000ULL:0;
-                    r_lo=std::max(xr.start,s_lo); r_hi=std::min(xr.end,anchor+0x80000000ULL);
+                    r_lo=std::max(xr.start,s_lo); r_hi=std::min(xr.end,static_cast<uintptr_t>(anchor+0x80000000ULL));
                     if(r_lo>=r_hi) continue;
                 }
                 size_t xscan=r_hi-r_lo;
