@@ -228,7 +228,7 @@ static FuncSig analyze_func_sig(const uint8_t* code, size_t off, size_t scan_sz,
             if((code[i]==0x48||code[i]==0x49)&&code[i+1]==0x89&&(code[i+2]&0x38)==0x38) s.saves_rdi=true;
             if(code[i]==0x89&&(code[i+1]&0x38)==0x30) s.saves_rsi=true;
             if((code[i]==0x48||code[i]==0x49)&&code[i+1]==0x89&&(code[i+2]&0x38)==0x30) s.saves_rsi=true;
-            if(code[i]==0x48&&code[i+1]==0x63&&(code[i+2]&0xC7)==0xC6) s.saves_rsi=true;
+            if((code[i]&0x49)==0x48&&code[i+1]==0x63&&(code[i+2]&0xC7)==0xC6) s.saves_rsi=true;
             if(code[i]==0x89&&(code[i+1]&0x38)==0x10) s.saves_rdx=true;
             if((code[i]==0x48||code[i]==0x49)&&code[i+1]==0x89&&(code[i+2]&0x38)==0x10) s.saves_rdx=true;
         }
@@ -1517,8 +1517,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         uint8_t stb[128];struct iovec sl={stb,sizeof(stb)},sr={reinterpret_cast<void*>(out.settop),sizeof(stb)};
         if(process_vm_readv(pid,&sl,1,&sr,1,0)>=24){
             auto sig=analyze_func_sig(stb,0,128,128,10);
-            if(sig.saves_rdx&&!sig.saves_rsi){LOG_WARN("[direct-hook] lua_settop wrong sig, clearing");out.settop=0;}
-            else if(!sig.saves_rsi){LOG_WARN("[direct-hook] lua_settop no rsi, clearing");out.settop=0;}}}
+            if(!sig.saves_rdi||!sig.saves_rsi){out.settop=0;}}}
 
     if(!out.settop&&out.resume){
         std::vector<uintptr_t> excl={out.resume,out.newthread,out.load};
@@ -1611,7 +1610,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if(td>0x100000)break;
                         int64_t cd=(int64_t)cand-(int64_t)active_lock;if(cd<0)cd=-cd;
                         if(cd<best_dist){best_dist=cd;best_ul=cand;}break;}}
-                if(best_ul){out.unlock_fn=best_ul;LOG_INFO("[direct-hook] active_unlock at 0x{:X}",best_ul);}}}}
+                if(best_ul&&best_dist>=16){out.unlock_fn=best_ul;LOG_INFO("[direct-hook] active_unlock at 0x{:X}",best_ul);}}}}
 
     if(active_lock&&!out.unlock_fn){
         int32_t gs_off=0,mx_off=0;uintptr_t pml_addr=0;
@@ -1880,7 +1879,6 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     if(!find_code_cave(pid,nearby,CAVE_SIZE,cave)){LOG_ERROR("[direct-hook] no code cave");return false;}
 
     uintptr_t hook_addr=addrs.settop;
-    bool hook_needs_unlock=false;
     uint8_t patch[16]={};size_t patch_len=0;
 
     auto try_hook=[&](uintptr_t target,const char* name,uint8_t* pro,size_t st,bool held_lock)->bool{
@@ -1952,11 +1950,10 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                         if(fend>10){uintptr_t ul=last_call_in_func(ls_buf,fend,cand,addrs.lock_fn);
                             if(ul)addrs.unlock_fn=ul;}}}
 
-                hook_needs_unlock=true;
                 memcpy(prologue,cand_pro,cand_steal);steal=cand_steal;
                 hook_addr=cand;
 
-                if(try_hook(cand,"live_settop",cand_pro,cand_steal,true)){found_live=true;break;}
+                if(try_hook(cand,"live_settop",cand_pro,cand_steal,false)){found_live=true;break;}
                 else{hook_addr=addrs.settop;memcpy(prologue,cand_pro,steal);}
             }}
 
@@ -1967,21 +1964,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 size_t rsteal=0;while(rsteal<5){size_t il=dh_insn_len(rpro+rsteal);
                     if(il==0||rsteal+il>sizeof(rpro)) break;
                     rsteal+=il;}
-                if(rsteal>=5&&try_hook(addrs.resume,"lua_resume",rpro,rsteal,true)){
+            if(rsteal>=5&&try_hook(addrs.resume,"lua_resume",rpro,rsteal,false)){
                     hook_addr=addrs.resume;memcpy(prologue,rpro,rsteal);steal=rsteal;
-                    hook_needs_unlock=true;found_live=true;}}}
+                    found_live=true;}}}
 
         if(!found_live){LOG_ERROR("[direct-hook] all hook targets exhausted");return false;}
     }
 
-    if(hook_needs_unlock&&!addrs.unlock_fn&&addrs.lock_internals_valid&&addrs.pthread_mutex_unlock_addr){
-        if(addrs.pthread_mutex_lock_addr){
-            int64_t lu=(int64_t)addrs.pthread_mutex_lock_addr-(int64_t)addrs.pthread_mutex_unlock_addr;
-            if(lu<0) lu=-lu;
-            if((uint64_t)lu>0x100000ULL){
-                LOG_WARN("[direct-hook] lock/unlock incompatible, disabling bracket");hook_needs_unlock=false;}}}
-
-    bool effective_held_lock=hook_needs_unlock;
+    bool effective_held_lock=false;
     {auto t_final=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,hook_addr,prologue,steal,
                                         false,effective_held_lock,hook_addr!=addrs.resume);
      if(!proc_mem_write(pid,cave.padding_start,t_final.data(),t_final.size())){
@@ -2010,7 +2000,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if(rs>=5){
                     DirectMailbox mb2{};memcpy(mb2.magic,"OSS_DMBOX_V3\0\0\0\0",16);
                     proc_mem_write(pid,mb_addr,&mb2,sizeof(mb2));
-                    auto rt=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,addrs.resume,rpro,rs,false,true,false);
+                    auto rt=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,addrs.resume,rpro,rs,false,false,false);
                     if(rt.size()<=CAVE_SIZE&&proc_mem_write(pid,cave.padding_start,rt.data(),rt.size())){
                         uint8_t rp[16];size_t rpl=0;
                         if(install_jump_patch(rp,rpl,addrs.resume,cave.padding_start,rs)&&
