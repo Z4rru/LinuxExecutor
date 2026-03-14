@@ -1558,14 +1558,22 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             if(result.addr&&result.score>=12){out.load=result.addr;
                 LOG_INFO("[direct-hook] proximity sig: luau_load=0x{:X} (score={})",result.addr,result.score);}}}
 
-    if(!out.lock_fn&&out.settop){
+    if(out.settop){
         uint8_t stb[128];struct iovec sl={stb,sizeof(stb)},sr={reinterpret_cast<void*>(out.settop),sizeof(stb)};
         if(process_vm_readv(pid,&sl,1,&sr,1,0)>=20){
             size_t fend=find_func_end(stb,128,20);if(!fend)fend=80;
+            uintptr_t settop_lock=0;
             for(size_t i=0;i<std::min(fend,(size_t)80);i++)
                 if(stb[i]==0xE8){int32_t d;memcpy(&d,&stb[i+1],4);
-                    out.lock_fn=out.settop+i+5+(int64_t)d;
-                    LOG_INFO("[direct-hook] lua_lock from settop at 0x{:X}",out.lock_fn);break;}}}
+                    settop_lock=out.settop+i+5+(int64_t)d;break;}
+            if(settop_lock&&out.lock_fn&&settop_lock!=out.lock_fn){
+                LOG_INFO("[direct-hook] lua_lock cross-ref: newthread had 0x{:X} (luaC_checkGC), settop has 0x{:X} (lua_lock), using settop",
+                         out.lock_fn,settop_lock);
+                out.lock_fn=settop_lock;
+            }else if(settop_lock&&!out.lock_fn){
+                out.lock_fn=settop_lock;
+                LOG_INFO("[direct-hook] lua_lock from settop at 0x{:X}",out.lock_fn);
+            }}}
 
     uintptr_t active_lock=out.lock_fn;
 
