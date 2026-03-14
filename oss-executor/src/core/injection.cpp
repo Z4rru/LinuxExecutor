@@ -1474,6 +1474,11 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         uintptr_t found=find_func_by_stringref(pid,memory_,regions,fb.strings,anchor,excl);
         if(found){*fb.dst=found;LOG_INFO("[direct-hook] string-ref: {} at 0x{:X}",fb.name,found);}}
 
+    if(out.resume&&out.load){int64_t d=(int64_t)out.resume-(int64_t)out.load;if(d<0)d=-d;
+        if((uint64_t)d>0x8000000ULL){LOG_WARN("[direct-hook] luau_load too far from resume ({} bytes), clearing",d);out.load=0;}}
+    if(out.resume&&out.settop){int64_t d=(int64_t)out.resume-(int64_t)out.settop;if(d<0)d=-d;
+        if((uint64_t)d>0x8000000ULL){LOG_WARN("[direct-hook] lua_settop too far from resume ({} bytes), clearing",d);out.settop=0;}}
+
     if(!out.newthread){
         std::vector<uintptr_t> anchors;
         if(out.settop)anchors.push_back(out.settop);
@@ -1855,7 +1860,7 @@ static bool do_dryrun(pid_t pid, uintptr_t mb_addr, int timeout_iters=100) {
         struct iovec al={&da,8},ar={reinterpret_cast<void*>(mb_addr+24),8};
         process_vm_readv(pid,&al,1,&ar,1,0);
         if(da>=arm){pass=true;break;}
-        if(i>=39){uint32_t ds=0;uint8_t dg=0;
+        if(i>=19){uint32_t ds=0;uint8_t dg=0;
             struct iovec dsl={&ds,4},dsr={reinterpret_cast<void*>(mb_addr+44),4};
             process_vm_readv(pid,&dsl,1,&dsr,1,0);
             struct iovec dgl={&dg,1},dgr={reinterpret_cast<void*>(mb_addr+40),1};
@@ -1935,7 +1940,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             if(found_live||total_probes>=MAX_PROBES) break;
             if(!r.readable()||!r.executable()||r.size()<256) continue;
             int64_t rd=(int64_t)r.start-(int64_t)addrs.resume;
-            if(rd<-0x800000LL||rd>0x800000LL) continue;
+            if(rd<-0x8000000LL||rd>0x8000000LL) continue;
             size_t scan_sz=std::min(r.size(),(size_t)0x800000);
             std::vector<uint8_t> code(scan_sz);
             struct iovec sli={code.data(),scan_sz},sri={reinterpret_cast<void*>(r.start),scan_sz};
@@ -2001,7 +2006,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         if(!found_live){LOG_ERROR("[direct-hook] all hook targets exhausted");return false;}
     }
 
-    bool effective_held_lock=(hook_addr==addrs.resume);
+    bool effective_held_lock=false;
     {auto t_final=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,hook_addr,prologue,steal,
                                         true,effective_held_lock,hook_addr!=addrs.resume);
      if(!proc_mem_write(pid,cave.padding_start,t_final.data(),t_final.size())){
@@ -2017,6 +2022,19 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
     LOG_INFO("[direct-hook] HOOK ARMED at 0x{:X}, cave=0x{:X}, mailbox=0x{:X}",hook_addr,cave.padding_start,mb_addr);
 
+    if(addrs.pthread_mutex_lock_addr){
+        usleep(200000);
+        uintptr_t cap_L=0;proc_mem_read(pid,mb_addr+48,&cap_L,8);
+        if(cap_L>0x10000){
+            uintptr_t gs=0;
+            if(proc_mem_read(pid,cap_L+addrs.lock_global_state_offset,&gs,8)&&gs>0x10000){
+                uintptr_t mx=gs+addrs.lock_mutex_offset;int32_t kind=0;
+                if(proc_mem_read(pid,mx+16,&kind,4)&&kind>=0&&kind<=4&&kind!=1){
+                    int32_t recursive=1;
+                    if(proc_mem_write(pid,mx+16,&recursive,4))
+                        LOG_INFO("[direct-hook] pre-emptive: mutex 0x{:X} kind {}->1 (recursive)",mx,kind);
+                }}}}
+
     if(!do_dryrun(pid,mb_addr)){
         uintptr_t saved_L=0;proc_mem_read(pid,mb_addr+48,&saved_L,8);
         proc_mem_write(pid,hook_addr,prologue,steal);
@@ -2031,7 +2049,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if(rs>=5){
                     DirectMailbox mb2{};memcpy(mb2.magic,"OSS_DMBOX_V3\0\0\0\0",16);
                     proc_mem_write(pid,mb_addr,&mb2,sizeof(mb2));
-                    auto rt=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,addrs.resume,rpro,rs,true,true,false);
+                    auto rt=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,addrs.resume,rpro,rs,true,false,false);
                     if(rt.size()<=CAVE_SIZE&&proc_mem_write(pid,cave.padding_start,rt.data(),rt.size())){
                         uint8_t rp[16];size_t rpl=0;
                         if(install_jump_patch(rp,rpl,addrs.resume,cave.padding_start,rs)&&
@@ -2084,6 +2102,10 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
     }
 
+    if(!dhook_.active){
+        LOG_ERROR("[direct-hook] all retry strategies exhausted");
+        return false;
+    }
     set_state(InjectionState::Ready,"Direct hook active \u2014 ready for scripts");return true;
 }
 
