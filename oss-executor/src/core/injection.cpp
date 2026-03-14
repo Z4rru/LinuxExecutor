@@ -2047,7 +2047,35 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 }
             }
         }
-        error_="Direct hook dry-run failed";set_state(InjectionState::Failed,error_);return false;
+        if(saved_L&&addrs.pthread_mutex_lock_addr){
+            uintptr_t n_gs=0;
+            if(proc_mem_read(pid,saved_L+addrs.lock_global_state_offset,&n_gs,8)&&n_gs>0x10000){
+                uintptr_t n_mx=n_gs+addrs.lock_mutex_offset;int32_t n_kind=0;
+                if(proc_mem_read(pid,n_mx+16,&n_kind,4)&&n_kind>=0&&n_kind<=4){
+                    int32_t n_rec=1;
+                    if(proc_mem_write(pid,n_mx+16,&n_rec,4)){
+                        LOG_INFO("[direct-hook] nuclear: mutex 0x{:X} kind {}->1 (recursive)",n_mx,n_kind);
+                        DirectMailbox nmb{};memcpy(nmb.magic,"OSS_DMBOX_V3\0\0\0\0",16);
+                        proc_mem_write(pid,mb_addr,&nmb,sizeof(nmb));
+                        auto nt=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,
+                            hook_addr,prologue,steal,true,false,hook_addr!=addrs.resume);
+                        if(nt.size()<=CAVE_SIZE&&proc_mem_write(pid,cave.padding_start,nt.data(),nt.size())
+                           &&proc_mem_write(pid,hook_addr,patch,patch_len)){
+                            if(do_dryrun(pid,mb_addr)){
+                                dhook_.cave_addr=cave.padding_start;dhook_.mailbox_addr=mb_addr;
+                                dhook_.cave_size=CAVE_SIZE;dhook_.stolen_len=steal;
+                                dhook_.resume_addr=addrs.resume;dhook_.newthread_addr=addrs.newthread;
+                                dhook_.load_addr=addrs.load;dhook_.settop_addr=hook_addr;
+                                memcpy(dhook_.stolen_bytes,prologue,steal);
+                                memcpy(dhook_.orig_patch,prologue,patch_len);
+                                dhook_.patch_len=patch_len;dhook_.active=true;
+                                dhook_.nop_stub_addr=cave.padding_start+nt.size()-1;
+                                set_state(InjectionState::Ready,
+                                    "Direct hook active (nuclear) \u2014 ready for scripts");
+                                return true;}
+                            proc_mem_write(pid,hook_addr,prologue,steal);}
+                        proc_mem_write(pid,n_mx+16,&n_kind,4);}}}}
+
     }
 
     set_state(InjectionState::Ready,"Direct hook active \u2014 ready for scripts");return true;
