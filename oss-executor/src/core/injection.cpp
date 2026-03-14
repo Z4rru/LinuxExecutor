@@ -1349,6 +1349,9 @@ static bool extract_lock_internals(pid_t pid, uintptr_t lock_fn_addr,
     if(pos+2<=code_len&&code[pos]==0x41&&code[pos+1]>=0x50&&code[pos+1]<=0x57) pos+=2;
     if(pos+4<=code_len&&code[pos]==0x48&&code[pos+1]==0x83&&code[pos+2]==0xEC) pos+=4;
 
+    int l_reg=7;
+    if(pos+3<=code_len&&code[pos]==0x48&&code[pos+1]==0x89){
+        uint8_t m=code[pos+2];if((m&0xC0)==0xC0&&((m>>3)&7)==7&&(m&7)!=7){l_reg=m&7;pos+=3;}}
     int gs_reg=7;int32_t gs_off=0,mx_off=0;
     bool found_global=false,found_mutex=false;uintptr_t call_target=0;
 
@@ -1359,7 +1362,7 @@ static bool extract_lock_internals(pid_t pid, uintptr_t lock_fn_addr,
         if(!found_global&&has_rw&&pos+rex_skip+2<code_len){
             uint8_t op=code[pos+rex_skip],modrm=code[pos+rex_skip+1];
             uint8_t mod=(modrm>>6)&3,reg=(modrm>>3)&7,rm=modrm&7;
-            if(op==0x8B&&rm==7&&mod!=3&&rm!=4){
+            if(op==0x8B&&rm==l_reg&&mod!=3&&rm!=4){
                 if(mod==1&&pos+rex_skip+3<=code_len){gs_off=(int8_t)code[pos+rex_skip+2];gs_reg=reg;if(b0&0x04)gs_reg+=8;found_global=true;pos+=rex_skip+3;continue;}
                 if(mod==2&&pos+rex_skip+6<=code_len){memcpy(&gs_off,&code[pos+rex_skip+2],4);gs_reg=reg;if(b0&0x04)gs_reg+=8;found_global=true;pos+=rex_skip+6;continue;}
                 if(mod==0){gs_off=0;gs_reg=reg;if(b0&0x04)gs_reg+=8;found_global=true;pos+=rex_skip+2;continue;}}}
@@ -1385,7 +1388,7 @@ static bool extract_lock_internals(pid_t pid, uintptr_t lock_fn_addr,
         for(size_t scan=pos;scan+10<code_len;scan++){
             if(scan+4<=code_len&&code[scan]==0x48&&code[scan+1]==0x8B){
                 uint8_t modrm=code[scan+2];uint8_t mod=(modrm>>6)&3,reg=(modrm>>3)&7,rm=modrm&7;
-                if(rm!=7||rm==4||mod==3) continue;
+                if(rm!=l_reg||rm==4||mod==3) continue;
                 int32_t ov=0;size_t insn_len=0;
                 if(mod==1&&scan+4<=code_len){ov=(int8_t)code[scan+3];insn_len=4;}
                 else if(mod==2&&scan+7<=code_len){memcpy(&ov,&code[scan+3],4);insn_len=7;}
@@ -1600,7 +1603,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             if(process_vm_readv(pid,&rl,1,&rr,1,0)==(ssize_t)scan_sz){
                 int64_t best_dist=INT64_MAX;uintptr_t best_ul=0;
                 for(size_t off=1;off+20<scan_sz;off++){
-                    uintptr_t cand=scan_lo+off;if(cand==active_lock||!at_func_boundary(rbuf[off-1]))continue;
+                    uintptr_t cand=scan_lo+off;if(cand<=active_lock)continue;
+                    if(!at_func_boundary(rbuf[off-1])&&!has_prologue(rbuf.data()+off,scan_sz-off))continue;
                     for(size_t j=0;j<20&&off+j+5<scan_sz;j++){
                         if(rbuf[off+j]!=0xE8&&rbuf[off+j]!=0xE9)continue;
                         int32_t d;memcpy(&d,&rbuf[off+j+1],4);
@@ -1610,11 +1614,30 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         if(td>0x100000)break;
                         int64_t cd=(int64_t)cand-(int64_t)active_lock;if(cd<0)cd=-cd;
                         if(cd<best_dist){best_dist=cd;best_ul=cand;}break;}}
-                if(best_ul&&best_dist>=16){out.unlock_fn=best_ul;LOG_INFO("[direct-hook] active_unlock at 0x{:X}",best_ul);}}}}
+                if(best_ul){out.unlock_fn=best_ul;LOG_INFO("[direct-hook] active_unlock at 0x{:X}",best_ul);}}}}
 
     if(active_lock&&!out.unlock_fn){
-        int32_t gs_off=0,mx_off=0;uintptr_t pml_addr=0;
-        bool internals_ok=extract_lock_internals(pid,active_lock,gs_off,mx_off,pml_addr);
+        uint8_t lkc[64];struct iovec lkl={lkc,sizeof(lkc)},lkr={reinterpret_cast<void*>(active_lock),sizeof(lkc)};
+        ssize_t lkrd=process_vm_readv(pid,&lkl,1,&lkr,1,0);
+        if(lkrd>=10){size_t lk_end=0;uintptr_t lk_tgt=0;
+            for(size_t i=0;i+5<=(size_t)lkrd;){
+                if(lkc[i]==0xC3){lk_end=i+1;break;}
+                if(lkc[i]==0xE8||lkc[i]==0xE9){int32_t d;memcpy(&d,&lkc[i+1],4);
+                    lk_tgt=active_lock+i+5+(int64_t)d;if(lkc[i]==0xE9){lk_end=i+5;break;}i+=5;continue;}
+                if(lkc[i]==0xFF&&i+1<(size_t)lkrd&&(lkc[i+1]&0x38)==0x20){lk_end=i;break;}
+                size_t il=dh_insn_len(lkc+i);if(il==0)break;i+=il;}
+            if(lk_end&&lk_tgt){uint8_t af[80];
+                struct iovec afl={af,sizeof(af)},afr={reinterpret_cast<void*>(active_lock+lk_end),sizeof(af)};
+                if(process_vm_readv(pid,&afl,1,&afr,1,0)>=20){
+                    size_t sk=0;while(sk<20&&(af[sk]==0xCC||af[sk]==0x90||af[sk]==0x00))sk++;
+                    if(sk<20){uintptr_t uc=active_lock+lk_end+sk;
+                        for(size_t j=0;j<30&&sk+j+5<=sizeof(af);j++){
+                            if(af[sk+j]!=0xE8&&af[sk+j]!=0xE9)continue;
+                            int32_t d;memcpy(&d,&af[sk+j+1],4);uintptr_t ut=uc+j+5+(int64_t)d;
+                            if(ut!=lk_tgt){int64_t td=(int64_t)ut-(int64_t)lk_tgt;if(td<0)td=-td;
+                                if((uint64_t)td<0x10000ULL){out.unlock_fn=uc;
+                                    LOG_INFO("[direct-hook] nuclear: lua_unlock at 0x{:X}",uc);}}
+                            break;}}}}}}
 
         if(!internals_ok){
             uint8_t lk[48];struct iovec lkl={lk,sizeof(lk)},lkr={reinterpret_cast<void*>(active_lock),sizeof(lk)};
@@ -1663,7 +1686,8 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         ssize_t ul_rd=process_vm_readv(pid,&ul_l,1,&ul_r,1,0);
         if(ul_rd>=40){size_t fend=find_func_end(stbuf,(size_t)ul_rd);
             if(fend>10){uintptr_t last=last_call_in_func(stbuf,fend,out.settop,active_lock);
-                if(last){out.unlock_fn=last;LOG_INFO("[direct-hook] lua_unlock at 0x{:X}",last);}}}}
+                if(last){int64_t ud=(int64_t)last-(int64_t)active_lock;if(ud<0)ud=-ud;
+                    if((uint64_t)ud<0x100000ULL){out.unlock_fn=last;LOG_INFO("[direct-hook] lua_unlock at 0x{:X}",last);}}}}}}
 
     if(!out.resume||!out.load||!out.settop){
         LOG_ERROR("[direct-hook] missing required: resume={:#x} load={:#x} settop={:#x}",out.resume,out.load,out.settop);
@@ -1971,9 +1995,9 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         if(!found_live){LOG_ERROR("[direct-hook] all hook targets exhausted");return false;}
     }
 
-    bool effective_held_lock=false;
+    bool effective_held_lock=(hook_addr==addrs.resume);
     {auto t_final=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,hook_addr,prologue,steal,
-                                        false,effective_held_lock,hook_addr!=addrs.resume);
+                                        true,effective_held_lock,hook_addr!=addrs.resume);
      if(!proc_mem_write(pid,cave.padding_start,t_final.data(),t_final.size())){
          proc_mem_write(pid,hook_addr,prologue,steal);return false;}}
 
@@ -1982,12 +2006,13 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
     dhook_.load_addr=addrs.load;dhook_.settop_addr=hook_addr;
     memcpy(dhook_.stolen_bytes,prologue,steal);memcpy(dhook_.orig_patch,prologue,patch_len);
     dhook_.patch_len=patch_len;dhook_.active=true;dhook_.has_compile=(addrs.compile!=0);
-    {auto tm=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,hook_addr,prologue,steal,false,effective_held_lock,hook_addr!=addrs.resume);
+    {auto tm=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,hook_addr,prologue,steal,true,effective_held_lock,hook_addr!=addrs.resume);
      dhook_.nop_stub_addr=cave.padding_start+tm.size()-1;}
 
     LOG_INFO("[direct-hook] HOOK ARMED at 0x{:X}, cave=0x{:X}, mailbox=0x{:X}",hook_addr,cave.padding_start,mb_addr);
 
     if(!do_dryrun(pid,mb_addr)){
+        uintptr_t saved_L=0;proc_mem_read(pid,mb_addr+48,&saved_L,8);
         proc_mem_write(pid,hook_addr,prologue,steal);
         DirectMailbox empty{};proc_mem_write(pid,mb_addr,&empty,sizeof(empty));
         dhook_={};
@@ -2000,7 +2025,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if(rs>=5){
                     DirectMailbox mb2{};memcpy(mb2.magic,"OSS_DMBOX_V3\0\0\0\0",16);
                     proc_mem_write(pid,mb_addr,&mb2,sizeof(mb2));
-                    auto rt=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,addrs.resume,rpro,rs,false,false,false);
+                    auto rt=gen_entry_trampoline(addrs,mb_addr,cave.padding_start,addrs.resume,rpro,rs,true,true,false);
                     if(rt.size()<=CAVE_SIZE&&proc_mem_write(pid,cave.padding_start,rt.data(),rt.size())){
                         uint8_t rp[16];size_t rpl=0;
                         if(install_jump_patch(rp,rpl,addrs.resume,cave.padding_start,rs)&&
