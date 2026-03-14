@@ -2022,18 +2022,56 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
 
     LOG_INFO("[direct-hook] HOOK ARMED at 0x{:X}, cave=0x{:X}, mailbox=0x{:X}",hook_addr,cave.padding_start,mb_addr);
 
-    if(addrs.pthread_mutex_lock_addr){
-        usleep(200000);
+    {usleep(200000);
         uintptr_t cap_L=0;proc_mem_read(pid,mb_addr+48,&cap_L,8);
         if(cap_L>0x10000){
-            uintptr_t gs=0;
-            if(proc_mem_read(pid,cap_L+addrs.lock_global_state_offset,&gs,8)&&gs>0x10000){
-                uintptr_t mx=gs+addrs.lock_mutex_offset;int32_t kind=0;
-                if(proc_mem_read(pid,mx+16,&kind,4)&&kind>=0&&kind<=4&&kind!=1){
+            uintptr_t mx_found=0;const char* mx_method="";
+            if(addrs.pthread_mutex_lock_addr){
+                uintptr_t gs=0;
+                if(proc_mem_read(pid,cap_L+addrs.lock_global_state_offset,&gs,8)&&gs>0x10000){
+                    uintptr_t mx=gs+addrs.lock_mutex_offset;int32_t mf[5]={};
+                    if(proc_mem_read(pid,mx,mf,20)&&mf[0]>=1&&mf[0]<=2&&mf[1]==0&&
+                       mf[2]>0&&mf[2]<0x1000000&&mf[4]==0){mx_found=mx;mx_method="lock-internals";}}}
+            if(!mx_found&&addrs.lock_fn){
+                uint8_t lkb[64];
+                if(proc_mem_read(pid,addrs.lock_fn,lkb,sizeof(lkb))){
+                    for(size_t bi=0;bi<sizeof(lkb)-7&&!mx_found;bi++){
+                        if(lkb[bi]<0x48||lkb[bi]>0x4F||lkb[bi+1]!=0x8B) continue;
+                        uint8_t modrm=lkb[bi+2];uint8_t mod=(modrm>>6)&3,rm=modrm&7;
+                        if(mod==3||rm==4||(mod==0&&rm==5)) continue;
+                        int32_t disp=0;size_t ie=0;
+                        if(mod==1&&bi+4<=sizeof(lkb)){disp=(int8_t)lkb[bi+3];ie=bi+4;}
+                        else if(mod==2&&bi+7<=sizeof(lkb)){memcpy(&disp,&lkb[bi+3],4);ie=bi+7;}
+                        else if(mod==0){disp=0;ie=bi+3;}
+                        if(!ie) continue;
+                        uintptr_t gs=0;
+                        if(!proc_mem_read(pid,cap_L+disp,&gs,8)||gs<0x10000||gs==cap_L) continue;
+                        uint8_t gsd[260];
+                        if(!proc_mem_read(pid,gs,gsd,sizeof(gsd))) continue;
+                        for(int32_t moff=0;moff<=240&&!mx_found;moff+=8){
+                            int32_t mf[5];memcpy(mf,gsd+moff,20);
+                            if(mf[0]>=1&&mf[0]<=2&&mf[1]==0&&mf[2]>0&&mf[2]<0x1000000&&mf[4]==0)
+                                {mx_found=gs+moff;mx_method="lock-bytescan";}}}}}
+            if(!mx_found){
+                uint8_t lsd[208];
+                if(proc_mem_read(pid,cap_L,lsd,sizeof(lsd))){
+                    for(size_t poff=8;poff<=200&&!mx_found;poff+=8){
+                        uintptr_t gs=0;memcpy(&gs,lsd+poff,8);
+                        if(gs<0x10000||gs==cap_L) continue;
+                        uint8_t gsd[260];
+                        if(!proc_mem_read(pid,gs,gsd,sizeof(gsd))) continue;
+                        for(int32_t moff=0;moff<=240&&!mx_found;moff+=8){
+                            int32_t mf[5];memcpy(mf,gsd+moff,20);
+                            if(mf[0]>=1&&mf[0]<=2&&mf[1]==0&&mf[2]>0&&mf[2]<0x1000000&&mf[4]==0)
+                                {mx_found=gs+moff;mx_method="brute-force";}}}}}
+            if(mx_found){int32_t kind=0;
+                if(proc_mem_read(pid,mx_found+16,&kind,4)&&kind==0){
                     int32_t recursive=1;
-                    if(proc_mem_write(pid,mx+16,&recursive,4))
-                        LOG_INFO("[direct-hook] pre-emptive: mutex 0x{:X} kind {}->1 (recursive)",mx,kind);
-                }}}}
+                    if(proc_mem_write(pid,mx_found+16,&recursive,4))
+                        LOG_INFO("[direct-hook] pre-emptive({}): mutex 0x{:X} kind {}->1 (recursive)",mx_method,mx_found,kind);
+                }else if(kind==1) LOG_INFO("[direct-hook] mutex 0x{:X} already recursive",mx_found);
+            }else LOG_WARN("[direct-hook] pre-emptive: could not locate Lua mutex from L=0x{:X}",cap_L);
+        }}
 
     if(!do_dryrun(pid,mb_addr)){
         uintptr_t saved_L=0;proc_mem_read(pid,mb_addr+48,&saved_L,8);
