@@ -1687,7 +1687,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         if(ul_rd>=40){size_t fend=find_func_end(stbuf,(size_t)ul_rd);
             if(fend>10){uintptr_t last=last_call_in_func(stbuf,fend,out.settop,active_lock);
                 if(last){int64_t ud=(int64_t)last-(int64_t)active_lock;if(ud<0)ud=-ud;
-                    if((uint64_t)ud<0x100000ULL){out.unlock_fn=last;LOG_INFO("[direct-hook] lua_unlock at 0x{:X}",last);}}}}}}
+                    if((uint64_t)ud<0x100000ULL){out.unlock_fn=last;LOG_INFO("[direct-hook] lua_unlock at 0x{:X}",last);}}}}}
 
     if(!out.resume||!out.load||!out.settop){
         LOG_ERROR("[direct-hook] missing required: resume={:#x} load={:#x} settop={:#x}",out.resume,out.load,out.settop);
