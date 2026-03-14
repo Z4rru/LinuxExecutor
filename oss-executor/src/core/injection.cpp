@@ -1679,7 +1679,7 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                         {pmu=pml_addr+try_off;break;}}}
 
             if(pmu){out.pthread_mutex_unlock_addr=pmu;out.lock_internals_valid=true;
-                LOG_INFO("[direct-hook] pthread_mutex_unlock=0x{:X}",pmu);}}}
+                LOG_INFO("[direct-hook] pthread_mutex_unlock=0x{:X}",pmu);}}
 
     if(out.settop&&active_lock&&!out.unlock_fn){
         uint8_t stbuf[256];struct iovec ul_l={stbuf,sizeof(stbuf)},ul_r={reinterpret_cast<void*>(out.settop),sizeof(stbuf)};
