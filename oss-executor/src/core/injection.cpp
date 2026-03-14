@@ -2026,14 +2026,18 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         uintptr_t cap_L=0;proc_mem_read(pid,mb_addr+48,&cap_L,8);
         if(cap_L>0x10000){
             uintptr_t mx_found=0;const char* mx_method="";
+            auto is_held_mutex=[](const void* data)->bool{
+                uint32_t lv;int32_t mf[5];memcpy(&lv,data,4);memcpy(mf,data,20);
+                if(lv!=1&&lv!=2&&lv!=0x80000001u&&lv!=0x80000002u&&lv!=0x80000003u) return false;
+                return mf[1]==0&&mf[2]>0&&mf[2]<0x4000000&&mf[4]==0;};
             if(addrs.pthread_mutex_lock_addr){
                 uintptr_t gs=0;
                 if(proc_mem_read(pid,cap_L+addrs.lock_global_state_offset,&gs,8)&&gs>0x10000){
-                    uintptr_t mx=gs+addrs.lock_mutex_offset;int32_t mf[5]={};
-                    if(proc_mem_read(pid,mx,mf,20)&&mf[0]>=1&&mf[0]<=2&&mf[1]==0&&
-                       mf[2]>0&&mf[2]<0x1000000&&mf[4]==0){mx_found=mx;mx_method="lock-internals";}}}
+                    uintptr_t mx=gs+addrs.lock_mutex_offset;uint8_t mb[20]={};
+                    if(proc_mem_read(pid,mx,mb,20)&&is_held_mutex(mb))
+                        {mx_found=mx;mx_method="lock-internals";}}}
             if(!mx_found&&addrs.lock_fn){
-                uint8_t lkb[64];
+                uint8_t lkb[128];
                 if(proc_mem_read(pid,addrs.lock_fn,lkb,sizeof(lkb))){
                     for(size_t bi=0;bi<sizeof(lkb)-7&&!mx_found;bi++){
                         if(lkb[bi]<0x48||lkb[bi]>0x4F||lkb[bi+1]!=0x8B) continue;
@@ -2046,23 +2050,21 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                         if(!ie) continue;
                         uintptr_t gs=0;
                         if(!proc_mem_read(pid,cap_L+disp,&gs,8)||gs<0x10000||gs==cap_L) continue;
-                        uint8_t gsd[260];
-                        if(!proc_mem_read(pid,gs,gsd,sizeof(gsd))) continue;
-                        for(int32_t moff=0;moff<=240&&!mx_found;moff+=8){
-                            int32_t mf[5];memcpy(mf,gsd+moff,20);
-                            if(mf[0]>=1&&mf[0]<=2&&mf[1]==0&&mf[2]>0&&mf[2]<0x1000000&&mf[4]==0)
+                        uint8_t gsd[1024];size_t gr=1024;
+                        if(!proc_mem_read(pid,gs,gsd,gr)){gr=512;if(!proc_mem_read(pid,gs,gsd,gr))continue;}
+                        for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=8){
+                            if(is_held_mutex(gsd+moff))
                                 {mx_found=gs+moff;mx_method="lock-bytescan";}}}}}
             if(!mx_found){
-                uint8_t lsd[208];
+                uint8_t lsd[520];
                 if(proc_mem_read(pid,cap_L,lsd,sizeof(lsd))){
-                    for(size_t poff=8;poff<=200&&!mx_found;poff+=8){
+                    for(size_t poff=8;poff<=512&&!mx_found;poff+=8){
                         uintptr_t gs=0;memcpy(&gs,lsd+poff,8);
                         if(gs<0x10000||gs==cap_L) continue;
-                        uint8_t gsd[260];
-                        if(!proc_mem_read(pid,gs,gsd,sizeof(gsd))) continue;
-                        for(int32_t moff=0;moff<=240&&!mx_found;moff+=8){
-                            int32_t mf[5];memcpy(mf,gsd+moff,20);
-                            if(mf[0]>=1&&mf[0]<=2&&mf[1]==0&&mf[2]>0&&mf[2]<0x1000000&&mf[4]==0)
+                        uint8_t gsd[1024];size_t gr=1024;
+                        if(!proc_mem_read(pid,gs,gsd,gr)){gr=512;if(!proc_mem_read(pid,gs,gsd,gr))continue;}
+                        for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=8){
+                            if(is_held_mutex(gsd+moff))
                                 {mx_found=gs+moff;mx_method="brute-force";}}}}}
             if(mx_found){int32_t kind=0;
                 if(proc_mem_read(pid,mx_found+16,&kind,4)&&kind==0){
