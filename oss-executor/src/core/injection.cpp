@@ -1639,6 +1639,12 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
                                     LOG_INFO("[direct-hook] nuclear: lua_unlock at 0x{:X}",uc);}}
                             break;}}}}}}
 
+        bool internals_ok = false;
+        int32_t gs_off = 0, mx_off = 0;
+        uintptr_t pml_addr = 0;
+        if(active_lock)
+            internals_ok = extract_lock_internals(pid, active_lock, gs_off, mx_off, pml_addr);
+
         if(!internals_ok){
             uint8_t lk[48];struct iovec lkl={lk,sizeof(lk)},lkr={reinterpret_cast<void*>(active_lock),sizeof(lk)};
             ssize_t lkrd=process_vm_readv(pid,&lkl,1,&lkr,1,0);
