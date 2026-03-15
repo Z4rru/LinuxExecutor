@@ -1514,10 +1514,14 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
         uint8_t ntb[128];struct iovec nl={ntb,sizeof(ntb)},nr={reinterpret_cast<void*>(out.newthread),sizeof(ntb)};
         ssize_t nrd=process_vm_readv(pid,&nl,1,&nr,1,0);
         if(nrd>=20){size_t fend=find_func_end(ntb,(size_t)nrd,25);if(!fend)fend=(size_t)nrd;
+            int call_idx=0;
             for(size_t i=0;i<std::min(fend,(size_t)80);i++)
-                if(ntb[i]==0xE8){int32_t d;memcpy(&d,&ntb[i+1],4);
-                    out.lock_fn=out.newthread+i+5+(int64_t)d;
-                    LOG_INFO("[direct-hook] lua_lock at 0x{:X}",out.lock_fn);break;}}}
+                if(ntb[i]==0xE8){call_idx++;int32_t d;memcpy(&d,&ntb[i+1],4);
+                    uintptr_t target=out.newthread+i+5+(int64_t)d;
+                    if(call_idx==1){LOG_INFO("[direct-hook] newthread call#1 (luaC_checkGC) at 0x{:X}",target);}
+                    if(call_idx==2){out.lock_fn=target;
+                        LOG_INFO("[direct-hook] lua_lock at 0x{:X} (newthread call#2)",out.lock_fn);break;}
+                    i+=4;}}}
 
     if(!out.free_fn){out.free_fn=find_remote_symbol(pid,"c","free");}
 
@@ -1566,14 +1570,14 @@ bool Injection::find_remote_luau_functions(pid_t pid, DirectHookAddrs& out) {
             for(size_t i=0;i<std::min(fend,(size_t)80);i++)
                 if(stb[i]==0xE8){int32_t d;memcpy(&d,&stb[i+1],4);
                     settop_lock=out.settop+i+5+(int64_t)d;break;}
-            if(settop_lock&&out.lock_fn&&settop_lock!=out.lock_fn){
-                LOG_INFO("[direct-hook] lua_lock cross-ref: newthread had 0x{:X} (luaC_checkGC), settop has 0x{:X} (lua_lock), using settop",
-                         out.lock_fn,settop_lock);
-                out.lock_fn=settop_lock;
-            }else if(settop_lock&&!out.lock_fn){
-                out.lock_fn=settop_lock;
-                LOG_INFO("[direct-hook] lua_lock from settop at 0x{:X}",out.lock_fn);
-            }}}
+            if(settop_lock){
+                if(out.lock_fn&&settop_lock==out.lock_fn)
+                    LOG_INFO("[direct-hook] lua_lock 0x{:X} confirmed by settop cross-ref",out.lock_fn);
+                else if(out.lock_fn&&settop_lock!=out.lock_fn)
+                    LOG_WARN("[direct-hook] settop 1st call 0x{:X} differs from lua_lock 0x{:X} (settop may be misidentified)",settop_lock,out.lock_fn);
+                else if(!out.lock_fn){
+                    out.lock_fn=settop_lock;
+                    LOG_INFO("[direct-hook] lua_lock from settop at 0x{:X}",out.lock_fn);}}}}
 
     uintptr_t active_lock=out.lock_fn;
 
@@ -2034,18 +2038,21 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         uintptr_t cap_L=0;proc_mem_read(pid,mb_addr+48,&cap_L,8);
         if(cap_L>0x10000){
             uintptr_t mx_found=0;const char* mx_method="";
-            auto is_held_mutex=[](const void* data)->bool{
+            auto chk_mx=[](const void* data,bool strict)->bool{
                 uint32_t lv;int32_t mf[5];memcpy(&lv,data,4);memcpy(mf,data,20);
-                if(lv!=1&&lv!=2&&lv!=0x80000001u&&lv!=0x80000002u&&lv!=0x80000003u) return false;
+                if(strict){if(lv!=1&&lv!=2)return false;}
+                else{if(lv==0||lv>0x80000003u)return false;}
                 return mf[1]==0&&mf[2]>0&&mf[2]<0x4000000&&mf[4]==0;};
             if(addrs.pthread_mutex_lock_addr){
                 uintptr_t gs=0;
                 if(proc_mem_read(pid,cap_L+addrs.lock_global_state_offset,&gs,8)&&gs>0x10000){
                     uintptr_t mx=gs+addrs.lock_mutex_offset;uint8_t mb[20]={};
-                    if(proc_mem_read(pid,mx,mb,20)&&is_held_mutex(mb))
-                        {mx_found=mx;mx_method="lock-internals";}}}
+                    if(proc_mem_read(pid,mx,mb,20)&&chk_mx(mb,true))
+                        {mx_found=mx;mx_method="lock-internals";}
+                    else if(!mx_found&&proc_mem_read(pid,mx,mb,20)&&chk_mx(mb,false))
+                        {mx_found=mx;mx_method="lock-internals-relaxed";}}}
             if(!mx_found&&addrs.lock_fn){
-                uint8_t lkb[128];
+                uint8_t lkb[256];
                 if(proc_mem_read(pid,addrs.lock_fn,lkb,sizeof(lkb))){
                     for(size_t bi=0;bi<sizeof(lkb)-7&&!mx_found;bi++){
                         if(lkb[bi]<0x48||lkb[bi]>0x4F||lkb[bi+1]!=0x8B) continue;
@@ -2058,22 +2065,40 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                         if(!ie) continue;
                         uintptr_t gs=0;
                         if(!proc_mem_read(pid,cap_L+disp,&gs,8)||gs<0x10000||gs==cap_L) continue;
-                        uint8_t gsd[1024];size_t gr=1024;
-                        if(!proc_mem_read(pid,gs,gsd,gr)){gr=512;if(!proc_mem_read(pid,gs,gsd,gr))continue;}
-                        for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=8){
-                            if(is_held_mutex(gsd+moff))
-                                {mx_found=gs+moff;mx_method="lock-bytescan";}}}}}
-            if(!mx_found){
-                uint8_t lsd[520];
-                if(proc_mem_read(pid,cap_L,lsd,sizeof(lsd))){
-                    for(size_t poff=8;poff<=512&&!mx_found;poff+=8){
-                        uintptr_t gs=0;memcpy(&gs,lsd+poff,8);
-                        if(gs<0x10000||gs==cap_L) continue;
-                        uint8_t gsd[1024];size_t gr=1024;
-                        if(!proc_mem_read(pid,gs,gsd,gr)){gr=512;if(!proc_mem_read(pid,gs,gsd,gr))continue;}
-                        for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=8){
-                            if(is_held_mutex(gsd+moff))
-                                {mx_found=gs+moff;mx_method="brute-force";}}}}}
+                        uint8_t gsd[4096];size_t gr=4096;
+                        if(!proc_mem_read(pid,gs,gsd,gr)){gr=2048;if(!proc_mem_read(pid,gs,gsd,gr)){gr=1024;if(!proc_mem_read(pid,gs,gsd,gr))continue;}}
+                        for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=4){
+                            if(chk_mx(gsd+moff,true))
+                                {mx_found=gs+moff;mx_method="lock-bytescan";}}}
+                    if(!mx_found){
+                        for(size_t bi=0;bi<sizeof(lkb)-7&&!mx_found;bi++){
+                            if(lkb[bi]<0x48||lkb[bi]>0x4F||lkb[bi+1]!=0x8B) continue;
+                            uint8_t modrm=lkb[bi+2];uint8_t mod=(modrm>>6)&3,rm=modrm&7;
+                            if(mod==3||rm==4||(mod==0&&rm==5)) continue;
+                            int32_t disp=0;size_t ie=0;
+                            if(mod==1&&bi+4<=sizeof(lkb)){disp=(int8_t)lkb[bi+3];ie=bi+4;}
+                            else if(mod==2&&bi+7<=sizeof(lkb)){memcpy(&disp,&lkb[bi+3],4);ie=bi+7;}
+                            else if(mod==0){disp=0;ie=bi+3;}
+                            if(!ie) continue;
+                            uintptr_t gs=0;
+                            if(!proc_mem_read(pid,cap_L+disp,&gs,8)||gs<0x10000||gs==cap_L) continue;
+                            uint8_t gsd[4096];size_t gr=4096;
+                            if(!proc_mem_read(pid,gs,gsd,gr)){gr=2048;if(!proc_mem_read(pid,gs,gsd,gr)){gr=1024;if(!proc_mem_read(pid,gs,gsd,gr))continue;}}
+                            for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=4){
+                                if(chk_mx(gsd+moff,false))
+                                    {mx_found=gs+moff;mx_method="lock-bytescan-relaxed";}}}}}}
+            for(int pass=0;pass<2&&!mx_found;pass++){
+                bool strict=(pass==0);
+                uint8_t lsd[4096];size_t lsr=4096;
+                if(!proc_mem_read(pid,cap_L,lsd,lsr)){lsr=2048;if(!proc_mem_read(pid,cap_L,lsd,lsr))break;}
+                for(size_t poff=8;poff+8<=lsr&&!mx_found;poff+=8){
+                    uintptr_t gs=0;memcpy(&gs,lsd+poff,8);
+                    if(gs<0x10000||gs==cap_L||(gs&7)!=0) continue;
+                    uint8_t gsd[4096];size_t gr=4096;
+                    if(!proc_mem_read(pid,gs,gsd,gr)){gr=2048;if(!proc_mem_read(pid,gs,gsd,gr)){gr=1024;if(!proc_mem_read(pid,gs,gsd,gr))continue;}}
+                    for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=4){
+                        if(chk_mx(gsd+moff,strict))
+                            {mx_found=gs+moff;mx_method=strict?"brute-force":"brute-force-relaxed";}}}}
             if(mx_found){int32_t kind=0;
                 if(proc_mem_read(pid,mx_found+16,&kind,4)&&kind==0){
                     int32_t recursive=1;
