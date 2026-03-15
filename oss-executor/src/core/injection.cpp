@@ -2046,11 +2046,14 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
             if(addrs.pthread_mutex_lock_addr){
                 uintptr_t gs=0;
                 if(proc_mem_read(pid,cap_L+addrs.lock_global_state_offset,&gs,8)&&gs>0x10000){
-                    uintptr_t mx=gs+addrs.lock_mutex_offset;uint8_t mb[20]={};
-                    if(proc_mem_read(pid,mx,mb,20)&&chk_mx(mb,true))
-                        {mx_found=mx;mx_method="lock-internals";}
-                    else if(!mx_found&&proc_mem_read(pid,mx,mb,20)&&chk_mx(mb,false))
-                        {mx_found=mx;mx_method="lock-internals-relaxed";}}}
+                    uintptr_t mx=gs+addrs.lock_mutex_offset;int32_t mf[5]={};
+                    if(proc_mem_read(pid,mx,mf,20)){
+                        bool valid=(mf[4]>=0&&mf[4]<=3)&&(mf[1]>=0&&mf[1]<=100);
+                        LOG_INFO("[direct-hook] lock-internals: gs_off={} mx_off={} gs=0x{:X} mx=0x{:X} fields=[{},{},{},{},{}] valid={}",
+                                 addrs.lock_global_state_offset,addrs.lock_mutex_offset,gs,mx,mf[0],mf[1],mf[2],mf[3],mf[4],valid);
+                        if(valid){mx_found=mx;mx_method="lock-internals";}
+                    }}else LOG_WARN("[direct-hook] lock-internals: gs read failed (L=0x{:X} gs_off={} mx_off={})",
+                                    cap_L,addrs.lock_global_state_offset,addrs.lock_mutex_offset);}
             if(!mx_found&&addrs.lock_fn){
                 uint8_t lkb[256];
                 if(proc_mem_read(pid,addrs.lock_fn,lkb,sizeof(lkb))){
