@@ -1944,9 +1944,23 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
         memcpy(patch,p,pl);patch_len=pl;return true;};
 
     if(!try_hook(addrs.settop,"lua_settop",prologue,steal,false)){
-        LOG_WARN("[direct-hook] lua_settop dead, searching for live variant...");
+        LOG_WARN("[direct-hook] lua_settop dead, trying lua_resume first...");
+        bool found_live=false;
+        if(addrs.resume){
+            uint8_t rpro[32];
+            if(proc_mem_read(pid,addrs.resume,rpro,sizeof(rpro))){
+                size_t rsteal=0;while(rsteal<5){size_t il=dh_insn_len(rpro+rsteal);
+                    if(il==0||rsteal+il>sizeof(rpro)) break;rsteal+=il;}
+                if(rsteal>=5){
+                    if(try_hook(addrs.resume,"lua_resume",rpro,rsteal,false)){
+                        hook_addr=addrs.resume;memcpy(prologue,rpro,rsteal);steal=rsteal;
+                        found_live=true;
+                    }else LOG_WARN("[direct-hook] lua_resume probe failed, trying live settop search...");
+                }else LOG_WARN("[direct-hook] lua_resume decode failed (got {} bytes)",rsteal);
+            }else LOG_WARN("[direct-hook] lua_resume read failed at 0x{:X}",addrs.resume);
+        }
         uintptr_t dead_settop=addrs.settop;
-        bool found_live=false;int total_probes=0;constexpr int MAX_PROBES=15;
+        int total_probes=0;constexpr int MAX_PROBES=15;
 
         for(const auto& r:regions){
             if(found_live||total_probes>=MAX_PROBES) break;
@@ -2003,17 +2017,6 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if(try_hook(cand,"live_settop",cand_pro,cand_steal,false)){found_live=true;break;}
                 else{hook_addr=addrs.settop;memcpy(prologue,cand_pro,steal);}
             }}
-
-        if(!found_live&&addrs.resume){
-            LOG_INFO("[direct-hook] trying lua_resume as fallback hook target");
-            uint8_t rpro[32];
-            if(proc_mem_read(pid,addrs.resume,rpro,sizeof(rpro))){
-                size_t rsteal=0;while(rsteal<5){size_t il=dh_insn_len(rpro+rsteal);
-                    if(il==0||rsteal+il>sizeof(rpro)) break;
-                    rsteal+=il;}
-            if(rsteal>=5&&try_hook(addrs.resume,"lua_resume",rpro,rsteal,false)){
-                    hook_addr=addrs.resume;memcpy(prologue,rpro,rsteal);steal=rsteal;
-                    found_live=true;}}}
 
         if(!found_live){LOG_ERROR("[direct-hook] all hook targets exhausted");return false;}
     }
