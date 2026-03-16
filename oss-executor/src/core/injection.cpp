@@ -2048,15 +2048,40 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 return mf[1]==0&&mf[2]>0&&mf[2]<0x4000000&&mf[4]==0;};
             if(addrs.pthread_mutex_lock_addr){
                 uintptr_t gs=0;
-                if(proc_mem_read(pid,cap_L+addrs.lock_global_state_offset,&gs,8)&&gs>0x10000){
+                bool gs_ok=proc_mem_read(pid,cap_L+addrs.lock_global_state_offset,&gs,8);
+                if(gs_ok&&gs>0x10000){
                     uintptr_t mx=gs+addrs.lock_mutex_offset;int32_t mf[5]={};
                     if(proc_mem_read(pid,mx,mf,20)){
                         bool valid=(mf[4]>=0&&mf[4]<=3)&&(mf[1]>=0&&mf[1]<=100);
                         LOG_INFO("[direct-hook] lock-internals: gs_off={} mx_off={} gs=0x{:X} mx=0x{:X} fields=[{},{},{},{},{}] valid={}",
                                  addrs.lock_global_state_offset,addrs.lock_mutex_offset,gs,mx,mf[0],mf[1],mf[2],mf[3],mf[4],valid);
-                        if(valid){mx_found=mx;mx_method="lock-internals";}
-                    }}else LOG_WARN("[direct-hook] lock-internals: gs read failed (L=0x{:X} gs_off={} mx_off={})",
-                                    cap_L,addrs.lock_global_state_offset,addrs.lock_mutex_offset);}
+                        if(valid){mx_found=mx;mx_method="lock-internals";}}}
+                if(!mx_found)
+                    LOG_WARN("[direct-hook] lock-internals: gs_off={} gs=0x{:X} gs_ok={} — will scan all newthread calls",
+                             addrs.lock_global_state_offset,gs,gs_ok);}
+            if(!mx_found&&addrs.newthread){
+                uint8_t ntsc[160];
+                if(proc_mem_read(pid,addrs.newthread,ntsc,sizeof(ntsc))){
+                    size_t ntfe=find_func_end(ntsc,sizeof(ntsc),25);if(!ntfe)ntfe=100;
+                    for(size_t ni=0;ni<std::min(ntfe,(size_t)100)&&!mx_found;ni++){
+                        if(ntsc[ni]!=0xE8){continue;}
+                        int32_t cd;memcpy(&cd,&ntsc[ni+1],4);
+                        uintptr_t ct=addrs.newthread+ni+5+(int64_t)cd;
+                        int32_t tgs=0,tmx=0;uintptr_t tpml=0;
+                        if(!extract_lock_internals(pid,ct,tgs,tmx,tpml)){ni+=4;continue;}
+                        uintptr_t tg=0;
+                        if(!proc_mem_read(pid,cap_L+tgs,&tg,8)||tg<0x10000){
+                            LOG_DEBUG("[direct-hook] newthread call 0x{:X}: gs_off={} gs=0x{:X} — skip",ct,tgs,tg);
+                            ni+=4;continue;}
+                        uintptr_t tm=tg+tmx;int32_t tmf[5]={};
+                        if(!proc_mem_read(pid,tm,tmf,20)){ni+=4;continue;}
+                        bool valid=(tmf[4]>=0&&tmf[4]<=3)&&(tmf[1]>=0&&tmf[1]<=100);
+                        LOG_INFO("[direct-hook] newthread-scan: call 0x{:X} gs_off={} mx_off={} gs=0x{:X} mx=0x{:X} fields=[{},{},{},{},{}] valid={}",
+                                 ct,tgs,tmx,tg,tm,tmf[0],tmf[1],tmf[2],tmf[3],tmf[4],valid);
+                        if(valid){mx_found=tm;mx_method="newthread-scan";
+                            addrs.lock_fn=ct;addrs.lock_global_state_offset=tgs;
+                            addrs.lock_mutex_offset=tmx;addrs.pthread_mutex_lock_addr=tpml;}
+                        ni+=4;}}}
             if(!mx_found&&addrs.lock_fn){
                 uint8_t lkb[256];
                 if(proc_mem_read(pid,addrs.lock_fn,lkb,sizeof(lkb))){
