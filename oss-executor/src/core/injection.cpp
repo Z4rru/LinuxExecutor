@@ -2059,65 +2059,66 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                 if(!mx_found)
                     LOG_WARN("[direct-hook] lock-internals: gs_off={} gs=0x{:X} gs_ok={} — will scan all newthread calls",
                              addrs.lock_global_state_offset,gs,gs_ok);}
-            if(!mx_found&&addrs.newthread){
-                uint8_t ntsc[160];
-                if(proc_mem_read(pid,addrs.newthread,ntsc,sizeof(ntsc))){
-                    size_t ntfe=find_func_end(ntsc,sizeof(ntsc),25);if(!ntfe)ntfe=100;
-                    for(size_t ni=0;ni<std::min(ntfe,(size_t)100)&&!mx_found;ni++){
-                        if(ntsc[ni]!=0xE8){continue;}
-                        int32_t cd;memcpy(&cd,&ntsc[ni+1],4);
-                        uintptr_t ct=addrs.newthread+ni+5+(int64_t)cd;
-                        int32_t tgs=0,tmx=0;uintptr_t tpml=0;
-                        if(!extract_lock_internals(pid,ct,tgs,tmx,tpml)){ni+=4;continue;}
-                        uintptr_t tg=0;
-                        if(!proc_mem_read(pid,cap_L+tgs,&tg,8)||tg<0x10000){
-                            LOG_DEBUG("[direct-hook] newthread call 0x{:X}: gs_off={} gs=0x{:X} — skip",ct,tgs,tg);
-                            ni+=4;continue;}
-                        uintptr_t tm=tg+tmx;int32_t tmf[5]={};
-                        if(!proc_mem_read(pid,tm,tmf,20)){ni+=4;continue;}
-                        bool valid=(tmf[4]>=0&&tmf[4]<=3)&&(tmf[1]>=0&&tmf[1]<=100);
-                        LOG_INFO("[direct-hook] newthread-scan: call 0x{:X} gs_off={} mx_off={} gs=0x{:X} mx=0x{:X} fields=[{},{},{},{},{}] valid={}",
-                                 ct,tgs,tmx,tg,tm,tmf[0],tmf[1],tmf[2],tmf[3],tmf[4],valid);
-                        if(valid){mx_found=tm;mx_method="newthread-scan";
-                            addrs.lock_fn=ct;addrs.lock_global_state_offset=tgs;
-                            addrs.lock_mutex_offset=tmx;addrs.pthread_mutex_lock_addr=tpml;}
-                        ni+=4;}}}
-            if(!mx_found&&addrs.lock_fn){
-                uint8_t lkb[256];
-                if(proc_mem_read(pid,addrs.lock_fn,lkb,sizeof(lkb))){
-                    for(size_t bi=0;bi<sizeof(lkb)-7&&!mx_found;bi++){
-                        if(lkb[bi]<0x48||lkb[bi]>0x4F||lkb[bi+1]!=0x8B) continue;
-                        uint8_t modrm=lkb[bi+2];uint8_t mod=(modrm>>6)&3,rm=modrm&7;
-                        if(mod==3||rm==4||(mod==0&&rm==5)) continue;
-                        int32_t disp=0;size_t ie=0;
-                        if(mod==1&&bi+4<=sizeof(lkb)){disp=(int8_t)lkb[bi+3];ie=bi+4;}
-                        else if(mod==2&&bi+7<=sizeof(lkb)){memcpy(&disp,&lkb[bi+3],4);ie=bi+7;}
-                        else if(mod==0){disp=0;ie=bi+3;}
-                        if(!ie) continue;
-                        uintptr_t gs=0;
-                        if(!proc_mem_read(pid,cap_L+disp,&gs,8)||gs<0x10000||gs==cap_L) continue;
-                        uint8_t gsd[4096];size_t gr=4096;
-                        if(!proc_mem_read(pid,gs,gsd,gr)){gr=2048;if(!proc_mem_read(pid,gs,gsd,gr)){gr=1024;if(!proc_mem_read(pid,gs,gsd,gr))continue;}}
-                        for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=4){
-                            if(chk_mx(gsd+moff,true))
-                                {mx_found=gs+moff;mx_method="lock-bytescan";}}}
-                    if(!mx_found){
-                        for(size_t bi=0;bi<sizeof(lkb)-7&&!mx_found;bi++){
-                            if(lkb[bi]<0x48||lkb[bi]>0x4F||lkb[bi+1]!=0x8B) continue;
-                            uint8_t modrm=lkb[bi+2];uint8_t mod=(modrm>>6)&3,rm=modrm&7;
-                            if(mod==3||rm==4||(mod==0&&rm==5)) continue;
-                            int32_t disp=0;size_t ie=0;
-                            if(mod==1&&bi+4<=sizeof(lkb)){disp=(int8_t)lkb[bi+3];ie=bi+4;}
-                            else if(mod==2&&bi+7<=sizeof(lkb)){memcpy(&disp,&lkb[bi+3],4);ie=bi+7;}
-                            else if(mod==0){disp=0;ie=bi+3;}
-                            if(!ie) continue;
+            if(!mx_found){
+                std::vector<uintptr_t> scan_fns;
+                if(addrs.lock_fn){bool d=false;for(auto a:scan_fns)if(a==addrs.lock_fn){d=true;break;}if(!d)scan_fns.push_back(addrs.lock_fn);}
+                if(addrs.newthread){
+                    uint8_t ntb2[200];
+                    if(proc_mem_read(pid,addrs.newthread,ntb2,sizeof(ntb2))){
+                        for(size_t ni=0;ni+5<sizeof(ntb2);ni++){
+                            if(ntb2[ni]!=0xE8) continue;
+                            int32_t cd;memcpy(&cd,&ntb2[ni+1],4);
+                            uintptr_t ct=addrs.newthread+ni+5+(int64_t)cd;
+                            if(ct>0x10000){bool d=false;for(auto a:scan_fns)if(a==ct){d=true;break;}if(!d)scan_fns.push_back(ct);}
+                            ni+=4;}
+                        scan_fns.push_back(addrs.newthread);}}
+                LOG_INFO("[direct-hook] bytescan: {} targets from newthread",scan_fns.size());
+                for(int bpass=0;bpass<2&&!mx_found;bpass++){
+                    for(auto target:scan_fns){
+                        if(mx_found) break;
+                        uint8_t fb[256];
+                        if(!proc_mem_read(pid,target,fb,sizeof(fb))) continue;
+                        int lr=7;
+                        for(size_t p=0;p<30&&p+3<=sizeof(fb);p++){
+                            if(fb[p]>=0x48&&fb[p]<=0x4F&&fb[p+1]==0x89){
+                                uint8_t m=fb[p+2];
+                                if((m&0xC0)==0xC0&&((m>>3)&7)==7&&(m&7)!=7)
+                                    {lr=(m&7);if(fb[p]&0x01)lr+=8;break;}}
+                            if(fb[p]>=0x48&&fb[p]<=0x4F&&fb[p+1]==0x8B){
+                                uint8_t m=fb[p+2];
+                                if((m&0xC0)==0xC0&&(m&7)==7&&((m>>3)&7)!=7)
+                                    {lr=((m>>3)&7);if(fb[p]&0x04)lr+=8;break;}}}
+                        for(size_t bi=0;bi<sizeof(fb)-7&&!mx_found;bi++){
+                            if(fb[bi]<0x48||fb[bi]>0x4F||fb[bi+1]!=0x8B) continue;
+                            uint8_t modrm=fb[bi+2];
+                            uint8_t mod=(modrm>>6)&3,rm=modrm&7;
+                            if(mod==3||(mod==0&&rm==5)) continue;
+                            int src;size_t doff;
+                            if(rm==4){if(bi+4>sizeof(fb))continue;uint8_t sib=fb[bi+3];
+                                if(((sib>>3)&7)!=4)continue;src=(sib&7);if(fb[bi]&0x01)src+=8;
+                                if(mod==0&&(sib&7)==5)continue;doff=bi+4;
+                            }else{src=rm;if(fb[bi]&0x01)src+=8;doff=bi+3;}
+                            if(src!=lr&&src!=7) continue;
+                            int32_t disp=0;
+                            if(mod==1&&doff+1<=sizeof(fb)) disp=(int8_t)fb[doff];
+                            else if(mod==2&&doff+4<=sizeof(fb)) memcpy(&disp,&fb[doff],4);
+                            else if(mod==0) disp=0;
+                            if(disp<=0) continue;
                             uintptr_t gs=0;
                             if(!proc_mem_read(pid,cap_L+disp,&gs,8)||gs<0x10000||gs==cap_L) continue;
                             uint8_t gsd[4096];size_t gr=4096;
                             if(!proc_mem_read(pid,gs,gsd,gr)){gr=2048;if(!proc_mem_read(pid,gs,gsd,gr)){gr=1024;if(!proc_mem_read(pid,gs,gsd,gr))continue;}}
                             for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=4){
-                                if(chk_mx(gsd+moff,false))
-                                    {mx_found=gs+moff;mx_method="lock-bytescan-relaxed";}}}}}}
+                                int32_t tmf[5];memcpy(tmf,gsd+moff,20);
+                                bool ok;
+                                if(bpass==0){uint32_t lv;memcpy(&lv,gsd+moff,4);
+                                    ok=(lv>=1&&lv<=2)&&tmf[1]==0&&tmf[2]>0&&tmf[2]<0x4000000&&tmf[4]==0;}
+                                else{ok=(tmf[4]>=0&&tmf[4]<=3)&&(tmf[1]>=0&&tmf[1]<=100)&&
+                                        !(tmf[0]==0&&tmf[1]==0&&tmf[2]==0&&tmf[3]==0&&tmf[4]==0);}
+                                if(ok){mx_found=gs+moff;mx_method=(bpass==0)?"bytescan":"bytescan-relaxed";
+                                    addrs.lock_fn=target;addrs.lock_global_state_offset=disp;addrs.lock_mutex_offset=moff;
+                                    LOG_INFO("[direct-hook] {}(pass{}): fn=0x{:X} gs_off={} mx_off={} gs=0x{:X} mx=0x{:X} fields=[{},{},{},{},{}]",
+                                             mx_method,bpass,target,disp,moff,gs,mx_found,tmf[0],tmf[1],tmf[2],tmf[3],tmf[4]);}}}}}}
             for(int pass=0;pass<2&&!mx_found;pass++){
                 bool strict=(pass==0);
                 uint8_t lsd[4096];size_t lsr=4096;
