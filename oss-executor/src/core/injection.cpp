@@ -2132,7 +2132,7 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                                 mx_found=gs+moff;mx_method=(bpass==0)?"bytescan":"bytescan-relaxed";
                                 addrs.lock_fn=target;addrs.lock_global_state_offset=disp;addrs.lock_mutex_offset=moff;
                                 LOG_INFO("[direct-hook] {}(pass{}): fn=0x{:X} gs_off={} mx_off={} gs=0x{:X} mx=0x{:X} fields=[{},{},{},{},{}]",
-                                         mx_method,bpass,target,disp,moff,gs,mx_found,tmf[0],tmf[1],tmf[2],tmf[3],tmf[4]);}}}}}}
+                                         mx_method,bpass,target,disp,moff,gs,mx_found,tmf[0],tmf[1],tmf[2],tmf[3],tmf[4]);}}}}}
             for(int pass=0;pass<2&&!mx_found;pass++){
                 uint8_t lsd[512];size_t lsr=512;
                 if(!proc_mem_read(pid,cap_L,lsd,lsr)){lsr=256;if(!proc_mem_read(pid,cap_L,lsd,lsr))break;}
