@@ -2110,17 +2110,25 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                             if(!proc_mem_read(pid,gs,gsd,gr)){gr=2048;if(!proc_mem_read(pid,gs,gsd,gr)){gr=1024;if(!proc_mem_read(pid,gs,gsd,gr))continue;}}
                             for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=4){
                                 int32_t tmf[5];memcpy(tmf,gsd+moff,20);
-                                bool ok;
-                                if(bpass==0){uint32_t lv;memcpy(&lv,gsd+moff,4);
-                                    ok=(lv>=1&&lv<=2)&&tmf[1]==0&&tmf[2]>0&&tmf[2]<0x4000000&&tmf[4]==0;}
-                                else{ok=(tmf[4]>=0&&tmf[4]<=3)&&(tmf[1]>=0&&tmf[1]<=100)&&
-                                        !(tmf[0]==0&&tmf[1]==0&&tmf[2]==0&&tmf[3]==0&&tmf[4]==0);}
-                                if(ok){mx_found=gs+moff;mx_method=(bpass==0)?"bytescan":"bytescan-relaxed";
+                                bool ok;uint32_t lv;memcpy(&lv,gsd+moff,4);
+                                if(bpass==0) ok=(lv>=1&&lv<=2)&&tmf[1]==0&&tmf[2]>0&&tmf[2]<0x4000000&&tmf[4]==0;
+                                else{if(lv==0) ok=tmf[1]==0&&tmf[2]==0&&tmf[4]==0;
+                                     else ok=(lv<=2)&&tmf[1]==0&&tmf[2]>0&&tmf[2]<0x4000000&&tmf[4]==0;}
+                                if(ok){bool circ=false;
+                                    for(size_t cv=0;cv+8<=gr&&!circ;cv+=8){uintptr_t mt=0;memcpy(&mt,gsd+cv,8);
+                                        if(mt<0x10000||mt>0x7FFFFFFFFFFFULL||mt==cap_L||mt==gs)continue;
+                                        uintptr_t mt_gs=0;
+                                        if(proc_mem_read(pid,mt+(uint32_t)disp,&mt_gs,8)&&mt_gs==gs)circ=true;}
+                                    if(!circ){int np=0;bool hcl=false;
+                                        for(size_t cv=0;cv+8<=gr;cv+=8){uintptr_t v=0;memcpy(&v,gsd+cv,8);
+                                            if(v==cap_L)hcl=true;if(v>0x10000&&v<0x800000000000ULL)np++;}
+                                        if(hcl&&np>=15)circ=true;}
+                                    if(!circ)continue;
+                                    mx_found=gs+moff;mx_method=(bpass==0)?"bytescan":"bytescan-relaxed";
                                     addrs.lock_fn=target;addrs.lock_global_state_offset=disp;addrs.lock_mutex_offset=moff;
                                     LOG_INFO("[direct-hook] {}(pass{}): fn=0x{:X} gs_off={} mx_off={} gs=0x{:X} mx=0x{:X} fields=[{},{},{},{},{}]",
                                              mx_method,bpass,target,disp,moff,gs,mx_found,tmf[0],tmf[1],tmf[2],tmf[3],tmf[4]);}}}}}}
             for(int pass=0;pass<2&&!mx_found;pass++){
-                bool strict=(pass==0);
                 uint8_t lsd[4096];size_t lsr=4096;
                 if(!proc_mem_read(pid,cap_L,lsd,lsr)){lsr=2048;if(!proc_mem_read(pid,cap_L,lsd,lsr))break;}
                 for(size_t poff=8;poff+8<=lsr&&!mx_found;poff+=8){
@@ -2129,8 +2137,24 @@ bool Injection::inject_via_direct_hook(pid_t pid) {
                     uint8_t gsd[4096];size_t gr=4096;
                     if(!proc_mem_read(pid,gs,gsd,gr)){gr=2048;if(!proc_mem_read(pid,gs,gsd,gr)){gr=1024;if(!proc_mem_read(pid,gs,gsd,gr))continue;}}
                     for(int32_t moff=0;moff+20<=(int32_t)gr&&!mx_found;moff+=4){
-                        if(chk_mx(gsd+moff,strict))
-                            {mx_found=gs+moff;mx_method=strict?"brute-force":"brute-force-relaxed";}}}}
+                        int32_t bmf[5];memcpy(bmf,gsd+moff,20);uint32_t blv;memcpy(&blv,gsd+moff,4);bool bok;
+                        if(pass==0) bok=(blv==1||blv==2||blv==0x80000001u||blv==0x80000002u)&&bmf[1]==0&&bmf[2]>0&&bmf[2]<0x4000000&&bmf[4]==0;
+                        else{if(blv==0)bok=bmf[1]==0&&bmf[2]==0&&bmf[4]==0;
+                             else bok=(blv<=2||blv==0x80000001u||blv==0x80000002u)&&bmf[1]==0&&bmf[2]>0&&bmf[2]<0x4000000&&bmf[4]==0;}
+                        if(!bok)continue;
+                        bool bcirc=false;
+                        for(size_t cv=0;cv+8<=gr&&!bcirc;cv+=8){uintptr_t mt=0;memcpy(&mt,gsd+cv,8);
+                            if(mt<0x10000||mt>0x7FFFFFFFFFFFULL||mt==cap_L||mt==gs)continue;
+                            uintptr_t mt_gs=0;
+                            if(proc_mem_read(pid,mt+poff,&mt_gs,8)&&mt_gs==gs)bcirc=true;}
+                        if(!bcirc){int np=0;bool hcl=false;
+                            for(size_t cv=0;cv+8<=gr;cv+=8){uintptr_t v=0;memcpy(&v,gsd+cv,8);
+                                if(v==cap_L)hcl=true;if(v>0x10000&&v<0x800000000000ULL)np++;}
+                            if(hcl&&np>=15)bcirc=true;}
+                        if(!bcirc)continue;
+                        mx_found=gs+moff;mx_method=(pass==0)?"brute-force":"brute-force-relaxed";
+                        LOG_INFO("[direct-hook] {}: poff={} moff={} gs=0x{:X} mx=0x{:X} fields=[{},{},{},{},{}]",
+                                 mx_method,poff,moff,gs,mx_found,bmf[0],bmf[1],bmf[2],bmf[3],bmf[4]);}}}
             if(mx_found){int32_t kind=0;
                 if(proc_mem_read(pid,mx_found+16,&kind,4)&&kind==0){
                     int32_t recursive=1;
